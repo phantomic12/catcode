@@ -1198,6 +1198,12 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
     }
     case "aborted":
       return finishTurn(state);
+    case "advisor_note":
+    case "advisor_status":
+      // Advisors emit review feedback + state transitions for the watchdog.
+      // The web UI surfaces advisor status in the toast log but does not
+      // interrupt the turn — keep the current streaming state.
+      return state;
     case "error": {
       // Do NOT always clear streaming — core often emits non-fatal errors mid-turn.
       // Pre-turn failures (bad skill/model): drop the optimistic user bubble + working flag.
