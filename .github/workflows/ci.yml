@@ -148,6 +148,13 @@ jobs:
       - name: SDK protocol tests
         working-directory: sdk
         run: bun test
+      - name: SDK build
+        # The web app's `@catalyst-code/coding-agent` import resolves to
+        # `./dist/index.d.ts` per sdk/package.json. Web typecheck/test must
+        # see the latest SDK types whenever a new event is added to
+        # CORE_EVENT_TYPES, so build the SDK before web typecheck.
+        working-directory: sdk
+        run: bun run build
       - name: typecheck
         working-directory: web
         run: bun run typecheck
