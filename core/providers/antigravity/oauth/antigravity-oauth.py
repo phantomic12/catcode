@@ -543,11 +543,13 @@ def do_token(ctx):
         headers = []
         project_id = str(token.get("project_id") or "").strip()
         if project_id:
-            # The harness's Google Code Assist adapter resolves the project
-            # via this header (one of three accepted names). The plugin sets
-            # the real per-user project so requests don't fall back to the
-            # shared freemium project that the adapter ships as a default.
-            headers.append(["x-goog-user-project", project_id])
+            # CRITICAL: do NOT use x-goog-user-project. That Google consumer
+            # header forces a Cloud Code Private API enablement check and
+            # returns SERVICE_DISABLED on free-tier / managed projects.
+            # Put the project in the request body only (via the harness
+            # adapter reading x-code-assist-project). Verified: body.project
+            # alone works for gemini-cli; x-goog-user-project → 403.
+            headers.append(["x-code-assist-project", project_id])
         emit(
             {
                 "access_token": access,

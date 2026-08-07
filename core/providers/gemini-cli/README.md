@@ -103,3 +103,52 @@ The `project` field comes from the harness's `x-goog-user-project` header
   install.
 - Code Assist wire format + project discovery: Google's open-source
   Gemini CLI source.
+
+## Working models (verified 2026-08)
+
+With a free-tier Google account the gemini-cli OAuth client is marked
+`UNSUPPORTED_CLIENT` for free-tier project *provisioning*, but chat still
+works when `body.project` is set to a managed project the same account
+already owns (e.g. one provisioned by the sibling Antigravity login). Do
+**not** send `x-goog-user-project` — that header forces a Cloud Code
+Private API consumer check and returns `SERVICE_DISABLED`. The plugin
+emits `x-code-assist-project` instead so the harness adapter only puts
+the id into `body.project`.
+
+Verified working (HTTP 200, real text):
+
+```text
+gemini-2.5-pro
+gemini-2.5-flash
+gemini-2.5-flash-lite
+gemini-3.1-flash-lite-preview
+```
+
+404 / not available on free-tier gemini-cli:
+
+```text
+gemini-3-pro-preview
+gemini-3-flash-preview
+gemini-3.1-pro-preview
+gemini-3.1-pro-high          # Antigravity-only slug
+claude-*                     # Antigravity-only
+```
+
+## Gotchas
+
+1. **Never send `x-goog-user-project`.** It is a Google consumer-project
+   header and trips `SERVICE_DISABLED` on free-tier managed projects.
+   Project goes in the JSON body only (`{"project": "...", "model": "...",
+   "request": {...}}`). The plugin uses `x-code-assist-project` which the
+   harness adapter translates into `body.project` without the consumer
+   gate.
+2. **User-Agent for chat** should look like the official CLI:
+   `GeminiCLI/0.34.0/<model> (linux; x64; terminal)` plus
+   `X-Goog-Api-Client: google-genai-sdk/1.41.0 gl-node/v22.19.0`. The
+   harness currently leaves User-Agent as whatever `plugin.json` sets;
+   body-level `userAgent: "antigravity"` (set by the shared adapter) is
+   tolerated by the gateway.
+3. **Project discovery** may return nothing for free-tier gemini-cli
+   accounts. The script then falls back to
+   `CATALYST_CODE_GEMINI_CLI_PROJECT` or the sibling Antigravity token's
+   `project_id` under `~/.config/catalyst-code/oauth/antigravity.json`.

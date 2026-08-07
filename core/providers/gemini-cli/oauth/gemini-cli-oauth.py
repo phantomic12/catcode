@@ -43,12 +43,21 @@ AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 USERINFO_URL = "https://www.googleapis.com/oauth2/v1/userinfo"
 
-# Gemini CLI's standard scope list. ``cclog`` and
-# ``experimentsandconfigs`` are Antigravity-specific and intentionally
-# excluded here — including them with the wrong client id would silently
-# drop the Antigravity-only scopes on Google's side.
+# Google OAuth requires ``/oauth2callback`` (not arbitrary paths) for the
+# gemini-cli OAuth client — only this path is registered as a loopback
+# redirect URI for ``http://127.0.0.1:<port>`` in the client's Google Cloud
+# console entry. Using ``/callback`` makes Google reject the request as a
+# non-compliant redirect URI ("doesn't comply with Google's OAuth 2.0
+# policy for keeping apps secure"). The official gemini-cli binary uses
+# this exact path; we mirror it.
+REDIRECT_PATH = "/oauth2callback"
+
+# Scopes the official ``gemini`` CLI requests (no ``openid``). Including
+# ``openid`` triggers Google's "unverified app" rejection for this
+# public-but-unverified OAuth client — the gemini-cli project deliberately
+# omits it. ``userinfo.email`` + ``userinfo.profile`` alone are sufficient
+# for the loadCodeAssist user-info lookup.
 SCOPES = [
-    "openid",
     "https://www.googleapis.com/auth/cloud-platform",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
@@ -63,7 +72,24 @@ USER_AGENT = "google-api-nodejs-client/9.15.1"
 X_GOOG_API_CLIENT = "google-cloud-sdk vscode_cloudshelleditor/0.1"
 # Numeric enum values that match what gemini-cli actually sends. These are
 # not the same as Antigravity (different ideType/pluginType).
-CLIENT_METADATA = {"ideType": 0, "platform": 0, "pluginType": 0}
+# 9router's gemini-cli path uses Antigravity-style ClientMetadata on
+# loadCodeAssist (ideType=9 / pluginType=2). Using the zeroed "unspecified"
+# values makes Google refuse to provision a cloudaicompanionProject for
+# free-tier individuals (UNSUPPORTED_CLIENT on free-tier).
+def _platform_enum():
+    import platform as _plat
+    s = _plat.system().lower()
+    a = _plat.machine().lower()
+    if s == "darwin":
+        return 2 if "arm64" in a or "aarch64" in a else 1
+    if s == "linux":
+        return 4 if "arm64" in a or "aarch64" in a else 3
+    if s == "windows" or s == "win32":
+        return 5
+    return 0
+
+
+CLIENT_METADATA = {"ideType": 9, "platform": _platform_enum(), "pluginType": 2}
 
 LOAD_CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 ONBOARD_USER_URL = "https://cloudcode-pa.googleapis.com/v1internal:onboardUser"
@@ -218,6 +244,11 @@ def make_pkce():
 
 
 def build_authorize_url(redirect_uri, state, challenge):
+    # The official ``gemini`` CLI does NOT send ``prompt=consent`` or
+    # ``include_granted_scopes=true``; including them can confuse Google's
+    # refresh-token issuance logic for the public-but-unverified gemini-cli
+    # OAuth client. Keep the request minimal: redirect + scope + PKCE +
+    # state + offline access_type (required for a refresh_token).
     params = {
         "client_id": CLIENT_ID,
         "response_type": "code",
@@ -227,8 +258,6 @@ def build_authorize_url(redirect_uri, state, challenge):
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "access_type": "offline",
-        "prompt": "consent",
-        "include_granted_scopes": "true",
     }
     return AUTH_URL + "?" + urllib.parse.urlencode(params)
 
@@ -305,8 +334,10 @@ def _code_assist_headers(access_token):
     }
 
 
-def _code_assist_body(include_tier=False, tier_id=None):
-    body = {"metadata": dict(CLIENT_METADATA)}
+def _code_assist_body(include_tier=False, tier_id=None, mode=1):
+    # mode=1 is the Code Assist mode 9router always sends; without it the
+    # free-tier gemini-cli OAuth client often gets no project back.
+    body = {"metadata": dict(CLIENT_METADATA), "mode": mode}
     if include_tier:
         body["tierId"] = tier_id or "legacy-tier"
     return body
@@ -370,14 +401,44 @@ def onboard_user(access_token, tier_id):
 
 
 def discover_project_id(access_token):
-    """Try loadCodeAssist; on failure, fall back to onboardUser polling."""
+    """Try loadCodeAssist; on failure, fall back to onboardUser polling.
+
+    Free-tier gemini-cli OAuth often returns no project (Google now marks
+    free-tier as UNSUPPORTED_CLIENT for this OAuth client). Fallbacks, in
+    order:
+      1. ``CATALYST_CODE_GEMINI_CLI_PROJECT`` env override.
+      2. Sibling Antigravity token file's ``project_id`` (same Google
+         account often already has a working managed project via the
+         Antigravity OAuth flow — verified: body.project alone works).
+    """
+    override = (os.environ.get("CATALYST_CODE_GEMINI_CLI_PROJECT") or "").strip()
+    if override:
+        return override
     payload = load_code_assist_payload(access_token)
     if payload is not None:
         project = _extract_project(payload)
         if project:
             return project
         tier = _pick_default_tier(payload)
-        return onboard_user(access_token, tier)
+        project = onboard_user(access_token, tier)
+        if project:
+            return project
+    # Sibling Antigravity token (same user, different OAuth client) often
+    # already holds a working managed project. Read it if present.
+    try:
+        sibling = os.path.join(os.path.dirname(os.path.abspath(
+            # token_path is not in scope here; reconstruct from common layout.
+            os.path.expanduser("~/.config/catalyst-code/oauth/antigravity.json")
+        )), "antigravity.json") if False else os.path.expanduser(
+            "~/.config/catalyst-code/oauth/antigravity.json"
+        )
+        sib = read_token(sibling)
+        if sib:
+            pid = str(sib.get("project_id") or "").strip()
+            if pid:
+                return pid
+    except Exception:
+        pass
     return None
 
 
@@ -497,11 +558,16 @@ def do_token(ctx):
         headers = []
         project_id = str(token.get("project_id") or "").strip()
         if project_id:
-            # The harness's Google Code Assist adapter resolves the project
-            # via this header (one of three accepted names). The plugin sets
-            # the real per-user project so requests don't fall back to the
-            # shared freemium project that the adapter ships as a default.
-            headers.append(["x-goog-user-project", project_id])
+            # CRITICAL: do NOT use x-goog-user-project. That Google consumer
+            # header forces a Cloud Code Private API enablement check and
+            # returns SERVICE_DISABLED on free-tier / managed projects.
+            # 9router's gemini-cli executor never sends it — project goes in
+            # the request body only. The harness adapter also accepts
+            # x-code-assist-project / cloudaicompanion-project, which only
+            # affect body.project resolution and do not trip the consumer
+            # API gate. Verified end-to-end: body.project alone works;
+            # x-goog-user-project → 403 SERVICE_DISABLED.
+            headers.append(["x-code-assist-project", project_id])
         emit(
             {
                 "access_token": access,
