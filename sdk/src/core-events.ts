@@ -9,6 +9,8 @@
 /** Every known core event `type` string (alphabetical). */
 export const CORE_EVENT_TYPES = [
   "aborted",
+  "advisor_note",
+  "advisor_status",
   "agents",
   "approval_changed",
   "approval_expired",

@@ -55,7 +55,7 @@
       "properties": {
         "type": {
           "enum": [
-            "aborted", "agents", "approval_changed", "approval_expired",
+            "aborted", "advisor_note", "advisor_status", "agents", "approval_changed", "approval_expired",
             "approval_request", "ask_request", "audit", "authed",
             "bash_execution", "checkpoint_created", "checkpoint_restored",
             "checkpoints", "compacted", "compacting", "config_changed",

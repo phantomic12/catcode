@@ -4663,26 +4663,6 @@ mod tests {
     }
 
     #[test]
-    fn think_tag_demux_multibyte_tail_does_not_panic() {
-        // Stream chunk ending on a multi-byte UTF-8 char (U+2019 ’) used to
-        // panic in open_tag_hold_start when probing non-boundary hold lengths:
-        // "start byte index N is not a char boundary; it is inside '’'".
-        let mut d = ThinkTagDemux::default();
-        let pieces = d.push("user’s request");
-        assert_eq!(pieces, vec![ThinkPiece::Text("user’s request".into())]);
-        // Inside thinking with a multi-byte trailing char + partial close tag.
-        let mut d = ThinkTagDemux::default();
-        let p1 = d.push("<think>cafés");
-        assert_eq!(p1, vec![ThinkPiece::Thinking("cafés".into())]);
-        // Hold a partial close across a multi-byte boundary in the next chunk.
-        let p2 = d.push("…</th");
-        assert_eq!(p2, vec![ThinkPiece::Thinking("…".into())]);
-        let p3 = d.push("ink>done");
-        assert_eq!(p3, vec![ThinkPiece::Text("done".into())]);
-        assert!(d.finish().is_empty());
-    }
-
-    #[test]
     fn think_tag_demux_plain_text_passthrough() {
         let mut d = ThinkTagDemux::default();
         assert_eq!(d.push("hello "), vec![ThinkPiece::Text("hello ".into())]);

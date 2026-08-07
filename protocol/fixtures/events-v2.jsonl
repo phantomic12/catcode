@@ -1,4 +1,6 @@
 {"type":"aborted","protocol_version":2}
+{"type":"advisor_note","protocol_version":2,"scope":"turn","advisor":"drift","model":"drift-1","severity":"info","message":"stub fixture"}
+{"type":"advisor_status","protocol_version":2,"scope":"turn","advisor":"drift","state":"reviewing","model":"drift-1"}
 {"type":"agents","protocol_version":2}
 {"type":"approval_changed","protocol_version":2}
 {"type":"approval_expired","protocol_version":2}
