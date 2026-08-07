@@ -9,29 +9,54 @@ names, client id, redirect URI, refresh grant, and loadCodeAssist metadata
 mirror the public Antigravity IDE (2.1.1, darwin/arm64) so the upstream
 Code Assist gateway provisions a real ``cloudaicompanionProject`` for us.
 
+HTTP / PKCE / token-IO / refresh-grant / project-extraction helpers live
+in ``core/providers/_shared/google_oauth.py`` — see that file for the
+shared contract. Vendor constants + ``build_authorize_url`` +
+``discover_project_id`` + the four action functions stay here because they
+bind to Antigravity-specific scopes, the ``CATALYST_CODE_ANTIGRAVITY_PROJECT``
+override, and the Antigravity loadCodeAssist fingerprint.
+
 Flow
 ----
 login    PKCE + Authorization Code → harness binds loopback → opens browser
          → captures ``code`` → we exchange + run ``loadCodeAssist`` →
          write ``token.json`` containing access + refresh + project_id.
 token    Return a fresh ``access_token`` (refresh if near expiry) and a
-         ``x-goog-user-project`` header carrying the cached ``project_id``
+         ``x-code-assist-project`` header carrying the cached ``project_id``
          so the harness's Google Code Assist adapter routes to the user's
          real Antigravity project (not the freemium shared one).
 clear    Delete the on-disk token file.
 """
 
-import base64
-import hashlib
 import json
 import os
-import secrets
 import sys
-import tempfile
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
+
+# Bring the shared OAuth helpers into scope. The shared module lives at
+# ``core/providers/_shared/google_oauth.py``; the import below adds its
+# directory to ``sys.path`` so ``google_oauth`` resolves next to this file.
+import sys as _sys, os as _os
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+_sys.path.insert(
+    0, _os.path.abspath(_os.path.join(_HERE, "..", "..", "_shared"))
+)
+from google_oauth import (  # noqa: E402
+    atomic_write,
+    error_text,
+    extract_cloudaicompanion_project,
+    lock_for,
+    make_pkce,
+    normalize_tokens,
+    post_form,
+    post_json,
+    read_token,
+    refresh_access_token as _shared_refresh_access_token,
+    token_path as _shared_token_path,
+    unlock,
+)
 
 
 # ─── Antigravity IDE public OAuth client ────────────────────────────────────
@@ -45,12 +70,9 @@ AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 USERINFO_URL = "https://www.googleapis.com/oauth2/v1/userinfo"
 
-# Scopes the Antigravity IDE requests. ``cclog`` + ``experimentsandconfigs``
-# are Antigravity-specific and are required for Code Assist provisioning.
-# Google OAuth requires ``/oauth2callback`` (not arbitrary paths) for the
-# Antigravity OAuth client — only this path is registered as a loopback
-# redirect URI for ``http://127.0.0.1:<port>`` in the client's Google Cloud
-# console entry. Using ``/callback`` makes Google reject the request as a
+# Scopes the Antigravity IDE requests. ``/oauth2callback`` (not arbitrary
+# paths) is the only loopback redirect URI registered for the Antigravity
+# OAuth client — using ``/callback`` makes Google reject the request as a
 # non-compliant redirect URI ("doesn't comply with Google's OAuth 2.0
 # policy for keeping apps secure"). We mirror the path the Antigravity IDE
 # binary uses.
@@ -102,6 +124,10 @@ ONBOARD_MAX_ATTEMPTS = 5
 ONBOARD_POLL_S = 2
 HTTP_TIMEOUT_S = 30
 
+# Per-script defaults for shared helpers.
+_TOKEN_FILENAME = "antigravity.json"
+_ATOMIC_WRITE_PREFIX = ".antigravity-oauth-"
+
 
 # ─── harness I/O ───────────────────────────────────────────────────────────
 
@@ -115,136 +141,12 @@ def die(message):
     raise SystemExit(0)
 
 
-def now():
-    return int(time.time())
-
-
-# ─── HTTP helpers ──────────────────────────────────────────────────────────
-
-def http_post(url, body, content_type, extra_headers=None):
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": content_type,
-        "User-Agent": USER_AGENT,
-    }
-    if extra_headers:
-        headers.update(extra_headers)
-    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as response:
-            raw = response.read().decode("utf-8", "replace")
-            return response.status, parse_json(raw)
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", "replace")
-        return exc.code, parse_json(raw)
-    except Exception as exc:
-        return 0, {"error": "request_failed", "error_description": str(exc)}
-
-
-def parse_json(raw):
-    try:
-        value = json.loads(raw) if raw.strip() else {}
-        return value if isinstance(value, dict) else {}
-    except Exception:
-        return {"error": "invalid_json", "error_description": raw[:500]}
-
-
-def post_form(url, fields, extra_headers=None):
-    return http_post(
-        url,
-        urllib.parse.urlencode(fields).encode("utf-8"),
-        "application/x-www-form-urlencoded",
-        extra_headers,
-    )
-
-
-def post_json(url, payload, extra_headers=None):
-    return http_post(
-        url,
-        json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-        "application/json",
-        extra_headers,
-    )
-
-
-def error_text(status, data):
-    return (
-        data.get("error_description")
-        or data.get("error")
-        or ("network request failed" if status == 0 else f"HTTP {status}")
-    )
-
-
-# ─── on-disk token file ────────────────────────────────────────────────────
-
 def token_path(ctx):
-    return os.path.abspath(str(ctx.get("token_path") or "antigravity.json"))
-
-
-def read_token(path):
-    try:
-        with open(path, encoding="utf-8") as handle:
-            value = json.load(handle)
-        return value if isinstance(value, dict) else None
-    except (OSError, ValueError, TypeError):
-        return None
-
-
-def atomic_write(path, value):
-    path = os.path.abspath(path)
-    parent = os.path.dirname(path) or "."
-    os.makedirs(parent, mode=0o700, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".antigravity-oauth-", dir=parent)
-    try:
-        try:
-            os.fchmod(fd, 0o600)
-        except AttributeError:
-            pass  # Windows has no POSIX mode bits
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, separators=(",", ":"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def lock_for(path):
-    try:
-        import fcntl
-    except ImportError:
-        return None
-    handle = open(path + ".lock", "a+", encoding="utf-8")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    except OSError:
-        pass
-    return handle
-
-
-def unlock(handle):
-    if handle is not None:
-        try:
-            handle.close()
-        except OSError:
-            pass
+    """Absolute path of the on-disk token file (Antigravity-specific default)."""
+    return _shared_token_path(ctx, _TOKEN_FILENAME)
 
 
 # ─── PKCE + auth URL ───────────────────────────────────────────────────────
-
-def make_pkce():
-    """Generate (verifier, challenge, state) for S256 PKCE."""
-    verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).rstrip(b"=").decode("ascii")
-    challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(verifier.encode("ascii")).digest()
-    ).rstrip(b"=").decode("ascii")
-    state = base64.urlsafe_b64encode(secrets.token_bytes(24)).rstrip(b"=").decode("ascii")
-    return verifier, challenge, state
-
 
 def build_authorize_url(redirect_uri, state, challenge, extra=None):
     # The Antigravity IDE binary does not include ``prompt=consent`` or
@@ -284,16 +186,9 @@ def exchange_code(code, redirect_uri, verifier):
 
 
 def refresh_access_token(refresh_token):
-    status, data = post_form(
-        TOKEN_URL,
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-        },
+    return _shared_refresh_access_token(
+        TOKEN_URL, CLIENT_ID, CLIENT_SECRET, refresh_token
     )
-    return status, data
 
 
 def fetch_user_email(access_token):
@@ -309,21 +204,15 @@ def fetch_user_email(access_token):
         return ""
 
 
-def normalize_tokens(tokens):
-    """Coerce the raw OAuth response into the persistent shape on disk."""
-    access = tokens.get("access_token") or ""
-    refresh = tokens.get("refresh_token") or ""
-    if not access and not refresh:
-        return None
-    expires_in = int(tokens.get("expires_in") or 0)
-    return {
-        "access_token": access,
-        "refresh_token": refresh,
-        "expires_in": expires_in,
-        "expires_at": now() + max(expires_in, 60),
-        "scope": tokens.get("scope", ""),
-        "token_type": tokens.get("token_type", "Bearer"),
-    }
+def parse_json(raw):
+    # Local shim so ``fetch_user_email`` can keep its old call site; the
+    # canonical implementation now lives in ``google_oauth``. The behaviour
+    # is identical (raw -> dict-or-fallback-error shape).
+    try:
+        value = json.loads(raw) if raw.strip() else {}
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {"error": "invalid_json", "error_description": raw[:500]}
 
 
 # ─── Code Assist: loadCodeAssist + onboardUser ─────────────────────────────
@@ -353,14 +242,7 @@ def load_code_assist(access_token):
     )
     if status != 200:
         return None
-    project = data.get("cloudaicompanionProject")
-    if isinstance(project, str) and project.strip():
-        return project.strip()
-    if isinstance(project, dict):
-        nested = project.get("id")
-        if isinstance(nested, str) and nested.strip():
-            return nested.strip()
-    return None
+    return extract_cloudaicompanion_project(data)
 
 
 def _pick_default_tier(payload):
@@ -385,15 +267,7 @@ def onboard_user(access_token, tier_id):
         if status != 200:
             return None
         if data.get("done") is True:
-            response = data.get("response") or {}
-            project = response.get("cloudaicompanionProject")
-            if isinstance(project, str) and project.strip():
-                return project.strip()
-            if isinstance(project, dict):
-                nested = project.get("id")
-                if isinstance(nested, str) and nested.strip():
-                    return nested.strip()
-            return None
+            return extract_cloudaicompanion_project(data)
         if attempt < ONBOARD_MAX_ATTEMPTS:
             time.sleep(ONBOARD_POLL_S)
     return None
@@ -419,13 +293,9 @@ def discover_project_id(access_token):
     )
     if status != 200:
         return None
-    project = data.get("cloudaicompanionProject")
-    if isinstance(project, str) and project.strip():
-        return project.strip()
-    if isinstance(project, dict):
-        nested = project.get("id")
-        if isinstance(nested, str) and nested.strip():
-            return nested.strip()
+    project = extract_cloudaicompanion_project(data)
+    if project:
+        return project
     tier = _pick_default_tier(data)
     return onboard_user(access_token, tier)
 
@@ -490,7 +360,7 @@ def do_complete(ctx):
     if email:
         normalized["email"] = email
 
-    atomic_write(token_path(ctx), normalized)
+    atomic_write(token_path(ctx), normalized, prefix=_ATOMIC_WRITE_PREFIX)
     emit({"ok": True})
 
 
@@ -541,7 +411,7 @@ def do_token(ctx):
                 # OAuth grant.
                 rotated["project_id"] = current_token.get("project_id", "")
                 rotated["email"] = current_token.get("email", "")
-                atomic_write(path, rotated)
+                atomic_write(path, rotated, prefix=_ATOMIC_WRITE_PREFIX)
                 token = rotated
 
         access = token.get("access_token") or ""
@@ -578,6 +448,13 @@ def do_clear(ctx):
         except OSError:
             pass
     emit({"ok": True})
+
+
+def now():
+    # Local shim — action functions and ``do_token`` already use ``now()``
+    # directly. Same implementation as ``google_oauth.now()``; kept local
+    # so the per-script code reads naturally without a shared-module call.
+    return int(time.time())
 
 
 def main():

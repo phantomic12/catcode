@@ -27,7 +27,7 @@ use std::path::PathBuf;
 /// Bump when the bundled default set changes meaningfully. The marker file
 /// stores this; on a version mismatch we re-scan for *missing* files (existing
 /// user files are still never overwritten) and then re-stamp the marker.
-pub const STAGING_VERSION: u32 = 7;
+pub const STAGING_VERSION: u32 = 8;
 
 /// `~/.catalyst-code` — the global, user-owned home for harness defaults.
 /// All staged files live under here (agents/, skills/, plugins/, README.md).
@@ -290,6 +290,15 @@ fn bundled_files() -> Vec<(&'static str, &'static str)> {
             "plugins/gemini-cli/README.md",
             include_str!("../providers/gemini-cli/README.md"),
         ),
+        // --- shared OAuth helpers used by the antigravity + gemini-cli
+        //      provider scripts. Lives under ``plugins/_shared/`` so the
+        //      provider scripts' relative ``..``/``..``/``_shared`` import
+        //      pattern resolves to the staged location too. Not a hook —
+        //      not executable. ---
+        (
+            "plugins/_shared/google_oauth.py",
+            include_str!("../providers/_shared/google_oauth.py"),
+        ),
         // --- A short guide to the global layout + override model. ---
         ("README.md", GLOBAL_README),
     ]
@@ -401,7 +410,9 @@ project.
     │   ├── codex/           # ChatGPT subscription OAuth provider
     │   ├── deepseek/        # DeepSeek API-key provider
     │   ├── antigravity/     # Google Antigravity IDE OAuth + Code Assist
-    │   └── gemini-cli/      # Google Gemini CLI OAuth + Code Assist
+    │   ├── gemini-cli/      # Google Gemini CLI OAuth + Code Assist
+    │   └── _shared/         # shared Python helpers used by the Google OAuth
+    │                        # provider scripts (import-only, not a plugin)
     ├── README.md          # this file
     └── .staged            # staging schema version marker (do not edit)
 
@@ -512,6 +523,10 @@ mod tests {
         assert!(
             home.join("plugins/gemini-cli/README.md").exists(),
             "gemini-cli provider README should be staged on first run"
+        );
+        assert!(
+            home.join("plugins/_shared/google_oauth.py").exists(),
+            "shared google_oauth helpers should be staged on first run"
         );
         assert!(home.join(".staged").exists());
         assert_eq!(

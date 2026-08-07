@@ -9,6 +9,13 @@ names, client id, redirect URI, refresh grant, and loadCodeAssist metadata
 mirror Google's open-source ``gemini`` CLI so the upstream Code Assist
 gateway provisions a real ``cloudaicompanionProject`` for us.
 
+HTTP / PKCE / token-IO / refresh-grant / project-extraction helpers live
+in ``core/providers/_shared/google_oauth.py`` — see that file for the
+shared contract. Vendor constants + ``build_authorize_url`` +
+``discover_project_id`` + the four action functions stay here because they
+bind to gemini-cli-specific scopes and the sibling-Antigravity-token
+fallback used when free-tier loadCodeAssist returns no project.
+
 Compared to the Antigravity plugin this one uses:
 
 * a different public OAuth client (the open-source gemini-cli client);
@@ -20,17 +27,35 @@ Compared to the Antigravity plugin this one uses:
   numeric enums the gemini-cli binary actually sends).
 """
 
-import base64
-import hashlib
 import json
 import os
-import secrets
 import sys
-import tempfile
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
+
+# Bring the shared OAuth helpers into scope. The shared module lives at
+# ``core/providers/_shared/google_oauth.py``; the import below adds its
+# directory to ``sys.path`` so ``google_oauth`` resolves next to this file.
+import sys as _sys, os as _os
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+_sys.path.insert(
+    0, _os.path.abspath(_os.path.join(_HERE, "..", "..", "_shared"))
+)
+from google_oauth import (  # noqa: E402
+    atomic_write,
+    error_text,
+    extract_cloudaicompanion_project,
+    lock_for,
+    make_pkce,
+    normalize_tokens,
+    post_form,
+    post_json,
+    read_token,
+    refresh_access_token as _shared_refresh_access_token,
+    token_path as _shared_token_path,
+    unlock,
+)
 
 
 # ─── Gemini CLI public OAuth client ────────────────────────────────────────
@@ -99,6 +124,10 @@ ONBOARD_MAX_ATTEMPTS = 5
 ONBOARD_POLL_S = 2
 HTTP_TIMEOUT_S = 30
 
+# Per-script defaults for shared helpers.
+_TOKEN_FILENAME = "gemini-cli.json"
+_ATOMIC_WRITE_PREFIX = ".gemini-cli-oauth-"
+
 
 # ─── harness I/O ───────────────────────────────────────────────────────────
 
@@ -112,136 +141,12 @@ def die(message):
     raise SystemExit(0)
 
 
-def now():
-    return int(time.time())
-
-
-# ─── HTTP helpers ──────────────────────────────────────────────────────────
-
-def http_post(url, body, content_type, extra_headers=None):
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": content_type,
-        "User-Agent": USER_AGENT,
-    }
-    if extra_headers:
-        headers.update(extra_headers)
-    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as response:
-            raw = response.read().decode("utf-8", "replace")
-            return response.status, parse_json(raw)
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", "replace")
-        return exc.code, parse_json(raw)
-    except Exception as exc:
-        return 0, {"error": "request_failed", "error_description": str(exc)}
-
-
-def parse_json(raw):
-    try:
-        value = json.loads(raw) if raw.strip() else {}
-        return value if isinstance(value, dict) else {}
-    except Exception:
-        return {"error": "invalid_json", "error_description": raw[:500]}
-
-
-def post_form(url, fields, extra_headers=None):
-    return http_post(
-        url,
-        urllib.parse.urlencode(fields).encode("utf-8"),
-        "application/x-www-form-urlencoded",
-        extra_headers,
-    )
-
-
-def post_json(url, payload, extra_headers=None):
-    return http_post(
-        url,
-        json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-        "application/json",
-        extra_headers,
-    )
-
-
-def error_text(status, data):
-    return (
-        data.get("error_description")
-        or data.get("error")
-        or ("network request failed" if status == 0 else f"HTTP {status}")
-    )
-
-
-# ─── on-disk token file ────────────────────────────────────────────────────
-
 def token_path(ctx):
-    return os.path.abspath(str(ctx.get("token_path") or "gemini-cli.json"))
-
-
-def read_token(path):
-    try:
-        with open(path, encoding="utf-8") as handle:
-            value = json.load(handle)
-        return value if isinstance(value, dict) else None
-    except (OSError, ValueError, TypeError):
-        return None
-
-
-def atomic_write(path, value):
-    path = os.path.abspath(path)
-    parent = os.path.dirname(path) or "."
-    os.makedirs(parent, mode=0o700, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".gemini-cli-oauth-", dir=parent)
-    try:
-        try:
-            os.fchmod(fd, 0o600)
-        except AttributeError:
-            pass
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, separators=(",", ":"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
-def lock_for(path):
-    try:
-        import fcntl
-    except ImportError:
-        return None
-    handle = open(path + ".lock", "a+", encoding="utf-8")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    except OSError:
-        pass
-    return handle
-
-
-def unlock(handle):
-    if handle is not None:
-        try:
-            handle.close()
-        except OSError:
-            pass
+    """Absolute path of the on-disk token file (gemini-cli-specific default)."""
+    return _shared_token_path(ctx, _TOKEN_FILENAME)
 
 
 # ─── PKCE + auth URL ───────────────────────────────────────────────────────
-
-def make_pkce():
-    """Generate (verifier, challenge, state) for S256 PKCE."""
-    verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).rstrip(b"=").decode("ascii")
-    challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(verifier.encode("ascii")).digest()
-    ).rstrip(b"=").decode("ascii")
-    state = base64.urlsafe_b64encode(secrets.token_bytes(24)).rstrip(b"=").decode("ascii")
-    return verifier, challenge, state
-
 
 def build_authorize_url(redirect_uri, state, challenge):
     # The official ``gemini`` CLI does NOT send ``prompt=consent`` or
@@ -280,16 +185,9 @@ def exchange_code(code, redirect_uri, verifier):
 
 
 def refresh_access_token(refresh_token):
-    status, data = post_form(
-        TOKEN_URL,
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-        },
+    return _shared_refresh_access_token(
+        TOKEN_URL, CLIENT_ID, CLIENT_SECRET, refresh_token
     )
-    return status, data
 
 
 def fetch_user_email(access_token):
@@ -305,21 +203,15 @@ def fetch_user_email(access_token):
         return ""
 
 
-def normalize_tokens(tokens):
-    """Coerce the raw OAuth response into the persistent shape on disk."""
-    access = tokens.get("access_token") or ""
-    refresh = tokens.get("refresh_token") or ""
-    if not access and not refresh:
-        return None
-    expires_in = int(tokens.get("expires_in") or 0)
-    return {
-        "access_token": access,
-        "refresh_token": refresh,
-        "expires_in": expires_in,
-        "expires_at": now() + max(expires_in, 60),
-        "scope": tokens.get("scope", ""),
-        "token_type": tokens.get("token_type", "Bearer"),
-    }
+def parse_json(raw):
+    # Local shim so ``fetch_user_email`` can keep its old call site; the
+    # canonical implementation now lives in ``google_oauth``. The behaviour
+    # is identical (raw -> dict-or-fallback-error shape).
+    try:
+        value = json.loads(raw) if raw.strip() else {}
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {"error": "invalid_json", "error_description": raw[:500]}
 
 
 # ─── Code Assist: loadCodeAssist + onboardUser ─────────────────────────────
@@ -341,25 +233,6 @@ def _code_assist_body(include_tier=False, tier_id=None, mode=1):
     if include_tier:
         body["tierId"] = tier_id or "legacy-tier"
     return body
-
-
-def _extract_project(payload):
-    """Pull ``cloudaicompanionProject`` out of a loadCodeAssist / onboardUser response."""
-    project = payload.get("cloudaicompanionProject")
-    if isinstance(project, str) and project.strip():
-        return project.strip()
-    if isinstance(project, dict):
-        nested = project.get("id")
-        if isinstance(nested, str) and nested.strip():
-            return nested.strip()
-    nested = (payload.get("response") or {}).get("cloudaicompanionProject")
-    if isinstance(nested, str) and nested.strip():
-        return nested.strip()
-    if isinstance(nested, dict):
-        id_ = nested.get("id")
-        if isinstance(id_, str) and id_.strip():
-            return id_.strip()
-    return None
 
 
 def _pick_default_tier(payload):
@@ -394,7 +267,7 @@ def onboard_user(access_token, tier_id):
         if status != 200:
             return None
         if data.get("done") is True:
-            return _extract_project(data)
+            return extract_cloudaicompanion_project(data)
         if attempt < ONBOARD_MAX_ATTEMPTS:
             time.sleep(ONBOARD_POLL_S)
     return None
@@ -416,7 +289,7 @@ def discover_project_id(access_token):
         return override
     payload = load_code_assist_payload(access_token)
     if payload is not None:
-        project = _extract_project(payload)
+        project = extract_cloudaicompanion_project(payload)
         if project:
             return project
         tier = _pick_default_tier(payload)
@@ -503,7 +376,7 @@ def do_complete(ctx):
     if email:
         normalized["email"] = email
 
-    atomic_write(token_path(ctx), normalized)
+    atomic_write(token_path(ctx), normalized, prefix=_ATOMIC_WRITE_PREFIX)
     emit({"ok": True})
 
 
@@ -554,7 +427,7 @@ def do_token(ctx):
                 # OAuth grant.
                 rotated["project_id"] = current_token.get("project_id", "")
                 rotated["email"] = current_token.get("email", "")
-                atomic_write(path, rotated)
+                atomic_write(path, rotated, prefix=_ATOMIC_WRITE_PREFIX)
                 token = rotated
 
         access = token.get("access_token") or ""
@@ -594,6 +467,13 @@ def do_clear(ctx):
         except OSError:
             pass
     emit({"ok": True})
+
+
+def now():
+    # Local shim — action functions and ``do_token`` already use ``now()``
+    # directly. Same implementation as ``google_oauth.now()``; kept local
+    # so the per-script code reads naturally without a shared-module call.
+    return int(time.time())
 
 
 def main():
