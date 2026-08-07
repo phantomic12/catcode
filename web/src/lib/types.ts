@@ -812,6 +812,8 @@ export type CoreEvent =
   | { type: "history"; messages: unknown[]; tokens_in?: number }
   | { type: "done" }
   | { type: "aborted" }
+  | { type: "advisor_note"; scope: string; advisor: string; model: string; severity: string; message: string }
+  | { type: "advisor_status"; scope: string; advisor: string; state: string; model?: string }
   | { type: "reset" }
   | { type: "error"; message: string }
   | { type: "info"; message: string }
