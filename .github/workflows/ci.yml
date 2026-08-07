@@ -136,25 +136,26 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-next-${{ hashFiles('web/bun.lock') }}-${{ hashFiles('web/src/**/*.ts', 'web/src/**/*.tsx', 'web/public/**', 'web/next.config.mjs', 'web/tsconfig.json') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-next-${{ hashFiles('web/bun.lock') }}-
-      - name: install
-        working-directory: web
-        run: bun install --frozen-lockfile
       - name: SDK install
         working-directory: sdk
         run: bun install --frozen-lockfile
+      - name: SDK build
+        # The web app's `@catalyst-code/coding-agent` import resolves to
+        # `./dist/index.d.ts` per sdk/package.json. Web install must happen
+        # after this so the `file:../sdk` link resolves to a freshly built
+        # SDK; web typecheck/test must see the latest SDK types whenever a
+        # new event is added to CORE_EVENT_TYPES.
+        working-directory: sdk
+        run: bun run build
       - name: SDK typecheck
         working-directory: sdk
         run: bun run typecheck
       - name: SDK protocol tests
         working-directory: sdk
         run: bun test
-      - name: SDK build
-        # The web app's `@catalyst-code/coding-agent` import resolves to
-        # `./dist/index.d.ts` per sdk/package.json. Web typecheck/test must
-        # see the latest SDK types whenever a new event is added to
-        # CORE_EVENT_TYPES, so build the SDK before web typecheck.
-        working-directory: sdk
-        run: bun run build
+      - name: install
+        working-directory: web
+        run: bun install --frozen-lockfile
       - name: typecheck
         working-directory: web
         run: bun run typecheck
