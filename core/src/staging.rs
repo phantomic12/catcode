@@ -492,8 +492,7 @@ mod tests {
             "antigravity provider should be staged on first run"
         );
         assert!(
-            home
-                .join("plugins/antigravity/oauth/antigravity-oauth.py")
+            home.join("plugins/antigravity/oauth/antigravity-oauth.py")
                 .exists(),
             "antigravity oauth script should be staged on first run"
         );
@@ -506,8 +505,7 @@ mod tests {
             "gemini-cli provider should be staged on first run"
         );
         assert!(
-            home
-                .join("plugins/gemini-cli/oauth/gemini-cli-oauth.py")
+            home.join("plugins/gemini-cli/oauth/gemini-cli-oauth.py")
                 .exists(),
             "gemini-cli oauth script should be staged on first run"
         );
@@ -575,22 +573,19 @@ mod tests {
                 .permissions()
                 .mode();
             assert!(mode & 0o111 != 0, "codex oauth script must be executable");
-            let mode = std::fs::metadata(
-                home.join("plugins/antigravity/oauth/antigravity-oauth.py"),
-            )
-            .unwrap()
-            .permissions()
-            .mode();
+            let mode =
+                std::fs::metadata(home.join("plugins/antigravity/oauth/antigravity-oauth.py"))
+                    .unwrap()
+                    .permissions()
+                    .mode();
             assert!(
                 mode & 0o111 != 0,
                 "antigravity oauth script must be executable"
             );
-            let mode = std::fs::metadata(
-                home.join("plugins/gemini-cli/oauth/gemini-cli-oauth.py"),
-            )
-            .unwrap()
-            .permissions()
-            .mode();
+            let mode = std::fs::metadata(home.join("plugins/gemini-cli/oauth/gemini-cli-oauth.py"))
+                .unwrap()
+                .permissions()
+                .mode();
             assert!(
                 mode & 0o111 != 0,
                 "gemini-cli oauth script must be executable"
