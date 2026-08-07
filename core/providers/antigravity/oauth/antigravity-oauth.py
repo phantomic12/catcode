@@ -47,8 +47,20 @@ USERINFO_URL = "https://www.googleapis.com/oauth2/v1/userinfo"
 
 # Scopes the Antigravity IDE requests. ``cclog`` + ``experimentsandconfigs``
 # are Antigravity-specific and are required for Code Assist provisioning.
+# Google OAuth requires ``/oauth2callback`` (not arbitrary paths) for the
+# Antigravity OAuth client — only this path is registered as a loopback
+# redirect URI for ``http://127.0.0.1:<port>`` in the client's Google Cloud
+# console entry. Using ``/callback`` makes Google reject the request as a
+# non-compliant redirect URI ("doesn't comply with Google's OAuth 2.0
+# policy for keeping apps secure"). We mirror the path the Antigravity IDE
+# binary uses.
+REDIRECT_PATH = "/oauth2callback"
+
+# Scopes the Antigravity IDE requests. ``openid`` is intentionally omitted
+# (same reason as gemini-cli — it triggers Google's unverified-app gate on
+# ``cclog`` / ``experimentsandconfigs`` requests). ``userinfo.email`` +
+# ``userinfo.profile`` are sufficient for the loadCodeAssist user lookup.
 SCOPES = [
-    "openid",
     "https://www.googleapis.com/auth/cloud-platform",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
@@ -226,6 +238,10 @@ def make_pkce():
 
 
 def build_authorize_url(redirect_uri, state, challenge, extra=None):
+    # The Antigravity IDE binary does not include ``prompt=consent`` or
+    # ``include_granted_scopes=true``; including either can confuse Google's
+    # refresh-token issuance for the Antigravity OAuth client. Keep the
+    # request minimal: redirect + scope + PKCE + state + offline.
     params = {
         "client_id": CLIENT_ID,
         "response_type": "code",
@@ -235,8 +251,6 @@ def build_authorize_url(redirect_uri, state, challenge, extra=None):
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "access_type": "offline",
-        "prompt": "consent",
-        "include_granted_scopes": "true",
     }
     if extra:
         params.update(extra)
@@ -376,7 +390,18 @@ def onboard_user(access_token, tier_id):
 
 
 def discover_project_id(access_token):
-    """Try loadCodeAssist; on failure, fall back to onboardUser polling."""
+    """Try loadCodeAssist; on failure, fall back to onboardUser polling.
+
+    If ``CATALYST_CODE_ANTIGRAVITY_PROJECT`` is set in the environment, it
+    wins over whatever Google provisioned — the auto-provisioned project
+    is often a Google-managed one the user is not an owner of, so they
+    cannot enable Cloud Code Private API on it from the Cloud Console.
+    Pinning a project the user owns + can enable APIs on is the only way
+    to unblock chat in that situation.
+    """
+    override = os.environ.get(ANTIGRAVITY_PROJECT_ENV, "").strip()
+    if override:
+        return override
     # We need the loadCodeAssist payload too (for the tier), so re-call.
     status, data = post_json(
         LOAD_CODE_ASSIST_URL,
@@ -445,6 +470,12 @@ def do_complete(ctx):
     project_id = discover_project_id(normalized["access_token"])
     if project_id:
         normalized["project_id"] = project_id
+    # Re-check the env override after discover_project_id — if set, the
+    # auto-provisioned project would otherwise be persisted and chat would
+    # be stuck on SERVICE_DISABLED.
+    override = os.environ.get(ANTIGRAVITY_PROJECT_ENV, "").strip()
+    if override:
+        normalized["project_id"] = override
 
     email = fetch_user_email(normalized["access_token"])
     if email:
