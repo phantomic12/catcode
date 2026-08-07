@@ -594,11 +594,26 @@ Fields:
 - `login_timeout_ms` (optional, default 120000): timeout for `login` +
   `complete`.
 - `token_timeout_ms` (optional, default 30000): timeout for `token` + `clear`.
+- `redirect_path` (optional, default `"/callback"`): the path component the
+  harness binds on its loopback redirect server for the web flow. **Must
+  match the redirect URI registered with the provider's OAuth client** —
+  Google's installed-app OAuth clients (Antigravity IDE, Gemini CLI) require
+  `"/oauth2callback"`; using the default `"/callback"` makes Google reject
+  the request as a non-compliant redirect URI (`redirect_uri_mismatch`).
+  The harness prefixes a `/` if absent, so `"/oauth2callback"` and
+  `"oauth2callback"` are equivalent. See
+  [`docs/plugins/oauth.md`](../../../docs/plugins/oauth.md#redirect_path-matching-the-providers-registered-redirect-uri)
+  for the full table of which providers need which path.
 - `env_passthrough` (optional): non-secret env var names the harness forwards
-  to your scripts (e.g. `["ACME_OAUTH_HOST"]` for a self-hosted auth server).
-  The harness otherwise scrubs the environment, so undeclared vars never reach
-  the script. Names containing KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL are
-  rejected at load time — passthrough must never defeat env scrubbing.
+  to your scripts (e.g. `["ACME_OAUTH_HOST"]` for a self-hosted auth server,
+  or `["CATALYST_CODE_<NAME>_PROJECT"]` for a plugin-specific project
+  override that survives env scrubbing). The harness otherwise scrubs the
+  environment, so undeclared vars never reach the script. Names must match
+  `[A-Za-z_][A-Za-z0-9_]*`; any name containing KEY/TOKEN/SECRET/PASSWORD/
+  CREDENTIAL (case-insensitive) is rejected at load time — passthrough must
+  never defeat env scrubbing. See
+  [`docs/plugins/oauth.md`](../../../docs/plugins/oauth.md#env_passthrough-plugin-specific-config-knobs-that-survive-env-scrubbing)
+  for the conventions and the rationale.
 
 #### Script action contract
 
@@ -651,8 +666,19 @@ refresh (make your own HTTP call) and write the updated token back. Output:
 `expires_at` is unix seconds (optional; if 0/absent the harness caches for ~5
 min). Optional `headers` are merged onto every request for that provider
 (plugin wins on name conflicts) and cached with the token — use this for
-per-user identity headers such as ChatGPT's `chatgpt-account-id`. This runs
-on the per-turn hot path, so it is cached until near expiry.
+per-user identity headers such as ChatGPT's `chatgpt-account-id` or
+Google Code Assist's `x-code-assist-project` (Antigravity / Gemini CLI
+bundles). This runs on the per-turn hot path, so it is cached until near
+expiry.
+
+**Header gotcha (Google Code Assist):** inject `x-code-assist-project`,
+**not** `x-goog-user-project` and **not** `cloudaicompanion-project`. The
+Code Assist chat gateway treats the three names as different routing
+signals: only `x-code-assist-project` is authorized for Antigravity /
+Gemini CLI OAuth tokens; the other two route to the consumer GenAI gate
+and return `403 SERVICE_DISABLED`. Verified live and pinned by the
+`wire_shape_contract` test module in
+`core/src/providers/google_code_assist.rs`.
 
 Concurrency: several harness processes (TUI, web service, a second TUI) can
 invoke `token` at the same time, and providers commonly rotate refresh tokens.

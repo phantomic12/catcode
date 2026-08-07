@@ -64,3 +64,108 @@ daily-cloudcode-pa hosts to the right wire format, and the adapter's
 `resolve_project` reads the `x-code-assist-project` header that each plugin's
 `token` action injects to use the user's real Code Assist project instead
 of the freemium fallback.
+
+## OAuth gotchas
+
+These are the wire-level footguns the `google_code_assist` adapter exists
+to handle and the `wire_shape_contract` test module in
+`core/src/providers/google_code_assist.rs` line 800 is the authoritative
+spec for. Anything in this section will break the live Antigravity IDE /
+Gemini CLI flow with HTTP 403 (`SERVICE_DISABLED`) or
+`redirect_uri_mismatch` if violated.
+
+### 1. Project header: `x-code-assist-project`, NOT `x-goog-user-project`
+
+`resolve_project` reads the **first** header in the provider's headers vec
+that matches any of:
+
+- `x-goog-user-project`
+- `cloudaicompanion-project`
+- `x-code-assist-project`
+
+(iteration order, case-insensitive). The Google Code Assist chat gateway
+treats these as **three different signals** with **different routing**:
+
+| Header | What the gateway does | What to do |
+|--------|-----------------------|------------|
+| `x-goog-user-project` | Routes to the **consumer** Generative Language API (GenAI) gate. The Antigravity / Gemini CLI OAuth token does **not** have access; the gateway returns `403 SERVICE_DISABLED`. | **Do not inject.** |
+| `cloudaicompanion-project` | Routes to the consumer gate same as `x-goog-user-project`. | **Do not inject.** |
+| `x-code-assist-project` | Routes to the **Code Assist** gate. The OAuth token is authorized here. The body also carries the same value in `body.project`. | **Inject this one.** |
+
+**The plugin's `token` action MUST return `x-code-assist-project` in its
+`headers` array** (not `x-goog-user-project`, not
+`cloudaicompanion-project`). The bundled `antigravity/` and `gemini-cli/`
+bundles both do this. Verified live against the
+`daily-cloudcode-pa.sandbox.googleapis.com` and
+`cloudcode-pa.googleapis.com` hosts — swapping the header name surfaces
+as `403 SERVICE_DISABLED` on the very first chat request, with no helpful
+error message from the gateway.
+
+The `wire_shape_contract::resolve_project_picks_first_matching_header_in_iteration_order`
+test (line 882) pins this behavior.
+
+### 2. Code Assist body envelope shape
+
+The Code Assist / GenAI chat endpoint does not use the OpenAI
+`{messages, …}` body. The adapter wraps the user messages into the
+GenAI streaming envelope:
+
+```json
+{
+  "model": "<resolved-model-id>",
+  "project": "<from x-code-assist-project>",
+  "userAgent": "antigravity",
+  "request": {
+    "contents": [ {"role": "user", "parts": [{"text": "…"}]}, … ],
+    "generationConfig": { "maxOutputTokens": <n> },
+    "systemInstruction": {"parts": [{"text": "…"}]},
+    "tools": [{"functionDeclarations": […]}],
+    "thinkingConfig": {"thinkingLevel": "low|medium|high", "includeThoughts": true}
+  }
+}
+```
+
+Pinned by the
+`wire_shape_contract::body_uses_antigravity_user_agent_and_body_project`
+test (line 837). Key constraints:
+
+- `userAgent` is the **string** `"antigravity"` for Antigravity IDE traffic
+  and `"gemini-cli"` for Gemini CLI traffic. The gateway distinguishes
+  clients by this field.
+- `project` is the value the plugin's `token` action injected as
+  `x-code-assist-project`. The header and the body field must agree.
+- `contents[].role` is **only** `user` or `model`. `functionResponse`
+  parts must ride on a `user` turn (using role `function` 400s on
+  `cloudcode-pa` / `generativelanguage`).
+- `maxOutputTokens: 0` is rejected ("generate nothing"); the adapter
+  floors to `1`.
+- Empty `contents` (system-only) is rejected; the adapter errors before
+  sending instead of letting the gateway 400.
+- Gemini 3 uses `thinkingLevel` (`minimal` / `low` / `medium` / `high` /
+  `auto`); Gemini 2.5 uses `thinkingBudget` (numeric); Gemini 2.0
+  rejects `thinkingConfig` entirely. The adapter picks the right shape
+  per model id (`model_supports_thinking`).
+
+### 3. Redirect path: `/oauth2callback` for Google
+
+The Antigravity and Gemini CLI bundles both declare
+`redirect_path: "/oauth2callback"`. Google's installed-app OAuth clients
+only accept this exact path; using the harness's default `/callback`
+makes `accounts.google.com` reject the request as a non-compliant
+redirect URI (error: `redirect_uri_mismatch`, hard non-compliance
+per Google's OAuth 2.0 policy for installed apps). The plugin is
+expected to embed the harness-provided `redirect_uri` **verbatim** in
+the authorize URL — including the port and path.
+
+### 4. Token refresh on the hot path
+
+The `token` action runs on **every turn** (cached for ~5 min, then
+re-run). Two consequences:
+
+- Keep `token` cheap. Refresh only when the cached token is near
+  expiry; do not call out to the IdP on every chat turn.
+- The `headers` returned by `token` are **cached with the token** and
+  merged onto the provider's request headers. If `x-code-assist-project`
+  changes between calls (e.g. the user's `loadCodeAssist` rotation
+  swapped the project), the new value reaches the gateway on the very
+  next turn without a `/login` cycle.
