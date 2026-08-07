@@ -6,6 +6,12 @@
 core/target/
 **/*.rs.bk
 
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
 # Go (tui/) compiled binaries
 tui/tui
 tui/catalyst-code-tui
