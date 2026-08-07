@@ -591,6 +591,12 @@ struct OauthManifestEntry {
     /// Timeout for the token (resolve/refresh) action (default 30s).
     #[serde(default)]
     token_timeout_ms: Option<u64>,
+    /// Optional path for the loopback redirect (e.g. ``"/oauth2callback"``
+    /// for Google's installed-app OAuth clients). Defaults to ``"/callback"``
+    /// which is what most plugins use; override when the OAuth provider's
+    /// registered redirect URI has a different path.
+    #[serde(default)]
+    redirect_path: Option<String>,
     /// Non-secret env var names the harness forwards to this provider's
     /// scripts (e.g. `ACME_OAUTH_HOST` for a self-hosted auth server). The
     /// harness otherwise scrubs the environment, so plugin-specific config
@@ -721,6 +727,10 @@ pub struct PluginOauthConfig {
     pub base_url: String,
     pub description: String,
     pub headers: Vec<(String, String)>,
+    /// Loopback redirect path. Default ``"/callback"``. Override when the
+    /// provider's registered redirect URI uses a different path (e.g. Google's
+    /// installed-app OAuth clients expect ``"/oauth2callback"``).
+    pub redirect_path: String,
     /// Absolute path the plugin reads/writes its token at.
     pub token_path: PathBuf,
     /// Optional external credential path used for cheap login detection.
@@ -2335,8 +2345,18 @@ impl PluginManager {
 
         if !headless {
             // Web flow: bind a loopback redirect the script embeds in its URL.
+            // Plugins override ``redirect_path`` when their OAuth provider
+            // requires a specific registered path (e.g. Google's
+            // installed-app OAuth clients require ``/oauth2callback``).
             let (listener, listener_v6, port) = crate::oauth::bind_loopback(0).await?;
-            let redirect_uri = format!("http://localhost:{port}/callback");
+            let redirect_uri = format!(
+                "http://localhost:{port}{}",
+                if cfg.redirect_path.starts_with('/') {
+                    cfg.redirect_path.clone()
+                } else {
+                    format!("/{}", cfg.redirect_path)
+                }
+            );
             let mut ctx = self.oauth_action_ctx("login", provider_id, &token_path);
             ctx["headless"] = json!(false);
             ctx["redirect_uri"] = json!(redirect_uri);
@@ -3545,6 +3565,9 @@ fn load_oauth_entry(
         base_url: entry.base_url,
         description: entry.description.unwrap_or_default(),
         headers: entry.headers,
+        redirect_path: entry
+            .redirect_path
+            .unwrap_or_else(|| "/callback".to_string()),
         token_path,
         detect_path,
         scripts,

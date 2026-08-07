@@ -68,6 +68,15 @@ SCOPES = [
     "https://www.googleapis.com/auth/experimentsandconfigs",
 ]
 
+# Env var that pins the Antigravity ``cloudaicompanionProject`` to a
+# specific GCP project the user owns and can enable Cloud Code Private
+# API on. Use this when the auto-provisioned project (e.g.
+# ``synthetic-expanse-sxhhm``) is unusable — e.g. the user is not a
+# member of the Google-managed project so they cannot enable the API
+# from the Cloud Console. When unset, the script uses whatever
+# ``loadCodeAssist`` / ``onboardUser`` returns.
+ANTIGRAVITY_PROJECT_ENV = "CATALYST_CODE_ANTIGRAVITY_PROJECT"
+
 # Antigravity IDE fingerprints (must match what the IDE actually sends —
 # Google's backend fingerprints these headers and silently refuses to
 # provision a project if they look wrong).
@@ -334,6 +343,7 @@ def _code_assist_body(include_tier=False, tier_id=None):
     return body
 
 
+
 def load_code_assist(access_token):
     """POST :loadCodeAssist, return ``cloudaicompanionProject`` id or ``None``."""
     status, data = post_json(
@@ -390,35 +400,34 @@ def onboard_user(access_token, tier_id):
 
 
 def discover_project_id(access_token):
-    """Try loadCodeAssist; on failure, fall back to onboardUser polling.
+    """Resolve the Antigravity ``cloudaicompanionProject``.
 
-    If ``CATALYST_CODE_ANTIGRAVITY_PROJECT`` is set in the environment, it
-    wins over whatever Google provisioned — the auto-provisioned project
-    is often a Google-managed one the user is not an owner of, so they
-    cannot enable Cloud Code Private API on it from the Cloud Console.
-    Pinning a project the user owns + can enable APIs on is the only way
-    to unblock chat in that situation.
+    Priority:
+      1. ``CATALYST_CODE_ANTIGRAVITY_PROJECT`` env override (escape hatch
+         when the auto-provisioned project is a Google-managed one the
+         user does not own and so cannot enable Cloud Code Private API on).
+      2. ``loadCodeAssist`` — returns the existing project if the user is
+         already onboarded, otherwise ``onboardUser`` polls until done.
     """
     override = os.environ.get(ANTIGRAVITY_PROJECT_ENV, "").strip()
     if override:
         return override
-    # We need the loadCodeAssist payload too (for the tier), so re-call.
     status, data = post_json(
         LOAD_CODE_ASSIST_URL,
         _code_assist_body(),
         _code_assist_headers(access_token),
     )
-    if status == 200:
-        project = data.get("cloudaicompanionProject")
-        if isinstance(project, str) and project.strip():
-            return project.strip()
-        if isinstance(project, dict):
-            nested = project.get("id")
-            if isinstance(nested, str) and nested.strip():
-                return nested.strip()
-        tier = _pick_default_tier(data)
-        return onboard_user(access_token, tier)
-    return None
+    if status != 200:
+        return None
+    project = data.get("cloudaicompanionProject")
+    if isinstance(project, str) and project.strip():
+        return project.strip()
+    if isinstance(project, dict):
+        nested = project.get("id")
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip()
+    tier = _pick_default_tier(data)
+    return onboard_user(access_token, tier)
 
 
 # ─── actions ───────────────────────────────────────────────────────────────

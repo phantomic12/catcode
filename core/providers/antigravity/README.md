@@ -96,7 +96,7 @@ After OAuth + project discovery, every chat turn is a POST to
 }
 ```
 
-The `project` field comes from the harness's `x-goog-user-project` header
+The `project` field comes from the harness's `x-code-assist-project` header
 (merged from the OAuth plugin's per-request headers); see
 `core/src/providers/google_code_assist.rs`.
 

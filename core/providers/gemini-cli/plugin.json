@@ -1,19 +1,27 @@
 {
   "name": "gemini-cli",
   "version": "0.1.0",
-  "description": "Google Gemini CLI subscription access — OAuth + Code Assist project discovery. Auto-staged into every install.",
+  "description": "Google Gemini CLI subscription access \u2014 OAuth + Code Assist project discovery. Auto-staged into every install.",
   "oauth": {
     "provider_id": "gemini-cli",
     "label": "Gemini CLI (Google)",
     "kind": "openai",
     "base_url": "https://cloudcode-pa.googleapis.com/v1internal",
-    "description": "Gemini CLI / Code Assist OAuth — Authorization Code + PKCE. After login the harness calls :loadCodeAssist (with the gemini-cli fingerprint) to provision a cloudaicompanionProject, then sends chat through the prod Code Assist gateway.",
+    "description": "Gemini CLI / Code Assist OAuth \u2014 Authorization Code + PKCE. After login the harness calls :loadCodeAssist (with the gemini-cli fingerprint) to provision a cloudaicompanionProject, then sends chat through the prod Code Assist gateway.",
     "headers": [
-      ["User-Agent", "google-api-nodejs-client/9.15.1"]
+      [
+        "User-Agent",
+        "google-api-nodejs-client/9.15.1"
+      ]
     ],
     "token_path": "gemini-cli.json",
     "script": "oauth/gemini-cli-oauth.py",
     "login_timeout_ms": 300000,
-    "token_timeout_ms": 30000
+    "token_timeout_ms": 30000,
+    "env_passthrough": [
+      "CATALYST_CODE_GEMINI_CLI_PROJECT",
+      "CATALYST_CODE_OAUTH_DIR"
+    ],
+    "redirect_path": "/oauth2callback"
   }
 }

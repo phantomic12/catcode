@@ -424,21 +424,28 @@ def discover_project_id(access_token):
         if project:
             return project
     # Sibling Antigravity token (same user, different OAuth client) often
-    # already holds a working managed project. Read it if present.
-    try:
-        sibling = os.path.join(os.path.dirname(os.path.abspath(
-            # token_path is not in scope here; reconstruct from common layout.
-            os.path.expanduser("~/.config/catalyst-code/oauth/antigravity.json")
-        )), "antigravity.json") if False else os.path.expanduser(
-            "~/.config/catalyst-code/oauth/antigravity.json"
-        )
-        sib = read_token(sibling)
+    # already holds a working managed project. Resolve the sibling path
+    # from ``CATALYST_CODE_ANTIGRAVITY_PROJECT`` / the gemini-cli token
+    # directory first, then fall back to the default global location. The
+    # configured ``token_path`` is not in scope here (discover_project_id
+    # is called from do_complete, which has ctx); callers pass it via the
+    # GEMINI_CLI_PROJECT_DIR env var when they need a non-default layout.
+    sibling_candidates = []
+    project_dir = os.environ.get("CATALYST_CODE_OAUTH_DIR", "").strip()
+    if project_dir:
+        sibling_candidates.append(os.path.join(project_dir, "antigravity.json"))
+    sibling_candidates.append(os.path.expanduser(
+        "~/.config/catalyst-code/oauth/antigravity.json"
+    ))
+    for sibling in sibling_candidates:
+        try:
+            sib = read_token(sibling)
+        except Exception:
+            continue
         if sib:
             pid = str(sib.get("project_id") or "").strip()
             if pid:
                 return pid
-    except Exception:
-        pass
     return None
 
 

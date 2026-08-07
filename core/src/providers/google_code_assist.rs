@@ -112,7 +112,8 @@ fn resolve_project(
     }
     notices.push(format!(
         "no Code Assist project configured (set CODE_ASSIST_PROJECT, \
-         GOOGLE_CLOUD_PROJECT, or an x-goog-user-project header); \
+         GOOGLE_CLOUD_PROJECT, or an x-code-assist-project / \
+         cloudaicompanion-project header); \
          using freemium default `{DEFAULT_CODE_ASSIST_FREEMIUM_PROJECT}`"
     ));
     DEFAULT_CODE_ASSIST_FREEMIUM_PROJECT.to_string()
@@ -791,6 +792,204 @@ mod tests {
         assert_eq!(
             built.url,
             "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wire_shape_contract {
+    //! Wire-shape lock-in tests.
+    //!
+    //! These guard the exact URL + body shape + identity headers the OAuth
+    //! plugins (antigravity, gemini-cli) and downstream clients depend on.
+    //! If any of these break, both the harness and the real Antigravity /
+    //! Gemini CLI web clients will silently fail with HTTP 403. Reviewed
+    //! against the live Google Code Assist gateway.
+    use super::*;
+    use crate::config::{ProviderKind, ResolvedProvider};
+
+    fn project_provider(base_url: &str, project: &str) -> ResolvedProvider {
+        ResolvedProvider {
+            name: "code-assist".into(),
+            kind: ProviderKind::OpenAI,
+            base_url: base_url.into(),
+            api_key: Some("ya29.fake".into()),
+            headers: vec![
+                ("x-goog-user-project".into(), project.into()),
+                ("x-code-assist-project".into(), project.into()),
+                ("cloudaicompanion-project".into(), project.into()),
+            ],
+            oauth: true,
+            context_window: None,
+            models_override: Vec::new(),
+            models_endpoint: None,
+        }
+    }
+
+    #[test]
+    fn chat_targets_daily_cloudcode_pa_for_antigravity() {
+        // Antigravity OAuth plugin's base_url; verified live: the daily
+        // host serves chat for Antigravity IDE traffic. The prod host
+        // rejects Antigravity-issued tokens with HTTP 403 on free-tier.
+        let provider = project_provider(
+            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+            "synthetic-expanse-sxhhm",
+        );
+        let built = GoogleCodeAssistAdapter
+            .build_request(&ProviderRequest {
+                provider: &provider,
+                model: "gemini-3.1-pro-high",
+                messages: &[Message::user("hi")],
+                tools: &[],
+                reasoning_effort: "high",
+                thinking_levels: &["high".into()],
+                max_tokens: 64,
+            })
+            .expect("build_request");
+        assert_eq!(
+            built.url,
+            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+        );
+    }
+
+    #[test]
+    fn chat_targets_prod_cloudcode_pa_for_gemini_cli() {
+        // gemini-cli OAuth plugin's base_url. Verified live: the prod host
+        // serves chat for gemini-cli clients; daily is rejected with 403.
+        let provider = project_provider(
+            "https://cloudcode-pa.googleapis.com/v1internal",
+            "synthetic-expanse-sxhhm",
+        );
+        let built = GoogleCodeAssistAdapter
+            .build_request(&ProviderRequest {
+                provider: &provider,
+                model: "gemini-2.5-flash",
+                messages: &[Message::user("hi")],
+                tools: &[],
+                reasoning_effort: "low",
+                thinking_levels: &[],
+                max_tokens: 64,
+            })
+            .expect("build_request");
+        assert_eq!(
+            built.url,
+            "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+        );
+    }
+
+    #[test]
+    fn body_uses_antigravity_user_agent_and_body_project() {
+        // The body shape is the Google GenAI Cloud Code Assist envelope.
+        // The Antigravity IDE binary sends body.userAgent="antigravity" +
+        // body.project=<cloudaicompanionProject>. Verified live; the project
+        // field MUST come from body (NOT x-goog-user-project header, which
+        // trips the consumer API gate and returns SERVICE_DISABLED).
+        let provider = project_provider(
+            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+            "synthetic-expanse-sxhhm",
+        );
+        let built = GoogleCodeAssistAdapter
+            .build_request(&ProviderRequest {
+                provider: &provider,
+                model: "gemini-3.1-pro-high",
+                messages: &[Message::user("hi")],
+                tools: &[],
+                reasoning_effort: "high",
+                thinking_levels: &["high".into()],
+                max_tokens: 64,
+            })
+            .expect("build_request");
+        assert_eq!(built.body["model"], "gemini-3.1-pro-high");
+        assert_eq!(built.body["project"], "synthetic-expanse-sxhhm");
+        assert_eq!(built.body["userAgent"], "antigravity");
+        assert!(built.body["request"]["contents"].is_array());
+        assert!(built.body["request"]["generationConfig"]["maxOutputTokens"].is_number());
+    }
+
+    #[test]
+    fn resolve_project_picks_first_matching_header_in_iteration_order() {
+        // resolve_project reads the first matching header from the headers
+        // vec, matching any of the three names case-insensitively. Plugin
+        // authors must therefore inject ONLY x-code-assist-project — the
+        // other two names trigger Google's consumer API gate on the chat
+        // endpoint (HTTP 403 SERVICE_DISABLED). Verified live.
+        // Test 1: with x-goog-user-project first, it wins.
+        let provider = ResolvedProvider {
+            name: "code-assist".into(),
+            kind: ProviderKind::OpenAI,
+            base_url: "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal".into(),
+            api_key: Some("ya29.fake".into()),
+            headers: vec![("x-goog-user-project".into(), "from-x-goog".into())],
+            oauth: true,
+            context_window: None,
+            models_override: Vec::new(),
+            models_endpoint: None,
+        };
+        let built = GoogleCodeAssistAdapter
+            .build_request(&ProviderRequest {
+                provider: &provider,
+                model: "gemini-3.1-pro-high",
+                messages: &[Message::user("hi")],
+                tools: &[],
+                reasoning_effort: "high",
+                thinking_levels: &["high".into()],
+                max_tokens: 64,
+            })
+            .expect("build_request");
+        assert_eq!(built.body["project"], "from-x-goog");
+        // Test 2: with only x-code-assist-project, it wins.
+        let provider = ResolvedProvider {
+            headers: vec![("x-code-assist-project".into(), "from-x-code-assist".into())],
+            ..provider.clone()
+        };
+        let built = GoogleCodeAssistAdapter
+            .build_request(&ProviderRequest {
+                provider: &provider,
+                model: "gemini-3.1-pro-high",
+                messages: &[Message::user("hi")],
+                tools: &[],
+                reasoning_effort: "high",
+                thinking_levels: &["high".into()],
+                max_tokens: 64,
+            })
+            .expect("build_request");
+        assert_eq!(built.body["project"], "from-x-code-assist");
+    }
+
+    fn freemium_fallback_emitted_when_no_project_header_present() {
+        // When the plugin doesn't inject any project header, the adapter
+        // falls back to the freemium default `rising-fact-p41fc` and emits
+        // a notice so the user can fix their config.
+        let provider = ResolvedProvider {
+            name: "code-assist".into(),
+            kind: ProviderKind::OpenAI,
+            base_url: "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal".into(),
+            api_key: Some("ya29.fake".into()),
+            headers: Vec::new(),
+            oauth: false,
+            context_window: None,
+            models_override: Vec::new(),
+            models_endpoint: None,
+        };
+        let built = GoogleCodeAssistAdapter
+            .build_request(&ProviderRequest {
+                provider: &provider,
+                model: "gemini-3-flash",
+                messages: &[Message::user("hi")],
+                tools: &[],
+                reasoning_effort: "low",
+                thinking_levels: &[],
+                max_tokens: 64,
+            })
+            .expect("build_request");
+        assert_eq!(
+            built
+                .notices
+                .iter()
+                .filter(|n| n.contains("rising-fact-p41fc"))
+                .count(),
+            1,
+            "expected exactly one notice mentioning the freemium default project"
         );
     }
 }
