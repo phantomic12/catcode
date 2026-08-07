@@ -55,3 +55,12 @@ source-of-truth embedded into the binary.
 - `kimi/` — Kimi Code (Moonshot), device-code OAuth subscription.
 - `codex/` — ChatGPT (Codex), official Codex CLI device-code OAuth with automatic polling.
 - `deepseek/` — DeepSeek API, official OpenAI-compatible API-key provider.
+- `antigravity/` — Google Antigravity IDE, OAuth + Code Assist `loadCodeAssist` project discovery (Authorization Code + PKCE).
+- `gemini-cli/` — Google Gemini CLI, OAuth + Code Assist `loadCodeAssist` project discovery (Authorization Code + PKCE).
+
+Both Google bundles reuse the existing `core/src/providers/google_code_assist.rs`
+adapter — `is_code_assist_endpoint` already routes the `cloudcode-pa` /
+daily-cloudcode-pa hosts to the right wire format, and the adapter's
+`resolve_project` reads the `x-goog-user-project` header that each plugin's
+`token` action injects to use the user's real Code Assist project instead
+of the freemium fallback.

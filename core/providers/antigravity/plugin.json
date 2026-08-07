@@ -1,0 +1,19 @@
+{
+  "name": "antigravity",
+  "version": "0.1.0",
+  "description": "Google Antigravity IDE subscription access — OAuth + Code Assist project discovery. Auto-staged into every install.",
+  "oauth": {
+    "provider_id": "antigravity",
+    "label": "Antigravity (Google IDE)",
+    "kind": "openai",
+    "base_url": "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal",
+    "description": "Antigravity / Code Assist OAuth — Authorization Code + PKCE. After login the harness calls :loadCodeAssist (with the Antigravity IDE 2.1.1 fingerprint) to provision a cloudaicompanionProject, then sends chat through the daily Code Assist gateway.",
+    "headers": [
+      ["User-Agent", "antigravity"]
+    ],
+    "token_path": "antigravity.json",
+    "script": "oauth/antigravity-oauth.py",
+    "login_timeout_ms": 300000,
+    "token_timeout_ms": 30000
+  }
+}

@@ -27,7 +27,7 @@ use std::path::PathBuf;
 /// Bump when the bundled default set changes meaningfully. The marker file
 /// stores this; on a version mismatch we re-scan for *missing* files (existing
 /// user files are still never overwritten) and then re-stamp the marker.
-pub const STAGING_VERSION: u32 = 6;
+pub const STAGING_VERSION: u32 = 7;
 
 /// `~/.catalyst-code` — the global, user-owned home for harness defaults.
 /// All staged files live under here (agents/, skills/, plugins/, README.md).
@@ -262,6 +262,34 @@ fn bundled_files() -> Vec<(&'static str, &'static str)> {
             "plugins/deepseek/README.md",
             include_str!("../providers/deepseek/README.md"),
         ),
+        // --- antigravity provider (Google Antigravity IDE subscription —
+        //      OAuth + Code Assist loadCodeAssist project discovery). ---
+        (
+            "plugins/antigravity/plugin.json",
+            include_str!("../providers/antigravity/plugin.json"),
+        ),
+        (
+            "plugins/antigravity/oauth/antigravity-oauth.py",
+            include_str!("../providers/antigravity/oauth/antigravity-oauth.py"),
+        ),
+        (
+            "plugins/antigravity/README.md",
+            include_str!("../providers/antigravity/README.md"),
+        ),
+        // --- gemini-cli provider (Google Gemini CLI subscription —
+        //      OAuth + Code Assist loadCodeAssist project discovery). ---
+        (
+            "plugins/gemini-cli/plugin.json",
+            include_str!("../providers/gemini-cli/plugin.json"),
+        ),
+        (
+            "plugins/gemini-cli/oauth/gemini-cli-oauth.py",
+            include_str!("../providers/gemini-cli/oauth/gemini-cli-oauth.py"),
+        ),
+        (
+            "plugins/gemini-cli/README.md",
+            include_str!("../providers/gemini-cli/README.md"),
+        ),
         // --- A short guide to the global layout + override model. ---
         ("README.md", GLOBAL_README),
     ]
@@ -274,6 +302,8 @@ fn executable_rel_paths() -> &'static [&'static str] {
         "plugins/telemetry/hooks/session_stop.py",
         "plugins/kimi/oauth/kimi-oauth.py",
         "plugins/codex/oauth/codex-oauth.py",
+        "plugins/antigravity/oauth/antigravity-oauth.py",
+        "plugins/gemini-cli/oauth/gemini-cli-oauth.py",
     ]
 }
 
@@ -369,7 +399,9 @@ project.
     │   ├── vision-handoff/  # cheapest same-provider vision handoff (default ON)
     │   ├── kimi/            # Moonshot subscription OAuth provider
     │   ├── codex/           # ChatGPT subscription OAuth provider
-    │   └── deepseek/        # DeepSeek API-key provider
+    │   ├── deepseek/        # DeepSeek API-key provider
+    │   ├── antigravity/     # Google Antigravity IDE OAuth + Code Assist
+    │   └── gemini-cli/      # Google Gemini CLI OAuth + Code Assist
     ├── README.md          # this file
     └── .staged            # staging schema version marker (do not edit)
 
@@ -455,6 +487,34 @@ mod tests {
             home.join("plugins/deepseek/README.md").exists(),
             "deepseek provider README should be staged on first run"
         );
+        assert!(
+            home.join("plugins/antigravity/plugin.json").exists(),
+            "antigravity provider should be staged on first run"
+        );
+        assert!(
+            home
+                .join("plugins/antigravity/oauth/antigravity-oauth.py")
+                .exists(),
+            "antigravity oauth script should be staged on first run"
+        );
+        assert!(
+            home.join("plugins/antigravity/README.md").exists(),
+            "antigravity provider README should be staged on first run"
+        );
+        assert!(
+            home.join("plugins/gemini-cli/plugin.json").exists(),
+            "gemini-cli provider should be staged on first run"
+        );
+        assert!(
+            home
+                .join("plugins/gemini-cli/oauth/gemini-cli-oauth.py")
+                .exists(),
+            "gemini-cli oauth script should be staged on first run"
+        );
+        assert!(
+            home.join("plugins/gemini-cli/README.md").exists(),
+            "gemini-cli provider README should be staged on first run"
+        );
         assert!(home.join(".staged").exists());
         assert_eq!(
             std::fs::read_to_string(home.join(".staged")).unwrap(),
@@ -515,6 +575,26 @@ mod tests {
                 .permissions()
                 .mode();
             assert!(mode & 0o111 != 0, "codex oauth script must be executable");
+            let mode = std::fs::metadata(
+                home.join("plugins/antigravity/oauth/antigravity-oauth.py"),
+            )
+            .unwrap()
+            .permissions()
+            .mode();
+            assert!(
+                mode & 0o111 != 0,
+                "antigravity oauth script must be executable"
+            );
+            let mode = std::fs::metadata(
+                home.join("plugins/gemini-cli/oauth/gemini-cli-oauth.py"),
+            )
+            .unwrap()
+            .permissions()
+            .mode();
+            assert!(
+                mode & 0o111 != 0,
+                "gemini-cli oauth script must be executable"
+            );
         }
     }
 
