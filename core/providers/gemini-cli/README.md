@@ -33,19 +33,24 @@ fails with `project not found`.
 
 ## Models
 
-Gemini CLI exposes the Gemini 3 / 3.1 Pro + Flash previews plus the
-2.5 family. Model IDs map 1:1 to upstream Code Assist slugs — no
-aliasing:
+Gemini CLI exposes a subset of Code Assist model slugs under free-tier
+OAuth. Model IDs map 1:1 to upstream Code Assist slugs — no aliasing.
+
+This list was verified live against free-tier gemini-cli OAuth. The
+Antigravity bundle has a wider catalog (Claude + Gemini 3.x + GPT-OSS).
 
 ```text
-gemini-3.1-pro-preview
-gemini-3-pro-preview
-gemini-3-flash-preview
-gemini-3.1-flash-lite-preview
 gemini-2.5-pro
 gemini-2.5-flash
 gemini-2.5-flash-lite
+gemini-3.1-flash-lite-preview
 ```
+
+`gemini-3-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-pro-preview`,
+`gemini-3.1-pro-high`, and any `claude-*` slug are **Antigravity-only** and
+return HTTP 404 against the gemini-cli OAuth client. See
+[Working models (verified 2026-08)](#working-models-verified-2026-08) below
+for the live verification log.
 
 ## Endpoints
 
