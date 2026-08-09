@@ -159,13 +159,17 @@ the authorize URL — including the port and path.
 
 ### 4. Token refresh on the hot path
 
-The `token` action runs on **every turn** (cached for ~5 min, then
-re-run). Two consequences:
+The `token` action runs on **every turn** (cached for ~5 min
+**only when the token file has no `expires_at`**, then re-run). When
+`expires_at` is present, the harness uses it to decide when to call
+`token` again — typically within a 5-minute refresh lead. Two
+consequences:
 
 - Keep `token` cheap. Refresh only when the cached token is near
   expiry; do not call out to the IdP on every chat turn.
 - The `headers` returned by `token` are **cached with the token** and
   merged onto the provider's request headers. If `x-code-assist-project`
-  changes between calls (e.g. the user's `loadCodeAssist` rotation
-  swapped the project), the new value reaches the gateway on the very
-  next turn without a `/login` cycle.
+  changes (e.g. the user's `loadCodeAssist` rotation swapped the
+  project), the new value reaches the gateway **only after the token
+  is refreshed or invalidated** — stale headers persist for ~5 min
+  otherwise.

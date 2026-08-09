@@ -150,7 +150,7 @@ own process env at call time and injects them into the script's child env.
   - `CATALYST_CODE_ANTIGRAVITY_PROJECT` — overrides the Antigravity Code
     Assist `cloudaicompanionProject` (bypasses the `loadCodeAssist`
     auto-discovery round-trip in tests / CI).
-  - `CATALYST_CODE_GEMINICLI_PROJECT` — same for the Gemini CLI bundle.
+  - `CATALYST_CODE_GEMINI_CLI_PROJECT` — same for the Gemini CLI bundle.
 - **Self-hosted IdP overrides** typically use a `<PRODUCT>_HOST` /
   `<PRODUCT>_API_URL` / `<PRODUCT>_TENANT` shape. Example:
   `["ACME_OAUTH_HOST", "ACME_TENANT"]`.

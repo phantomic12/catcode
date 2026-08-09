@@ -17,10 +17,9 @@
     "token_path": "gemini-cli.json",
     "script": "oauth/gemini-cli-oauth.py",
     "login_timeout_ms": 300000,
-    "token_timeout_ms": 30000,
+    "token_timeout_ms": 45000,
     "env_passthrough": [
-      "CATALYST_CODE_GEMINI_CLI_PROJECT",
-      "CATALYST_CODE_OAUTH_DIR"
+      "CATALYST_CODE_GEMINI_CLI_PROJECT"
     ],
     "redirect_path": "/oauth2callback"
   }

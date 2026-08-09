@@ -385,13 +385,17 @@ class AntigravityOAuthTest(unittest.TestCase):
                 "token_type": "Bearer",
             }
 
+        t0 = int(time.time())
         out = run_script(
             {"action": "token", "token_path": self.token_path},
             port=self.mock.port,
         )
+        t1 = int(time.time())
 
         self.assertEqual(out["access_token"], "new-access")
-        self.assertEqual(out["expires_at"], int(time.time()) + 3600)
+        # expires_at is integer-seconds; the script may have sampled time
+        # either just before or just after our t0/t1 captures.
+        self.assertIn(out["expires_at"], (t0 + 3600, t1 + 3600))
         self.assertEqual(
             out["headers"],
             [["x-code-assist-project", "preserved-project"]],

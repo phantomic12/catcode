@@ -164,16 +164,27 @@ def lock_for(path):
     ``fcntl`` (Windows) returns ``None`` and the lock is silently
     skipped — fine for our use case since the harness only runs these
     scripts on macOS / Linux.
+
+    Returns ``None`` when ``fcntl`` is unavailable, when the lock file
+    cannot be opened (e.g. parent dir missing), or when ``LOCK_EX``
+    fails. The caller treats ``None`` as "no cross-process
+    serialization" — same semantics as the previous behaviour for
+    the Windows path. The lock file is created if missing.
     """
     try:
         import fcntl
     except ImportError:
         return None
-    handle = open(path + ".lock", "a+", encoding="utf-8")
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", mode=0o700, exist_ok=True)
+        handle = open(path + ".lock", "a+", encoding="utf-8")
+    except OSError:
+        return None
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
     except OSError:
-        pass
+        handle.close()
+        return None
     return handle
 
 
