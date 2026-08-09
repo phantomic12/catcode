@@ -323,7 +323,7 @@ class GeminiCliOAuthTest(unittest.TestCase):
         # Override HOME so the ``~/.config/...`` expansion lands in
         # our tempdir.
         home = self.tmp.name
-        with temp_env(HOME=home, USERPROFILE=home, CATALYST_CODE_OAUTH_DIR=""):
+        with temp_env(HOME=home, USERPROFILE=home):
             self.mock.start()
 
             @self.mock.route("/token")
@@ -371,19 +371,19 @@ class GeminiCliOAuthTest(unittest.TestCase):
             stat.S_IMODE(os.stat(token_path).st_mode), 0o600
         )
 
-    def test_complete_falls_back_to_sibling_via_env_dir(self):
-        """``CATALYST_CODE_OAUTH_DIR`` overrides the sibling lookup dir.
+    def test_complete_falls_back_to_sibling_via_token_path_dir(self):
+        """Sibling lookup uses ``dirname(token_path)`` for custom layouts.
 
-        Same fallback as above, but via the env var instead of relying on
-        ``$HOME`` — useful for sandboxed installs where ``~/.config/`` is
-        read-only or points somewhere weird.
+        When the harness passes a non-default ``token_path``, discovery
+        still finds ``antigravity.json`` next to it — without relying on
+        ``$HOME`` or any env override.
         """
         oauth_dir = os.path.join(self.tmp.name, "custom", "oauth")
         os.makedirs(oauth_dir, exist_ok=True)
         sibling_path = os.path.join(oauth_dir, "antigravity.json")
         with open(sibling_path, "w", encoding="utf-8") as handle:
             json.dump(
-                {"access_token": "x", "project_id": "env-dir-proj"},
+                {"access_token": "x", "project_id": "custom-layout-proj"},
                 handle,
             )
 
@@ -392,8 +392,8 @@ class GeminiCliOAuthTest(unittest.TestCase):
         @self.mock.route("/token")
         def token(_body, _headers):
             return 200, {
-                "access_token": "env-access",
-                "refresh_token": "env-refresh",
+                "access_token": "custom-access",
+                "refresh_token": "custom-refresh",
                 "expires_in": 3600,
                 "token_type": "Bearer",
             }
@@ -418,14 +418,13 @@ class GeminiCliOAuthTest(unittest.TestCase):
             "redirect_uri": "http://127.0.0.1:8085/oauth2callback",
             "token_path": token_path,
         }
-        with temp_env(CATALYST_CODE_OAUTH_DIR=oauth_dir):
-            out = run_script(ctx, port=self.mock.port)
+        out = run_script(ctx, port=self.mock.port)
 
         self.assertEqual(out, {"ok": True})
 
         with open(token_path, encoding="utf-8") as handle:
             token = json.load(handle)
-        self.assertEqual(token["project_id"], "env-dir-proj")
+        self.assertEqual(token["project_id"], "custom-layout-proj")
 
     # ── token ────────────────────────────────────────────────────────────
 

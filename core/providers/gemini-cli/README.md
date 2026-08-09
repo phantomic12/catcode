@@ -68,7 +68,7 @@ The script uses the public Gemini CLI OAuth client:
 | `client_secret`  | `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`                                            |
 | `User-Agent`     | `google-api-nodejs-client/9.15.1`                                                |
 | `X-Goog-Api-Client` | `google-cloud-sdk vscode_cloudshelleditor/0.1`                                 |
-| `Client-Metadata`| `{ ideType: 0, platform: 0, pluginType: 0 }`                                     |
+| `Client-Metadata`| `{ ideType: 9, platform: <host enum>, pluginType: 2 }` (runtime platform)         |
 
 These are intentional — the gemini-cli npm package ships the same public
 client and fingerprints. Google's backend uses them to differentiate
