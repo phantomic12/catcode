@@ -1,0 +1,30 @@
+name: OAuth Python Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Mirror CI's concurrency strategy: a newer commit makes an in-flight run for
+# the same branch obsolete, so reviewers don't wait on a stale build.
+concurrency:
+  group: oauth-py-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-oauth:
+    name: python oauth (unittest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # The OAuth helper modules under core/providers/{antigravity,gemini-cli}/oauth/
+      # are stdlib-only (urllib, json, http.server, ssl) and import cleanly on
+      # a fresh Python — no extra apt or pip install needed.
+      - name: run OAuth unittest suite
+        run: python3 -m unittest discover -s core/providers -p 'test_*_oauth.py' -v
