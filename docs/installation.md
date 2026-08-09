@@ -378,7 +378,9 @@ directory from your user PATH.
 ## Building from Source
 
 Build from source when you need the latest unreleased changes, or when you
-cannot use prebuilt binaries.
+cannot use prebuilt binaries. See [build.md](build.md) for the full guide,
+including the GTK3 + WebKitGTK requirement for the `native-browser` build
+and the `--no-web` flag for headless / CI environments.
 
 ### Quick build (core + TUI)
 
@@ -493,6 +495,7 @@ This document was written from these source files:
   + service restart), installer state detection
 - `tui/embed_core.go` — Embedded core extraction for standalone binaries
 - `README.md` — Usage descriptions, architecture overview
+- `build.md` — Building from source (GTK3 / WebKitGTK requirements, `--no-web`)
 - `build.sh` — Minimal build script
 - `packaging/vm-images/linux/Dockerfile` — Test Docker image
 

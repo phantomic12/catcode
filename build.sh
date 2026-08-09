@@ -5,25 +5,65 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
 
-case "${1:-}" in
-  ""|--run)
-    ;;
-  --help|-h)
-    printf 'usage: %s [--run [TUI_ARGS...]]\n' "$(basename "$0")"
-    printf '\nBuilds the release core and development TUI, then replaces the current\n'
-    printf 'catcode installation when it is available on PATH. --run starts the TUI\n'
-    printf 'with that exact core, even when CATCODE_CORE points at an installed binary.\n'
-    exit 0
-    ;;
-  *)
-    printf 'error: unknown option %s\n' "$1" >&2
-    printf 'usage: %s [--run [TUI_ARGS...]]\n' "$(basename "$0")" >&2
-    exit 2
-    ;;
-esac
+# Parse flags. We support three build modes:
+#   --with-web   force building the `native-browser` feature (requires
+#                WebKitGTK system headers on Linux).
+#   --no-web     skip `native-browser`; build the TUI-only core. This is the
+#                right mode on headless servers and CI.
+#   (none)       auto-detect: build `native-browser` when pkg-config can find
+#                gio-2.0, otherwise skip it with a one-line notice.
+# Plus --run [args] to launch the freshly-built TUI when the build succeeds.
+WITH_WEB="auto"
+RUN_TUI=false
+RUN_ARGS=()
+print_help() {
+  cat <<EOF
+usage: $(basename "$0") [--with-web | --no-web] [--run [TUI_ARGS...]]
 
-echo "[1/3] building core (cargo, native-browser, -j$(nproc))..."
-cargo build --release -j"$(nproc)" --features native-browser --manifest-path core/Cargo.toml
+Builds the release core and Go TUI, then replaces the current catcode
+installation when one is on PATH.
+
+  --with-web   build the \`native-browser\` feature (Linux: requires
+               libgtk-3-dev, libwebkit2gtk-4.1-dev, libgio-2.0-dev)
+  --no-web     skip \`native-browser\`; build the TUI-only core
+  (default)    auto-detect via \`pkg-config --exists gio-2.0\`
+  --run [...]  after building, exec the freshly-built TUI
+EOF
+}
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --with-web) WITH_WEB="yes" ;;
+    --no-web)   WITH_WEB="no"  ;;
+    --run)      RUN_TUI=true; shift; RUN_ARGS=("$@"); break ;;
+    -h|--help)  print_help; exit 0 ;;
+    *)
+      printf 'error: unknown option %s\n' "$1" >&2
+      print_help >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+# Resolve "auto" by probing for the WebKitGTK pkg-config metadata. We only
+# need *any* system library the native-browser feature pulls in; gio-2.0 is
+# the cheapest reliable signal on Linux.
+if [[ "$WITH_WEB" == "auto" ]]; then
+  if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists gio-2.0; then
+    WITH_WEB="yes"
+  else
+    WITH_WEB="no"
+    echo "notice: WebKitGTK system headers not found via pkg-config; skipping native-browser (pass --with-web once you've installed them)"
+  fi
+fi
+
+if [[ "$WITH_WEB" == "yes" ]]; then
+  echo "[1/3] building core (cargo, native-browser, -j$(nproc))..."
+  cargo build --release -j"$(nproc)" --features native-browser --manifest-path core/Cargo.toml
+else
+  echo "[1/3] building core (cargo, TUI-only, -j$(nproc); native-browser skipped)..."
+  cargo build --release -j"$(nproc)" --manifest-path core/Cargo.toml
+fi
 
 echo "[2/3] building tui (go)..."
 ( cd tui && go build -o tui . )
@@ -71,8 +111,7 @@ if [[ -n "${CATCODE_CORE:-}" && "$CATCODE_CORE" != "$LOCAL_CORE" ]]; then
   echo "         run locally with: CATCODE_CORE=$LOCAL_CORE $ROOT_DIR/tui/tui"
 fi
 
-if [[ "${1:-}" == "--run" ]]; then
-  shift
+if $RUN_TUI; then
   echo "starting local TUI (core=$LOCAL_CORE)"
-  exec env CATCODE_CORE="$LOCAL_CORE" "$ROOT_DIR/tui/tui" "$@"
+  exec env CATCODE_CORE="$LOCAL_CORE" "$ROOT_DIR/tui/tui" "${RUN_ARGS[@]}"
 fi
