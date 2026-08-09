@@ -17,7 +17,7 @@
     "token_path": "antigravity.json",
     "script": "oauth/antigravity-oauth.py",
     "login_timeout_ms": 300000,
-    "token_timeout_ms": 30000,
+    "token_timeout_ms": 45000,
     "env_passthrough": [
       "CATALYST_CODE_ANTIGRAVITY_PROJECT"
     ],

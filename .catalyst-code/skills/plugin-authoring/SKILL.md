@@ -623,8 +623,8 @@ includes `action`, `provider_id`, `token_path` (absolute), `workspace`, and
 `timestamp`; each action adds its own fields.
 
 **`login`** — build the authorize/verify URL. Input adds `headless` (bool) and,
-for the web flow, `redirect_uri` (a `http://localhost:<port>/callback` the
-harness already bound — embed it verbatim in your authorize URL). Output:
+for the web flow, `redirect_uri` (a `http://localhost:<port>/<redirect_path>`
+the harness already bound — embed it verbatim in your authorize URL). Output:
 ```json
 { "url": "https://auth.example.com/device?...", "code": "ABCD-EFGH",
   "message": "Open the URL and enter the code",

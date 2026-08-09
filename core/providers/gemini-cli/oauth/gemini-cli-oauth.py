@@ -273,16 +273,21 @@ def onboard_user(access_token, tier_id):
     return None
 
 
-def discover_project_id(access_token):
+def discover_project_id(access_token, oauth_dir=None):
     """Try loadCodeAssist; on failure, fall back to onboardUser polling.
 
     Free-tier gemini-cli OAuth often returns no project (Google now marks
     free-tier as UNSUPPORTED_CLIENT for this OAuth client). Fallbacks, in
     order:
       1. ``CATALYST_CODE_GEMINI_CLI_PROJECT`` env override.
-      2. Sibling Antigravity token file's ``project_id`` (same Google
+      2. ``loadCodeAssist`` — returns the existing project if the user
+         is already onboarded, otherwise ``onboardUser`` polls until done.
+      3. Sibling Antigravity token file's ``project_id`` — same Google
          account often already has a working managed project via the
-         Antigravity OAuth flow — verified: body.project alone works).
+         Antigravity OAuth flow (verified: body.project alone works).
+         Looked up next to the gemini-cli token file first (so custom
+         ``token_path`` layouts still find their sibling), then in the
+         default global location.
     """
     override = (os.environ.get("CATALYST_CODE_GEMINI_CLI_PROJECT") or "").strip()
     if override:
@@ -297,24 +302,17 @@ def discover_project_id(access_token):
         if project:
             return project
     # Sibling Antigravity token (same user, different OAuth client) often
-    # already holds a working managed project. Resolve the sibling path
-    # from ``CATALYST_CODE_ANTIGRAVITY_PROJECT`` / the gemini-cli token
-    # directory first, then fall back to the default global location. The
-    # configured ``token_path`` is not in scope here (discover_project_id
-    # is called from do_complete, which has ctx); callers pass it via the
-    # GEMINI_CLI_PROJECT_DIR env var when they need a non-default layout.
+    # already holds a working managed project. Look next to the gemini-cli
+    # token first (so non-default token layouts still resolve the sibling),
+    # then fall back to the default global location.
     sibling_candidates = []
-    project_dir = os.environ.get("CATALYST_CODE_OAUTH_DIR", "").strip()
-    if project_dir:
-        sibling_candidates.append(os.path.join(project_dir, "antigravity.json"))
+    if oauth_dir:
+        sibling_candidates.append(os.path.join(oauth_dir, "antigravity.json"))
     sibling_candidates.append(os.path.expanduser(
         "~/.config/catalyst-code/oauth/antigravity.json"
     ))
     for sibling in sibling_candidates:
-        try:
-            sib = read_token(sibling)
-        except Exception:
-            continue
+        sib = read_token(sibling)
         if sib:
             pid = str(sib.get("project_id") or "").strip()
             if pid:
@@ -368,7 +366,10 @@ def do_complete(ctx):
     if not normalized:
         die("Gemini CLI token exchange returned no usable tokens")
 
-    project_id = discover_project_id(normalized["access_token"])
+    project_id = discover_project_id(
+        normalized["access_token"],
+        oauth_dir=os.path.dirname(token_path(ctx)),
+    )
     if project_id:
         normalized["project_id"] = project_id
 

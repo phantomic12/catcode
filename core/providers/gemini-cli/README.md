@@ -19,9 +19,12 @@ authorization page, captures the code, exchanges it for tokens, runs
 + `Client-Metadata`), and persists everything to
 `~/.config/catalyst-code/oauth/gemini-cli.json`. On every subsequent
 turn the harness refreshes the access token when needed and injects an
-`x-goog-user-project` header carrying the discovered project id, so
+`x-code-assist-project` header carrying the discovered project id, so
 requests route to the user's real Cloud project — not the shared
-freemium project the adapter ships as a fallback.
+freemium project the adapter ships as a fallback. (Do **not** inject
+`x-goog-user-project`: that consumer header forces a Cloud Code Private API
+enablement check and returns `SERVICE_DISABLED` on free-tier / managed
+projects. Only `x-code-assist-project` survives the consumer gate.)
 
 If `loadCodeAssist` returns no project (new Google account with no
 Code Assist history yet), the harness also calls `:onboardUser` and polls

@@ -956,6 +956,7 @@ mod wire_shape_contract {
         assert_eq!(built.body["project"], "from-x-code-assist");
     }
 
+    #[test]
     fn freemium_fallback_emitted_when_no_project_header_present() {
         // When the plugin doesn't inject any project header, the adapter
         // falls back to the freemium default `rising-fact-p41fc` and emits

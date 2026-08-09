@@ -17,9 +17,12 @@ authorization page, captures the code, exchanges it for tokens, runs
 `loadCodeAssist` (with the Antigravity IDE 2.1.1 fingerprint headers), and
 persists everything to `~/.config/catalyst-code/oauth/antigravity.json`.
 On every subsequent turn the harness refreshes the access token when needed
-and injects an `x-goog-user-project` header carrying the discovered project
+and injects an `x-code-assist-project` header carrying the discovered project
 id, so requests route to the user's real Antigravity project — not the
-shared freemium project the adapter ships as a fallback.
+shared freemium project the adapter ships as a fallback. (Do **not** inject
+`x-goog-user-project`: that consumer header forces a Cloud Code Private API
+enablement check and returns `SERVICE_DISABLED` on free-tier / managed
+projects. Only `x-code-assist-project` survives the consumer gate.)
 
 If `loadCodeAssist` returns no project (new Google account with no
 Code Assist history yet), the harness also calls `:onboardUser` and polls
@@ -96,8 +99,8 @@ After OAuth + project discovery, every chat turn is a POST to
 }
 ```
 
-The `project` field comes from the harness's `x-code-assist-project` header
-(merged from the OAuth plugin's per-request headers); see
+The `project` field comes from the harness's `x-code-assist-project` header (NOT `x-goog-user-project`,
+which trips the consumer-API gate and returns `SERVICE_DISABLED`); see
 `core/src/providers/google_code_assist.rs`.
 
 ## References
