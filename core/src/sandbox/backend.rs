@@ -138,7 +138,23 @@ pub trait ExecutionBackend: Send + Sync {
     }
     /// Current readiness + preflight report (best-effort, never errors).
     async fn status(&self) -> super::error::SandboxPreflightReport {
-        super::error::SandboxPreflightReport::default()
+        // Sandbox disabled (host backend): report ready/supported so UI does not
+        // look like "platform unsupported" (CORE_REVIEW).
+        use super::error::{CheckStatus, SandboxPreflightCheck, SandboxPreflightReport};
+        SandboxPreflightReport {
+            requested: false,
+            supported: true,
+            ready: true,
+            platform: std::env::consts::OS.to_string(),
+            architecture: std::env::consts::ARCH.to_string(),
+            checks: vec![SandboxPreflightCheck {
+                code: "sandbox_disabled".into(),
+                title: "Sandbox".into(),
+                status: CheckStatus::Info,
+                detail: "sandbox mode is none (host execution)".into(),
+            }],
+            actions: vec![],
+        }
     }
     /// Cleanly stop the backing sandbox (no-op for the host backend).
     async fn shutdown(&self) {}

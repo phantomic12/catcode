@@ -147,10 +147,9 @@ pub fn soft_digest_conversation(
     let mut changed = 0usize;
     let n = messages.len();
     if n <= SOFT_DIGEST_MIN_KEEP {
-        // Few-but-huge: digest ALL oversized tool results (keep=0) so a 3–6
-        // message chat dominated by large reads still reclaims at the soft
-        // threshold instead of waiting for 90% compact.
-        changed += digest_stale_tool_results(messages, 0);
+        // Few-but-huge: digest oversized tool results but keep the most recent
+        // one so the model does not lose the content it just fetched (CORE_REVIEW).
+        changed += digest_stale_tool_results(messages, 1);
         changed += digest_stale_call_args(messages, n);
     } else if keep_start > 0 {
         let keep = n.saturating_sub(keep_start);
@@ -764,7 +763,13 @@ pub async fn compact_with_summary(
     // Pre-digest the middle so the summarize HTTP call itself stays small, then
     // one combined summarize+facts call (avoids a second full pass).
     let mut for_summary = to_summarize.clone();
-    let _ = soft_digest_conversation(&mut for_summary, context_window, None);
+    // Digest with a throwaway cache so restorable tool outputs are captured
+    // before collapse — the summary manifest's "re-run to restore" claim is
+    // only honest when something was cached (CORE_REVIEW). Callers that own
+    // the live ToolOutputCache should prefer compact paths that pass it;
+    // here we at least avoid promising restore from thin air mid-summarize.
+    let mut digest_cache = crate::tool_cache::ToolOutputCache::new();
+    let _ = soft_digest_conversation(&mut for_summary, context_window, Some(&mut digest_cache));
     let combined = provider::summarize_and_extract(
         client,
         provider,

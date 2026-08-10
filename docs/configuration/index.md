@@ -423,8 +423,8 @@ All config fields with their types and defaults.
 |-------|------|---------|-------------|
 | `subagents.max_depth` | number | `2` | Max nesting depth (0 blocks all subagents) |
 | `subagents.intercom_bridge_mode` | enum | `always` | `off` / `fork-only` / `always` |
-| `subagents.parallel_max_tasks` | number | `8` | Max tasks in a parallel run |
-| `subagents.parallel_concurrency` | number | `4` | Default concurrency for parallel runs |
+| `subagents.parallel_max_tasks` | number | `8` | Soft advisory max tasks in a parallel run (larger batches are allowed and queue under concurrency) |
+| `subagents.parallel_concurrency` | number | `4` | Default concurrency when omitted; explicit higher requests are honored |
 | `subagents.async_by_default` | bool | `false` | Top-level calls use background execution |
 | `subagents.disable_builtins` | bool | `false` | Hide builtin agents from discovery |
 

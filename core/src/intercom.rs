@@ -46,6 +46,7 @@ const INTERCOM_ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const MAX_MAILBOX_MESSAGES: usize = 256;
 const MAX_PENDING_ASKS: usize = 256;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_JOURNAL_RECORDS: usize = 4_000;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -181,7 +182,19 @@ impl IntercomBus {
         )
         .map_err(|e| format!("append intercom journal: {e}"))?;
         file.sync_all()
-            .map_err(|e| format!("sync intercom journal: {e}"))
+            .map_err(|e| format!("sync intercom journal: {e}"))?;
+        // Bound growth: keep last MAX_JOURNAL_RECORDS lines (CORE_REVIEW).
+        drop(file);
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            let lines: Vec<&str> = raw.lines().collect();
+            if lines.len() > MAX_JOURNAL_RECORDS {
+                let keep = &lines[lines.len() - MAX_JOURNAL_RECORDS..];
+                let mut body = keep.join("\n");
+                body.push('\n');
+                let _ = std::fs::write(&path, body);
+            }
+        }
+        Ok(())
     }
 
     fn undelivered_for(&self, target: &str) -> Vec<IntercomMessage> {

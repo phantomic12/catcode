@@ -679,6 +679,31 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.layout()
 		s.logInfo("conversation reset")
 
+	case "cleared":
+		// In-memory clear from core `/clear` (session file may still persist).
+		s.disarmAbortTimeout()
+		s.clearBlockingPrompts()
+		s.busy = false
+		s.blocks = nil
+		s.cur = nil
+		s.contextTokens = 0
+		s.lastCachePct = 0
+		s.tokensSaved = 0
+		s.summaryChars = 0
+		s.subProgress = nil
+		s.todos = nil
+		s.queued = nil
+		s.queuedNext = false
+		s.follow = true
+		s.invalidateAll()
+		s.layout()
+		s.logInfo("conversation cleared")
+
+	case "discard_partial":
+		// Top-level stream discard (Codex retry path); same effect as
+		// http_retry with discard_partial=true.
+		s.discardPartialStreamOutput()
+
 	case "history":
 		// Loading a session / undo is a conversation boundary — clear any in-flight
 		// turn/queue so a mid-turn /load or /sessions doesn't wedge the TUI with

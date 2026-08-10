@@ -379,7 +379,7 @@ func toolKindOf(name string) toolKindT {
 	// Mirror core/src/tools.rs classify() ReadOnly set exactly.
 	case "read_file", "list_dir", "grep", "glob", "bulk_read", "todo_read",
 		"diagnostics", "finish", "contact_supervisor", "intercom",
-		"git_status", "git_diff", "git_log", "memory",
+		"git_status", "git_diff", "git_log", "git_show", "memory",
 		"web_search", "ask", "load_tools", "goal_write_plan", "workspace_activity":
 		return kindReadOnly
 	default:
@@ -407,7 +407,7 @@ func toolIcon(name string) string {
 		return "▤"
 	case "write_file", "edit", "patch", "bulk_write", "bulk_edit":
 		return "✎"
-	case "git_status", "git_diff", "git_log", "git_add", "git_commit":
+	case "git_status", "git_diff", "git_log", "git_show", "git_add", "git_commit", "git_push", "git_pull", "git_branch":
 		return "⎇"
 	case "todo_write", "todo_read":
 		return "☑"
@@ -442,10 +442,18 @@ func toolDisplayName(name string) string {
 		return "git diff"
 	case "git_log":
 		return "git log"
+	case "git_show":
+		return "git show"
 	case "git_add":
 		return "git add"
 	case "git_commit":
 		return "git commit"
+	case "git_push":
+		return "git push"
+	case "git_pull":
+		return "git pull"
+	case "git_branch":
+		return "git branch"
 	case "contact_supervisor":
 		return "contact supervisor"
 	}

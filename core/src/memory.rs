@@ -300,9 +300,30 @@ pub fn project_hash(cwd: &str) -> String {
 }
 
 fn hash_workspace(workspace: &Path) -> String {
+    // Prefer project_identity's stable workspace_hash so learning + memory share
+    // keys across path moves (CORE_REVIEW dual-identity fix). Fall back to raw
+    // path hash when identity resolution is unavailable.
+    let identity = crate::project_identity::resolve_project_identity(workspace);
+    if !identity.workspace_hash.is_empty() {
+        return identity.workspace_hash;
+    }
     let canonical = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let h = fnv1a(canonical.to_string_lossy().as_bytes());
     format!("{:016x}", h)
+}
+
+/// All memory directory hashes that may hold entries for this workspace
+/// (current hash + registry legacy hashes).
+fn memory_dir_candidates(workspace: &Path) -> Vec<String> {
+    let identity = crate::project_identity::resolve_project_identity(workspace);
+    let mut out = vec![hash_workspace(workspace)];
+    // Also try raw path hash in case legacy data pre-dates identity.
+    let canonical = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let raw = format!("{:016x}", fnv1a(canonical.to_string_lossy().as_bytes()));
+    if !out.iter().any(|h| h == &raw) {
+        out.push(raw);
+    }
+    out
 }
 
 fn fnv1a(s: &[u8]) -> u64 {
@@ -347,11 +368,27 @@ impl Store {
     }
 
     fn scan(&self, workspace: &Path) -> Vec<MemoryEntry> {
-        scan_dir(&self.dir(workspace), Scope::Workspace)
+        self.scan_scoped(workspace, Scope::Workspace)
     }
 
     fn scan_scoped(&self, workspace: &Path, scope: Scope) -> Vec<MemoryEntry> {
-        scan_dir(&self.dir_scoped(workspace, scope), scope)
+        match scope {
+            Scope::Global => scan_dir(&self.global_dir(), Scope::Global),
+            Scope::Workspace => {
+                // Merge current + legacy hash dirs so path moves keep memories
+                // (CORE_REVIEW dual project identity).
+                let mut out = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for h in memory_dir_candidates(workspace) {
+                    for e in scan_dir(&self.root.join(&h), Scope::Workspace) {
+                        if seen.insert(e.name.clone()) {
+                            out.push(e);
+                        }
+                    }
+                }
+                out
+            }
+        }
     }
 
     fn save(
@@ -544,6 +581,14 @@ pub fn save_memory_scoped_with_importance(
     // Drop after write succeeds so the next scan/relevance call re-reads disk.
     drop(_guard);
     invalidate_scan_cache();
+    // Best-effort embedding index so synonym-miss recovery can prefer
+    // embeddings when enabled (CORE_REVIEW: index_memory was never called).
+    let index_text = format!(
+        "{name}
+{description}
+{content}"
+    );
+    crate::embed::index_memory(workspace, name, &index_text);
     Ok(path)
 }
 /// Mutate an existing memory using the latest on-disk entry while holding both

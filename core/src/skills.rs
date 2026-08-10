@@ -113,10 +113,10 @@ fn valid_name(s: &str) -> bool {
         && s != ".."
 }
 pub fn configured(project: &Path, user: Option<&Path>) -> SkillResolver {
+    // Align with runtime discovery / marketplace (`~/.catalyst-code/skills`),
+    // not the unused `~/.config/catalyst-code/skills` path (CORE_REVIEW).
     let project_root = project.join(".catalyst-code/skills");
-    let user_roots = user
-        .into_iter()
-        .map(|u| u.join(".config/catalyst-code/skills"));
+    let user_roots = user.into_iter().map(|u| u.join(".catalyst-code/skills"));
     SkillResolver::new([project_root], user_roots)
 }
 

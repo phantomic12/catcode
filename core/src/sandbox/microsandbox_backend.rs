@@ -224,26 +224,31 @@ impl MicrosandboxExecutionBackend {
                 let (domains, suffixes): (Vec<String>, Vec<String>) = entries
                     .into_iter()
                     .partition(|e| !e.starts_with('.') && !e.contains('/'));
-                builder.network(|n| {
-                    n.policy(
-                        microsandbox::NetworkPolicy::builder()
-                            .default_deny()
-                            .egress(|r| {
-                                // DNS is resolved by the SDK's built-in
-                                // interceptor; only the allowlisted domains/
-                                // suffixes (plus optionally private ranges) are
-                                // permitted for application egress.
-                                r.allow_domains(domains.iter());
-                                r.allow_domain_suffixes(suffixes.iter());
-                                if self.cfg.sandbox_allow_private_networks {
-                                    r.allow_private();
-                                }
-                                r
-                            })
-                            .build()
-                            .unwrap_or_else(|_| microsandbox::NetworkPolicy::public_only()),
-                    )
-                })
+                match microsandbox::NetworkPolicy::builder()
+                    .default_deny()
+                    .egress(|r| {
+                        // DNS is resolved by the SDK's built-in interceptor;
+                        // only the allowlisted domains/suffixes (plus optionally
+                        // private ranges) are permitted for application egress.
+                        r.allow_domains(domains.iter());
+                        r.allow_domain_suffixes(suffixes.iter());
+                        if self.cfg.sandbox_allow_private_networks {
+                            r.allow_private();
+                        }
+                        r
+                    })
+                    .build()
+                {
+                    Ok(policy) => builder.network(|n| n.policy(policy)),
+                    // Fail closed: a broken allowlist must NOT upgrade to public
+                    // egress (CORE_REVIEW HIGH).
+                    Err(e) => {
+                        eprintln!(
+                            "[sandbox] network allowlist policy failed to build ({e}); disabling network"
+                        );
+                        builder.disable_network()
+                    }
+                }
             }
         }
     }
@@ -402,11 +407,11 @@ impl ExecutionBackend for MicrosandboxExecutionBackend {
     }
 
     async fn prepare(&self) -> Result<(), ExecutionError> {
-        // Download verified runtime assets (msb + libkrunfw) into the CatCode
-        // cache dir. The SDK verifies the bundle after extraction.
-        let base = cache_dir();
+        // Install into the SDK default base dir (`~/.microsandbox` / `$MSB_HOME`).
+        // `is_installed()` and msb resolution only look there — a custom CatCode
+        // cache path made prepare "succeed" while every exec still reported
+        // runtime_missing (CORE_REVIEW C6 / microsandbox-auto-setup).
         if let Err(e) = microsandbox::setup::Setup::builder()
-            .base_dir(base.clone())
             .build()
             .install()
             .await
@@ -467,6 +472,7 @@ fn sandbox_name(workspace: &Path) -> String {
 }
 
 /// Where CatCode stores Microsandbox runtime assets (NOT ~/.microsandbox).
+#[allow(dead_code)]
 fn cache_dir() -> PathBuf {
     if let Some(c) = dirs_cache() {
         c.join("microsandbox")
@@ -475,6 +481,7 @@ fn cache_dir() -> PathBuf {
     }
 }
 
+#[allow(dead_code)]
 fn dirs_cache() -> Option<PathBuf> {
     std::env::var("XDG_CACHE_HOME")
         .ok()

@@ -18,7 +18,7 @@ Every tool is classified as one of:
 
 | Class | Gate | Tools |
 |-------|------|-------|
-| `ReadOnly` | Never gated (executes immediately) | `read_file`, `list_dir`, `grep`, `glob`, `bulk_read`, `todo_read`, `diagnostics`, `finish`, `contact_supervisor`, `intercom`, `git_status`, `git_diff`, `git_log`, `memory`, `knowledge`, `load_tools`, `ask`, `web_search`, `workspace_activity`, `goal_write_plan`, plus browser read-only tools |
+| `ReadOnly` | Never gated (executes immediately) | `read_file`, `list_dir`, `grep`, `glob`, `bulk_read`, `todo_read`, `diagnostics`, `finish`, `contact_supervisor`, `intercom`, `git_status`, `git_diff`, `git_log`, `git_show`, `memory`, `knowledge`, `load_tools`, `ask`, `web_search`, `workspace_activity`, `goal_write_plan`, plus browser read-only tools |
 | `Destructive` | Gated under `Approval::Destructive` (default) — prompts user before executing | Everything else (writes, edits, bash, subagent, …) |
 
 Classification is determined by the `classify()` (/core/src/tools.rs) function.
@@ -81,6 +81,10 @@ Always available (defined by `is_core_tool()` (/core/src/tools.rs)).
 | `load_tools` | Enable deferred tools for this session. Pass `tools:[...]` or `tool:"name"`. Groups: `all`, `git`, `web`, `bulk`, `browser`. | ReadOnly |
 | `subagent` | Delegate to a child agent. Modes: `single` (one agent), `parallel` (tasks array), `chain` (sequential steps), plus management actions. Supports worktree isolation, async background execution, and agent configuration. | Destructive |
 | `patch` | Apply a unified diff patch to a file. Uses `@@` hunks with `+`/`-`/space prefixes. For larger refactors than `edit` handles well. | Destructive |
+| `git_status` | Show working-tree status (`git status --short --branch`). Optional `path` scopes to a subdirectory. Prefer over bash `git status`. | ReadOnly |
+| `git_diff` | Show unstaged/staged changes. Optional `path` / `staged`. Prefer over bash `git diff`. | ReadOnly |
+| `git_log` | Recent commit history (`git log --oneline`). Prefer over bash `git log`. | ReadOnly |
+| `git_show` | Show a commit/tree/blob (`git show <object>`). Prefer over bash `git show`. | ReadOnly |
 
 ---
 
@@ -104,13 +108,15 @@ loaded. Defined by `deferred_tool_names()` (/core/src/tools.rs).
 
 ### Git Tools
 
+Read-only `git_status` / `git_diff` / `git_log` / `git_show` are **core** (always offered). The group `load_tools` `git` enables the mutators below.
+
 | Tool | Description | Class |
 |------|-------------|-------|
-| `git_status` | Show working-tree status (`git status --short --branch`). Optional `path` scopes to a subdirectory. | ReadOnly |
-| `git_diff` | Show unstaged changes (`git diff --no-color`) or staged changes with `staged:true`. Optional `path` scope. | ReadOnly |
-| `git_log` | Show recent commit history (`git log --oneline -n <limit>`). Optional `path` to filter to a file's history. | ReadOnly |
 | `git_add` | Stage files for commit (`git add -- <paths>`). Destructive (modifies the index). | Destructive |
 | `git_commit` | Create a commit (`git commit -m <message>`). Pass `all:true` to stage modified tracked files first (does NOT add untracked). | Destructive |
+| `git_push` | Push to a remote (`git push`). Optional `remote`/`refspec`/`set_upstream`/`tags`. | Destructive |
+| `git_pull` | Pull from a remote (`git pull`). Optional `remote`/`refspec`/`rebase`. | Destructive |
+| `git_branch` | List/create/delete/checkout branches (`action` + optional `name`/`all`). | Destructive |
 
 ### Execution Tools
 
@@ -167,7 +173,7 @@ is_parallel_wave_tool(name) => matches!(
     name,
     "read_file" | "list_dir" | "grep" | "glob"
         | "bulk_read" | "todo_read"
-        | "git_status" | "git_diff" | "git_log"
+        | "git_status" | "git_diff" | "git_log" | "git_show"
         | "workspace_activity"
         | "fetch" | "web_search"
         | "diagnostics"

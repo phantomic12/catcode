@@ -57,7 +57,7 @@ one of two `ToolKind` (/core/src/tools.rs) values:
 
 | Class | Gate | Tools |
 |-------|------|-------|
-| `ReadOnly` | Never gated (executes immediately) | `read_file`, `list_dir`, `grep`, `glob`, `bulk_read`, `todo_read`, `diagnostics`, `finish`, `contact_supervisor`, `intercom`, `git_status`, `git_diff`, `git_log`, `memory`, `knowledge`, `load_tools`, `ask`, `web_search`, `workspace_activity`, `goal_write_plan`, plus browser read-only tools (`browser_list_sessions`, `browser_snapshot`, `browser_find`, `browser_screenshot`) |
+| `ReadOnly` | Never gated (executes immediately) | `read_file`, `list_dir`, `grep`, `glob`, `bulk_read`, `todo_read`, `diagnostics`, `finish`, `contact_supervisor`, `intercom`, `git_status`, `git_diff`, `git_log`, `git_show`, `memory`, `knowledge`, `load_tools`, `ask`, `web_search`, `workspace_activity`, `goal_write_plan`, plus browser read-only tools (`browser_list_sessions`, `browser_snapshot`, `browser_find`, `browser_screenshot`) |
 | `Destructive` | Gated under `Approval::Destructive` — prompts user before executing | Everything else: `bash`, `edit`, `write_file`, `delete`, `rename`, `mkdir`, `bulk_write`, `bulk_edit`, `patch`, `git_add`, `git_commit`, `subagent`, `spawn`, `test_env`, `todo_write`, `bulk`, all browser navigation/interaction tools (`browser_navigate`, `browser_click`, `browser_fill`, `browser_type`, `browser_press`, `browser_scroll`, `browser_wait`, `browser_evaluate`, `browser_create`, `browser_close`, `browser_reload`, `browser_back`, `browser_show`, `browser_hide`) |
 
 Source: `classify()` (/core/src/tools.rs), line 44.

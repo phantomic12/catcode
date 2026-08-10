@@ -6,7 +6,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { UIToolCall } from "@/lib/types";
-import { isDangerousTool, prettyArgs, toolIcon, truncate } from "@/lib/format";
+import { isDangerousTool, prettyArgs, toolArgPreview, toolIcon } from "@/lib/format";
 import { ChevronRight, CheckIcon, CopyIcon } from "./icons";
 import { Diff } from "./diff";
 
@@ -60,7 +60,7 @@ export function ToolCallCard({ tc }: { tc: UIToolCall }) {
           </span>
         )}
         <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-ink-500">
-          {truncate(tc.argString || JSON.stringify(tc.args), 72)}
+          {toolArgPreview(tc.name, tc.args, tc.argString, 72)}
         </span>
         <span className="ml-auto flex shrink-0 items-center">
           {running ? (

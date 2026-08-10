@@ -1,5 +1,6 @@
 ---
 name: planner
+model: ck-grok-4.5
 description: A concrete implementation plan from existing context; reads and plans, does not edit
 tools: read_file, grep, glob, list_dir, bash, intercom
 thinking: high

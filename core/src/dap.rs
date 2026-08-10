@@ -190,6 +190,26 @@ async fn dispatch_inner(args: &Value, ctx: &ToolExecutionContext) -> Result<Valu
         return response.map(|response| result_with_events(response, &session));
     }
     validate_debug_arguments(action, args.get("arguments"), ctx.workspace())?;
+    // write_memory / evaluate can mutate target process memory or run
+    // expressions with full debuggee privileges. Schema claims extra approval;
+    // require an explicit confirm flag so a single Destructive approve of
+    // `debug` cannot silently escalate (CORE_REVIEW C7).
+    if matches!(action, "write_memory" | "evaluate") {
+        let confirmed = args
+            .get("confirm")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || args
+                .get("arguments")
+                .and_then(|v| v.get("confirm"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+        if !confirmed {
+            return Err(format!(
+                "debug action '{action}' requires confirm:true (memory write / evaluate can                  alter or inspect the debuggee arbitrarily)"
+            ));
+        }
+    }
     let command = match action {
         "launch" => "launch",
         "attach" => "attach",
@@ -439,7 +459,36 @@ fn validate_command(command: &str, workspace: &Path) -> Result<PathBuf, String> 
     if command.is_empty() || command.contains('\0') {
         return Err("adapter.command is invalid".into());
     }
+    // Bare PATH names must be known debug adapters (CORE_REVIEW).
+    const DAP_ALLOWLIST: &[&str] = &[
+        "python",
+        "python3",
+        "node",
+        "nodejs",
+        "dlv",
+        "lldb",
+        "lldb-vscode",
+        "lldb-dap",
+        "gdb",
+        "codelldb",
+        "rust-gdb",
+        "rust-lldb",
+        "netcoredbg",
+        "vsdbg",
+        "js-debug-adapter",
+        "rdbg",
+    ];
     if Path::new(command).components().count() == 1 {
+        let base = Path::new(command)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(command);
+        if !DAP_ALLOWLIST.iter().any(|a| *a == base) {
+            return Err(format!(
+                "debug adapter '{command}' is not allowlisted; use a workspace-relative path or one of: {}",
+                DAP_ALLOWLIST.join(", ")
+            ));
+        }
         return Ok(PathBuf::from(command));
     }
     resolve_workspace_path(workspace, command)

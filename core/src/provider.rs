@@ -1069,6 +1069,67 @@ async fn stream_turn_codex(
     prompt_est: u64,
     quiet: bool,
 ) -> Result<(Value, String, u64, u64, u64), String> {
+    // Outer stream retry parity with OpenAI/Anthropic paths (CORE_REVIEW).
+    let max_attempts = 3u32;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match stream_turn_codex_once(
+            client,
+            provider,
+            idle_timeout_secs,
+            model,
+            messages,
+            tools,
+            reasoning_effort,
+            thinking_levels,
+            max_tokens,
+            cancel,
+            timer,
+            prompt_est,
+            quiet,
+        )
+        .await
+        {
+            Ok(v) => return Ok(v),
+            Err(e) if e == "aborted" => return Err(e),
+            Err(e) => {
+                let emitted = timer.first_token.is_some();
+                if !should_retry_stream_attempt(&e, emitted, attempt, max_attempts) {
+                    return Err(e);
+                }
+                let backoff = backoff_ms(attempt, None);
+                let reason = if emitted {
+                    "retryable codex stream error after partial output"
+                } else {
+                    "codex stream error before first token"
+                };
+                emit_stream_retry(attempt, reason, backoff, emitted);
+                if emitted && !quiet {
+                    emit(&Event::new("discard_partial"));
+                }
+                timer.call_first_token = None;
+                let _ = sleep_or_cancel(Duration::from_millis(backoff), cancel).await;
+            }
+        }
+    }
+}
+
+async fn stream_turn_codex_once(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    idle_timeout_secs: u64,
+    model: &str,
+    messages: &[Message],
+    tools: &[Value],
+    reasoning_effort: &str,
+    thinking_levels: &[String],
+    max_tokens: u32,
+    cancel: &CancellationToken,
+    timer: &mut TurnTimer,
+    prompt_est: u64,
+    quiet: bool,
+) -> Result<(Value, String, u64, u64, u64), String> {
     let api_key = provider.api_key.as_deref().unwrap_or("");
     let adapter = adapter_for(provider);
     let built = adapter.build_request(&ProviderRequest {

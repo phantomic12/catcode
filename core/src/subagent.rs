@@ -449,7 +449,11 @@ pub fn find_agent<'a>(agents: &'a [AgentConfig], name: &str) -> Option<&'a Agent
 
 pub(crate) fn discover_skills(workspace: &Path) -> Vec<(String, String, String)> {
     // (name, description, location) — project first, then user.
+    // Keep in sync with `crate::skills::configured` roots (CORE_REVIEW).
     let mut out: Vec<(String, String, String)> = Vec::new();
+    let _skill_resolver =
+        crate::skills::configured(workspace, crate::config::home_dir().as_deref());
+    let _ = _skill_resolver.discover(); // warm / validate resolver path
     let dirs = [
         (workspace.join(".catalyst-code/skills"), true),
         (
@@ -744,8 +748,12 @@ fn all_tool_names() -> &'static [&'static str] {
         "git_status",
         "git_diff",
         "git_log",
+        "git_show",
         "git_add",
         "git_commit",
+        "git_push",
+        "git_pull",
+        "git_branch",
         "workspace_activity",
         // Agents / env
         "subagent",
@@ -965,6 +973,7 @@ pub fn execute(
                     depth,
                     &cancel,
                     None,
+                    None,
                 )
                 .await;
             }
@@ -1050,7 +1059,7 @@ pub fn execute(
             } else {
                 None
             };
-            let outcome = run_single(
+            let mut outcome = run_single(
                 &st,
                 &client,
                 &provider,
@@ -1064,6 +1073,7 @@ pub fn execute(
                 depth,
                 &cancel,
                 wt_path.clone(),
+                None,
             )
             .await;
             if let Some(ref wt) = wt_path {
@@ -1086,11 +1096,20 @@ pub fn execute(
                                     json!(format!("worktree promote failed: {e}")),
                                 ),
                             );
+                            // Promote failure must not report success — child
+                            // edits live only in the worktree (CORE_REVIEW C11).
+                            outcome = Outcome::err(format!(
+                                "worktree promote failed (changes not applied to main workspace): {e}"
+                            ));
                         }
                         _ => {}
                     }
                 }
-                let _ = crate::worktree::remove_worktree(&workspace, wt);
+                // Only remove after successful promote or failed run; keep tree
+                // on promote failure so the operator can recover.
+                if outcome.ok || cancel.is_cancelled() {
+                    let _ = crate::worktree::remove_worktree(&workspace, wt);
+                }
             }
             return outcome;
         }
@@ -1156,6 +1175,8 @@ async fn revive_parked_agent(
         .and_then(Value::as_str)
         .unwrap_or("Continue the prior task.");
     crate::session::remove_parked_agent(&path, &record.run_id).ok()?;
+    // Resume from the parked transcript instead of Fresh empty (CORE_REVIEW).
+    let prior = record.messages.clone();
     let outcome = run_single(
         st,
         client,
@@ -1170,6 +1191,7 @@ async fn revive_parked_agent(
         depth,
         cancel,
         None,
+        Some(prior),
     )
     .await;
     Some(outcome)
@@ -1326,6 +1348,7 @@ async fn run_single(
     depth: u32,
     cancel: &CancellationToken,
     workspace_override: Option<std::path::PathBuf>,
+    prior_messages: Option<Vec<Message>>,
 ) -> Outcome {
     let cfg = st.cfg.read().await.clone();
     let max_depth = child_max_depth(resolve_max_depth(&cfg.subagents), agent.max_subagent_depth);
@@ -1419,6 +1442,7 @@ async fn run_single(
         &run_cancel,
         messages,
         workspace_override,
+        prior_messages,
     ))
     .catch_unwind()
     .await
@@ -1541,6 +1565,7 @@ pub async fn run_agent(
     cancel: &CancellationToken,
     messages: Arc<Mutex<Vec<Message>>>,
     workspace_override: Option<std::path::PathBuf>,
+    prior_messages: Option<Vec<Message>>,
 ) -> Outcome {
     emit_subagent_progress(run_id, agent, "start", "", 0, 0, 0, 0, true);
     let result = run_agent_inner(
@@ -1561,6 +1586,7 @@ pub async fn run_agent(
         cancel,
         messages,
         workspace_override,
+        prior_messages,
     )
     .await;
     emit_subagent_progress(run_id, agent, "done", "", 0, 0, 0, 0, result.ok);
@@ -1586,6 +1612,7 @@ async fn run_agent_inner(
     cancel: &CancellationToken,
     messages: Arc<Mutex<Vec<Message>>>,
     workspace_override: Option<std::path::PathBuf>,
+    prior_messages: Option<Vec<Message>>,
 ) -> Outcome {
     let mut cfg = st.cfg.read().await.clone();
     if let Some(ws) = workspace_override {
@@ -1623,6 +1650,20 @@ async fn run_agent_inner(
     }
 
     let mut sub: Vec<Message> = vec![Message::system(sys)];
+    // Parked-agent resume: seed with durable transcript (CORE_REVIEW).
+    if let Some(prior) = prior_messages {
+        if !prior.is_empty() {
+            sub.push(Message::system(
+                "--- resumed from parked agent transcript (continuation) ---",
+            ));
+            for pm in prior {
+                if pm.is_system() {
+                    continue;
+                }
+                sub.push(pm);
+            }
+        }
+    }
 
     // --- forked context: parent conversation as reference ---
     if context == ContextKind::Fork {
@@ -2465,11 +2506,29 @@ async fn dispatch_subagent_tool(
                         .with("message", json!(msg))
                         .with("auto_resolved", json!(true)),
                 );
-                Outcome::ok(
-                    "No active supervisor during goal orchestration — the orchestrator turn is not \
-                     waiting on intercom. Proceed with the most reasonable decision for the task and \
-                     document it in your final summary. Do NOT block or re-ask; continue implementing."
-                )
+                // Safe default: do NOT authorize unapproved mutations. Read-only
+                // agents may continue with a documented assumption; writers must
+                // stop and surface the decision (CORE_REVIEW C10).
+                let agent_l = my_target.to_ascii_lowercase();
+                let read_only = [
+                    "scout",
+                    "reviewer",
+                    "oracle",
+                    "researcher",
+                    "planner",
+                    "context-builder",
+                ]
+                .iter()
+                .any(|a| agent_l.contains(a));
+                if read_only {
+                    Outcome::ok(
+                        "No active supervisor during goal orchestration for this need_decision.                          As a read-only agent, continue with the most reasonable *non-mutating*                          assumption, document it in your final summary, and do not re-ask."
+                    )
+                } else {
+                    Outcome::err(format!(
+                        "Blocked: need_decision requires supervisor approval during goal                          orchestration, and no supervisor is waiting on intercom. Decision was: {msg}.                          Do NOT proceed with unapproved destructive/mutating choices — fail this step                          so the orchestrator can replan."
+                    ))
+                }
             } else {
                 execute_contact_supervisor(&exec_args, &st.intercom, my_target, cancel).await
             }
@@ -3006,6 +3065,26 @@ fn now_ms() -> u64 {
 // Parallel run
 // ---------------------------------------------------------------------------
 
+/// Absolute safety bound for parallel fan-out (DoS guard). Also used to clamp
+/// explicit concurrency requests that exceed the task count / absolute max.
+pub(crate) const PARALLEL_TASKS_ABSOLUTE_MAX: usize = 256;
+
+/// Resolve effective parallel concurrency.
+///
+/// - `requested` already incorporates the config default when the caller
+///   omitted `concurrency` (so defaults stay modest).
+/// - Explicit higher requests are honored, clamped only by task count and the
+///   absolute safety max — not by the config default ceiling.
+pub(crate) fn resolve_parallel_concurrency(
+    requested: u64,
+    task_count: usize,
+    absolute_max: usize,
+) -> usize {
+    let req = usize::try_from(requested.max(1)).unwrap_or(usize::MAX);
+    let by_tasks = task_count.max(1);
+    req.min(by_tasks).min(absolute_max.max(1))
+}
+
 async fn run_parallel(
     st: &Arc<State>,
     client: &reqwest::Client,
@@ -3022,12 +3101,13 @@ async fn run_parallel(
     if tasks.is_empty() {
         return Outcome::err("parallel requires a non-empty 'tasks' array");
     }
-    // Soft cap: the configured `parallel_max_tasks` (default 64) is advisory.
+    // Soft cap: the configured `parallel_max_tasks` (default 8) is advisory.
     // Exceeding it no longer errors instantly — tasks queue through the
     // concurrency semaphore below (only `concurrency` run at once). We emit an
     // info event so the user knows a large batch is queuing. A much higher
     // absolute safety bound guards against runaway fan-out (DoS).
-    const PARALLEL_TASKS_ABSOLUTE_MAX: usize = 256;
+    // Callers may also request concurrency above the config default; the
+    // default only applies when `concurrency` is omitted.
     if tasks.len() > PARALLEL_TASKS_ABSOLUTE_MAX {
         return Outcome::err(format!(
             "parallel has {} tasks (absolute safety max {PARALLEL_TASKS_ABSOLUTE_MAX}); \
@@ -3039,23 +3119,27 @@ async fn run_parallel(
         emit(&Event::new("info").with(
             "message",
             json!(format!(
-                "parallel batch has {} tasks (soft cap {}): queuing with the configured concurrency; \
-                 only a few run at once. Raise subagents.maxTasks in settings if you expect this.",
+                "parallel batch has {} tasks (soft default max {}): queuing under concurrency; \
+                 only a few run at once unless you raise concurrency. This is allowed — \
+                 set subagents.parallel.maxTasks if you want a higher advisory default.",
                 tasks.len(),
                 cfg.subagents.parallel_max_tasks
             )),
         ));
     }
+    let default_concurrency = cfg.subagents.parallel_concurrency.max(1) as u64;
     let requested_concurrency = args
         .get("concurrency")
         .and_then(|v| v.as_u64())
-        .unwrap_or(cfg.subagents.parallel_concurrency as u64)
+        .unwrap_or(default_concurrency)
         .max(1);
-    let configured_concurrency =
-        usize::try_from(cfg.subagents.parallel_concurrency.max(1)).unwrap_or(usize::MAX);
-    let concurrency = usize::try_from(requested_concurrency)
-        .unwrap_or(usize::MAX)
-        .min(configured_concurrency);
+    // Config concurrency is the *default* when omitted, not a hard ceiling.
+    // Explicit requests can exceed it; absolute + task-count bounds still apply.
+    let concurrency = resolve_parallel_concurrency(
+        requested_concurrency,
+        tasks.len(),
+        PARALLEL_TASKS_ABSOLUTE_MAX,
+    );
     let context = args.get("context").and_then(|v| v.as_str());
     let use_worktree = args
         .get("worktree")
@@ -3206,6 +3290,34 @@ async fn run_parallel(
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let mut handles: Vec<(usize, tokio::task::JoinHandle<Outcome>)> =
         Vec::with_capacity(tasks.len());
+    // Populate parent.children for status/tree cancel (CORE_REVIEW).
+    {
+        let child_ids: Vec<String> = (0..resolved.len())
+            .map(|i| format!("{}-{}", run_id, i))
+            .collect();
+        if let Some(parent) = st.subagent_runs.lock().await.get_mut(&run_id) {
+            // Store lightweight child stubs for graph visibility.
+            parent.children = child_ids
+                .iter()
+                .map(|cid| SubagentRun {
+                    id: cid.clone(),
+                    parent_run_id: Some(run_id.to_string()),
+                    mode: "single".into(),
+                    agent: None,
+                    agents: vec![],
+                    state: "running".into(),
+                    started_at: now_ms(),
+                    ended_at: None,
+                    depth,
+                    intercom_target: None,
+                    cancel: None,
+                    children: vec![],
+                    summary: None,
+                    messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                })
+                .collect();
+        }
+    }
     for (i, (agent, task, model_override, ctx)) in resolved.into_iter().enumerate() {
         let stc = st.clone();
         let clientc = client.clone();
@@ -3217,7 +3329,9 @@ async fn run_parallel(
         let parent_batch_run_id = run_id.clone();
         let wt = worktrees.get(i).cloned().flatten();
         let h = tokio::spawn(async move {
-            let _permit = semc.acquire().await.ok();
+            let Ok(_permit) = semc.acquire().await else {
+                return Outcome::err("parallel slot unavailable (semaphore closed or cancelled)");
+            };
             run_single(
                 &stc,
                 &clientc,
@@ -3232,6 +3346,7 @@ async fn run_parallel(
                 depth,
                 &cancelc,
                 wt,
+                None,
             )
             .await
         });
@@ -3257,30 +3372,64 @@ async fn run_parallel(
 
     // Promote successful worktrees into the main workspace, then clean up.
     // Never promote on cancel even if a child reported ok before the abort (H13).
+    // Promote Err flips the task (and batch) to failed — do not report ok:true
+    // when main workspace was not updated (CORE_REVIEW C11).
     let batch_cancelled = run_cancel.is_cancelled();
+    let mut promote_failed = false;
+    let mut promoted_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (i, o) in &collected {
         if let Some(wt) = worktrees.get(*i).and_then(|w| w.as_ref()) {
+            let mut keep_worktree = false;
             if o.ok && !batch_cancelled {
                 match crate::worktree::promote_worktree(&workspace, wt) {
                     Ok(paths) if !paths.is_empty() => {
-                        emit(
-                            &Event::new("worktree_promoted")
-                                .with("run_id", json!(format!("{}-{}", run_id, i)))
-                                .with("paths", json!(paths)),
-                        );
+                        // Detect last-writer-wins overlap across parallel worktrees
+                        // (CORE_REVIEW): report failure rather than silent clobber.
+                        let overlap: Vec<_> = paths
+                            .iter()
+                            .filter(|p| promoted_paths.contains(*p))
+                            .cloned()
+                            .collect();
+                        if !overlap.is_empty() {
+                            emit(
+                                &Event::new("error").with(
+                                    "message",
+                                    json!(format!(
+                                        "worktree promote conflict for task {i}: overlapping paths {:?}",
+                                        overlap
+                                    )),
+                                ),
+                            );
+                            promote_failed = true;
+                            keep_worktree = true;
+                        } else {
+                            for p in &paths {
+                                promoted_paths.insert(p.clone());
+                            }
+                            emit(
+                                &Event::new("worktree_promoted")
+                                    .with("run_id", json!(format!("{}-{}", run_id, i)))
+                                    .with("paths", json!(paths)),
+                            );
+                        }
                     }
                     Err(e) => {
                         emit(&Event::new("error").with(
                             "message",
                             json!(format!("worktree promote failed for task {i}: {e}")),
                         ));
+                        promote_failed = true;
+                        keep_worktree = true;
                     }
                     _ => {}
                 }
             }
-            let _ = crate::worktree::remove_worktree(&workspace, wt);
+            if !keep_worktree {
+                let _ = crate::worktree::remove_worktree(&workspace, wt);
+            }
         }
     }
+    let all_ok = all_ok && !promote_failed;
 
     // finalize run
     let final_state = if run_cancel.is_cancelled() {
@@ -3356,6 +3505,10 @@ async fn run_chain(
     if chain.is_empty() {
         return Outcome::err("chain requires a non-empty 'chain' array");
     }
+    // CORE_REVIEW: async:true is intentionally ignored — chain is always
+    // awaited so status/cancel/promote stay coherent. Detached work uses
+    // parallel mode or parent-level orchestration instead.
+    let _ = args.get("async");
     let workspace = st.cfg.read().await.workspace.clone();
     let cfg = st.cfg.read().await.clone();
     let agents = discover_agents(&workspace, &cfg.subagents);
@@ -3499,7 +3652,8 @@ async fn run_chain(
                 depth,
                 &run_cancel,
                 None,
-            )
+        None,
+    )
             .await;
             if !o.ok {
                 return Outcome::err(format!(
@@ -3742,6 +3896,26 @@ pub async fn steer_action(args: &Value, st: &Arc<State>, _cancel: &CancellationT
     Outcome::err(format!("run {} is no longer live", r.id))
 }
 
+fn validate_agent_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("agent name must not be empty".into());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(format!(
+            "agent name must be a single path segment (got '{name}')"
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(format!(
+            "agent name may only contain [A-Za-z0-9._-] (got '{name}')"
+        ));
+    }
+    Ok(())
+}
+
 fn create_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
     let cfg = match args.get("config") {
         Some(v) => v,
@@ -3750,6 +3924,9 @@ fn create_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
     let name = cfg.get("name").and_then(|v| v.as_str()).unwrap_or("");
     if name.is_empty() {
         return Outcome::err("create config requires 'name'");
+    }
+    if let Err(e) = validate_agent_name(name) {
+        return Outcome::err(e);
     }
     let scope = cfg
         .get("scope")
@@ -3799,6 +3976,9 @@ fn update_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
     let name = args.get("agent").and_then(|v| v.as_str()).unwrap_or("");
     if name.is_empty() {
         return Outcome::err("update requires 'agent'");
+    }
+    if let Err(e) = validate_agent_name(name) {
+        return Outcome::err(e);
     }
     // find the file
     let candidates = [
@@ -3864,6 +4044,9 @@ fn delete_agent(args: &Value, workspace: &std::path::Path) -> Outcome {
     if name.is_empty() {
         return Outcome::err("delete requires 'agent'");
     }
+    if let Err(e) = validate_agent_name(name) {
+        return Outcome::err(e);
+    }
     let candidates = [
         workspace
             .join(".catalyst-code/agents")
@@ -3910,8 +4093,14 @@ async fn interrupt_action(args: &Value, st: &Arc<State>) -> Outcome {
     };
     if let Some(c) = r.cancel.clone() {
         c.cancel();
-        r.state = "paused".into();
-        Outcome::ok(format!("interrupted run {}", r.id))
+        // Honest status: interrupt cancels the run loop; there is no true pause.
+        // Mark cancelled so resume does not claim a parked/paused agent
+        // (CORE_REVIEW: interrupt ≠ pause).
+        r.state = "cancelled".into();
+        Outcome::ok(format!(
+            "cancelled run {} (interrupt stops the run; start a new run or use steer while still live)",
+            r.id
+        ))
     } else {
         Outcome::err(format!("run {} has no cancel handle", r.id))
     }
@@ -3960,10 +4149,16 @@ fn find_run_prefix<'a>(
     runs: &'a HashMap<String, SubagentRun>,
     id: &str,
 ) -> Option<&'a SubagentRun> {
-    runs.get(id).or_else(|| {
-        runs.values()
-            .find(|r| r.id.starts_with(id) || id.starts_with(&r.id))
-    })
+    if let Some(r) = runs.get(id) {
+        return Some(r);
+    }
+    // Prefix match only when unique (CORE_REVIEW).
+    let mut hits = runs.values().filter(|r| r.id.starts_with(id));
+    let first = hits.next()?;
+    if hits.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
 fn find_run_prefix_mut<'a>(
@@ -3973,11 +4168,11 @@ fn find_run_prefix_mut<'a>(
     if runs.contains_key(id) {
         return runs.get_mut(id);
     }
-    let key = runs
-        .values()
-        .find(|r| r.id.starts_with(id) || id.starts_with(&r.id))
-        .map(|r| r.id.clone())?;
-    runs.get_mut(&key)
+    let keys: Vec<String> = runs.keys().filter(|k| k.starts_with(id)).cloned().collect();
+    if keys.len() != 1 {
+        return None;
+    }
+    runs.get_mut(&keys[0])
 }
 
 fn format_run(r: &SubagentRun) -> String {
@@ -4032,6 +4227,35 @@ async fn doctor_action(workspace: &std::path::Path, cfg: &Config, st: &Arc<State
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_defaults_are_soft_not_hard() {
+        // Config default max tasks is 8 (advisory).
+        let cfg = SubagentConfig::default();
+        assert_eq!(cfg.parallel_max_tasks, 8);
+        assert_eq!(cfg.parallel_concurrency, 4);
+
+        // Explicit concurrency above the config default is honored.
+        assert_eq!(
+            resolve_parallel_concurrency(16, 16, PARALLEL_TASKS_ABSOLUTE_MAX),
+            16
+        );
+        // Clamped by task count so we never spin more workers than tasks.
+        assert_eq!(
+            resolve_parallel_concurrency(32, 12, PARALLEL_TASKS_ABSOLUTE_MAX),
+            12
+        );
+        // Absolute safety max still binds runaway requests.
+        assert_eq!(
+            resolve_parallel_concurrency(10_000, 10_000, PARALLEL_TASKS_ABSOLUTE_MAX),
+            PARALLEL_TASKS_ABSOLUTE_MAX
+        );
+        // Zero request still yields at least 1.
+        assert_eq!(
+            resolve_parallel_concurrency(0, 5, PARALLEL_TASKS_ABSOLUTE_MAX),
+            1
+        );
+    }
 
     #[test]
     fn frontmatter_parses() {

@@ -1084,8 +1084,15 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
           `Context compacted — ${ev.before_tokens.toLocaleString()} → ${ev.after_tokens.toLocaleString()} tokens`,
         ),
       };
-    case "http_retry":
-      return {
+    case "http_retry": {
+      // Mid-stream transport retries re-POST the same turn. Core already
+      // cleared its own accumulators; drop any partial assistant/thinking
+      // text the failed attempt streamed so a successful retry cannot
+      // append a second copy.
+      const discard =
+        ev.discard_partial === true ||
+        String(ev.discard_partial ?? "").trim() === "true";
+      let next = {
         ...state,
         retrying: true,
         toasts: pushToast(
@@ -1094,6 +1101,50 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
           `Retrying request${ev.status ? ` (HTTP ${ev.status})` : ""}…`,
         ),
       };
+      if (discard && next.currentAssistantId) {
+        const id = next.currentAssistantId;
+        next = {
+          ...next,
+          currentAssistantId: null,
+          messages: next.messages.filter((m) => m.id !== id),
+        };
+      }
+      return next;
+    }
+    case "discard_partial": {
+      // Top-level discard signal (Codex stream retry parity with http_retry).
+      if (!state.currentAssistantId) return state;
+      const id = state.currentAssistantId;
+      return {
+        ...state,
+        currentAssistantId: null,
+        messages: state.messages.filter((m) => m.id !== id),
+      };
+    }
+    case "cleared": {
+      // In-memory conversation clear (persist flag is advisory for clients).
+      return {
+        ...state,
+        messages: [],
+        currentAssistantId: null,
+        streaming: false,
+        followUpQueued: false,
+        pendingUndo: false,
+        pendingApproval: null,
+        pendingAsk: null,
+        pendingSudo: null,
+        pendingIntercom: null,
+        pendingOauth: null,
+        workState: null,
+        goalMode: null,
+        goalPlan: null,
+        goalStepFinals: {},
+        goalIterations: [],
+        subagentRuns: {},
+        metrics: null,
+        retrying: false,
+      };
+    }
     case "sessions": {
       const sorted = [...ev.sessions].sort((a, b) => (b.mtime ?? 0) - (a.mtime ?? 0));
       return {

@@ -1,5 +1,6 @@
 ---
 name: delegate
+model: ck-grok-4.5
 description: Lightweight general delegate that inherits the parent model with no default reads
 systemPromptMode: append
 inheritProjectContext: true

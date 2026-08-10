@@ -1,5 +1,6 @@
 ---
 name: researcher
+model: ck-grok-4.5
 description: Web/docs research with sources and a concise research brief
 tools: read_file, grep, glob, list_dir, bash, write_file, memory, intercom, fetch, web_search
 thinking: low

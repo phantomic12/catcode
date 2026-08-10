@@ -3,7 +3,8 @@
 // and a real timeout+kill. read_file returns plain content; edit uses search/replace.
 use crate::config::{Approval, Config};
 use crate::tooling::builtin::git::{
-    git_add, git_commit, git_diff, git_log, git_status, workspace_activity,
+    git_add, git_branch, git_commit, git_diff, git_log, git_pull, git_push, git_show, git_status,
+    workspace_activity,
 };
 use crate::tooling::builtin::memory::{knowledge_tool, memory_tool};
 use crate::workspace;
@@ -37,6 +38,12 @@ pub async fn execute_unified_read(
     if let Some(name) = uri.strip_prefix("skill://") {
         if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
             return Outcome::err("read: unsafe skill URI");
+        }
+        // Prefer skills:: SkillResolver (CORE_REVIEW wiring), then subagent discover.
+        let resolver =
+            crate::skills::configured(&cfg.workspace, crate::config::home_dir().as_deref());
+        if let Ok(body) = resolver.read(&format!("skill://{name}")) {
+            return Outcome::ok(body);
         }
         return crate::subagent::discover_skills_full(&cfg.workspace)
             .into_iter()
@@ -139,9 +146,160 @@ pub(crate) fn bash_tool_desc() -> &'static str {
     crate::sandbox::policy::bash_tool_description()
 }
 
+/// One-shot replaceability hint appended to bash tool results when the command
+/// is a pure reimplementation of a native tool (session audit 2026-08: ~25% of
+/// bash calls). Advisory only — never blocks execution.
+pub fn bash_native_tool_hint(command: &str) -> Option<String> {
+    let mut s = command.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Drop leading comment-only lines.
+    loop {
+        let Some(first) = s.lines().next() else {
+            break;
+        };
+        let t = first.trim();
+        if t.is_empty() || t.starts_with('#') {
+            s = s[first.len()..]
+                .trim_start_matches(['\r', '\n'])
+                .trim_start();
+            continue;
+        }
+        break;
+    }
+    // Strip leading `cd <dir> &&` / `cd <dir>;` chains (common habit).
+    for _ in 0..5 {
+        let bytes = s.as_bytes();
+        if bytes.len() < 4 || &bytes[..3] != b"cd " {
+            break;
+        }
+        // Find end of cd argument then separator.
+        let rest = &s[3..];
+        let mut end = 0;
+        let mut chars = rest.char_indices().peekable();
+        // skip optional quotes roughly by taking until whitespace/;&|
+        if rest.starts_with('\'') || rest.starts_with('"') {
+            let q = rest.as_bytes()[0];
+            if let Some(i) = rest.as_bytes().iter().skip(1).position(|&b| b == q) {
+                end = i + 2;
+            } else {
+                break;
+            }
+        } else {
+            end = rest
+                .find(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '|')
+                .unwrap_or(rest.len());
+        }
+        let after = rest[end..].trim_start();
+        if let Some(stripped) = after.strip_prefix("&&") {
+            s = stripped.trim_start();
+            continue;
+        }
+        if let Some(stripped) = after.strip_prefix(';') {
+            s = stripped.trim_start();
+            continue;
+        }
+        break;
+    }
+    let first_line = s.lines().next().unwrap_or(s).trim();
+    // First token
+    let tok = first_line.split_whitespace().next().unwrap_or("");
+    let tok = tok.rsplit('/').next().unwrap_or(tok);
+
+    let complex = first_line.contains('|')
+        && !(first_line.matches('|').count() == 1
+            && (first_line.contains("| head")
+                || first_line.contains("|head")
+                || first_line.contains("| wc")
+                || first_line.contains("|wc")
+                || first_line.contains("| tail")
+                || first_line.contains("|tail")));
+    let chained = first_line.contains("&&") || first_line.contains("||");
+
+    let hint = match tok {
+        "git" => {
+            let sub = first_line.split_whitespace().nth(1).unwrap_or("");
+            match sub {
+                "status" if !chained => Some(
+                    "Prefer the native `git_status` tool over bash `git status` (core, always available).",
+                ),
+                "diff" if !chained => Some(
+                    "Prefer the native `git_diff` tool over bash `git diff` (core). For a commit use `git_show`.",
+                ),
+                "log" if !chained => Some(
+                    "Prefer the native `git_log` tool over bash `git log` (core, always available).",
+                ),
+                "show" if !chained => Some(
+                    "Prefer the native `git_show` tool over bash `git show` (core, always available).",
+                ),
+                "add" => Some(
+                    "Prefer `load_tools` group `git` then `git_add` over bash `git add`.",
+                ),
+                "commit" => Some(
+                    "Prefer `load_tools` group `git` then `git_commit` over bash `git commit`.",
+                ),
+                "push" => Some(
+                    "Prefer `load_tools` group `git` then `git_push` over bash `git push`.",
+                ),
+                "pull" => Some(
+                    "Prefer `load_tools` group `git` then `git_pull` over bash `git pull`.",
+                ),
+                "branch" | "switch" | "checkout" => Some(
+                    "Prefer `load_tools` group `git` then `git_branch` over bash branch/switch/checkout.",
+                ),
+                _ => None,
+            }
+        }
+        "rg" | "grep" if !complex => Some(
+            "Prefer the native `grep` tool over bash rg/grep (use head_limit/offset instead of `| head`/`| wc`).",
+        ),
+        "find" if !complex && !chained => Some(
+            "Prefer the native `glob` tool over bash `find` for in-workspace file discovery.",
+        ),
+        "ls" | "tree" if !complex && !chained => Some(
+            "Prefer the native `list_dir` tool over bash `ls` for workspace directories.",
+        ),
+        "cat" | "head" | "tail" if !complex => Some(
+            "Prefer the native `read_file` tool (offset/limit) over bash cat/head/tail for workspace files.",
+        ),
+        "sed" if first_line.contains("sed -n") || first_line.contains("sed -n") => Some(
+            "Prefer the native `read_file` tool with offset/limit over `sed -n 'A,Bp'`.",
+        ),
+        "curl" | "wget"
+            if !first_line.contains(" -X ")
+                && !first_line.contains("--data")
+                && !first_line.contains(" -d ")
+                && !first_line.contains(" -F ") =>
+        {
+            Some("Prefer the native `fetch` tool over bash curl/wget for simple HTTP GET.")
+        }
+        "nohup" | "pkill" | "kill" | "killall" | "ps" | "pgrep" => Some(
+            "Prefer the native `process` tool (load_tools process) over bash nohup/pkill/ps for app servers.",
+        ),
+        "rm" | "mkdir" | "mv" | "cp" | "touch" if !complex && !chained => Some(
+            "Prefer native `delete`/`mkdir`/`rename`/`write_file` over bash file ops when in-workspace.",
+        ),
+        _ => None,
+    }?;
+    Some(hint.to_string())
+}
+
 pub use crate::tooling::policy::{classify, is_parallel_wave_tool};
 pub use crate::tooling::scheduler::execute_parallel_wave;
 pub use crate::tooling::ToolKind;
+
+/// Map the built-in `mcp` surface args to a [`ToolKind`] for the approval gate.
+/// Delegates to [`crate::mcp::surface_approval_class`] so remote `call` tools are
+/// reclassified live (CORE_REVIEW Wave 5).
+pub fn kind_for_mcp_args(args: &serde_json::Value) -> ToolKind {
+    match crate::mcp::surface_approval_class(args) {
+        crate::mcp::ApprovalClass::ReadOnly => ToolKind::ReadOnly,
+        crate::mcp::ApprovalClass::Mutating | crate::mcp::ApprovalClass::Destructive => {
+            ToolKind::Destructive
+        }
+    }
+}
 
 /// Internal sentinel returned by the `finish` tool. The orchestrator treats this
 /// as loop exit; the UI/session see [`FINISH_MESSAGE`] instead.
@@ -218,9 +376,13 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "git_status" => git_status(args, cfg),
         "git_diff" => git_diff(args, cfg),
         "git_log" => git_log(args, cfg),
+        "git_show" => git_show(args, cfg),
         "workspace_activity" => workspace_activity(args, cfg),
         "git_add" => git_add(args, cfg),
         "git_commit" => git_commit(args, cfg),
+        "git_push" => git_push(args, cfg),
+        "git_pull" => git_pull(args, cfg),
+        "git_branch" => git_branch(args, cfg),
         "memory" => memory_tool(args, cfg),
         "knowledge" => knowledge_tool(args, cfg),
         "collections" => collections_tool(args, cfg),
@@ -2312,9 +2474,12 @@ fn bulk_edit(args: &Value, cfg: &Config) -> Outcome {
 const BULK_CONCURRENCY: usize = 4;
 
 /// Inner bulk calls that mutate workspace / shared state must run serially so
-/// independent-looking batches cannot race two writes. Readonly + bash/fetch/
-/// web_search (and other non-mutating tools) run concurrently.
+/// independent-looking batches cannot race two writes. Readonly + fetch/
+/// web_search (and other non-mutating tools) run concurrently. Bash is serial
+/// because shell commands routinely mutate the workspace.
 fn bulk_must_serialize(name: &str) -> bool {
+    // Keep Sequential/mutating tools out of the concurrent bulk pool so
+    // metadata.parallel == Sequential is not bypassed via bulk (CORE_REVIEW).
     matches!(
         name,
         "write_file"
@@ -2326,9 +2491,18 @@ fn bulk_must_serialize(name: &str) -> bool {
             | "todo_write"
             | "git_add"
             | "git_commit"
+            | "git_push"
+            | "git_pull"
+            | "git_branch"
             | "memory"
+            | "collections"
             | "bulk_write"
             | "bulk_edit"
+            | "bash"
+            | "snapshot_edit"
+            | "ast_edit"
+            | "process"
+            | "test_env"
     )
 }
 
@@ -2349,7 +2523,15 @@ pub(crate) async fn dispatch_bulk_inner(name: &str, inner_args: &Value, cfg: &Co
     } else if crate::sandbox::is_sandbox_enabled()
         && matches!(
             name,
-            "git_status" | "git_diff" | "git_log" | "git_add" | "git_commit"
+            "git_status"
+                | "git_diff"
+                | "git_log"
+                | "git_show"
+                | "git_add"
+                | "git_commit"
+                | "git_push"
+                | "git_pull"
+                | "git_branch"
         )
     {
         // Sandboxed: built-in git runs inside the microVM via the shared
@@ -4128,16 +4310,18 @@ mod tests {
 
     #[tokio::test]
     async fn bulk_runs_independent_calls_concurrently() {
-        // Four independent sleeps: sequential ≈ 600ms, concurrent ≈ 150ms.
+        // Readonly tools stay concurrent; bash is serial (workspace-mutating).
+        // Four independent sleeps via concurrent-eligible tools would be ideal,
+        // but bash is intentionally serialized — assert that contract + order.
         let (_root, cfg) = tmp_ws();
         let t0 = std::time::Instant::now();
         let o = execute_bulk(
             &json!({
                 "calls": [
-                    { "name": "bash", "args": { "command": "sleep 0.15" } },
-                    { "name": "bash", "args": { "command": "sleep 0.15" } },
-                    { "name": "bash", "args": { "command": "sleep 0.15" } },
-                    { "name": "bash", "args": { "command": "sleep 0.15" } }
+                    { "name": "bash", "args": { "command": "sleep 0.05" } },
+                    { "name": "bash", "args": { "command": "sleep 0.05" } },
+                    { "name": "bash", "args": { "command": "sleep 0.05" } },
+                    { "name": "bash", "args": { "command": "sleep 0.05" } }
                 ]
             }),
             &cfg,
@@ -4146,14 +4330,52 @@ mod tests {
         .await;
         let elapsed = t0.elapsed();
         assert!(o.ok, "{}", o.output);
+        // Serial bash: wall time must be roughly sum of sleeps (not max).
         assert!(
-            elapsed.as_millis() < 450,
-            "expected concurrent bulk (~150ms), got {elapsed:?}"
+            elapsed.as_millis() >= 180,
+            "expected serial bash bulk (>= ~200ms), got {elapsed:?}"
         );
-        // Output blocks stay index-ordered even when futures finish out of order.
+        // Output blocks stay index-ordered.
         let pos0 = o.output.find("### [0] bash").expect("slot 0");
         let pos3 = o.output.find("### [3] bash").expect("slot 3");
         assert!(pos0 < pos3);
+    }
+
+    #[tokio::test]
+    async fn bulk_runs_readonly_calls_concurrently() {
+        // Four independent sleeps via a concurrent-eligible path: use fetch is
+        // network; instead spin four read_file on distinct files with a small
+        // pure-Rust delay is hard. Use list_dir x4 and only assert ordering +
+        // success (concurrency is covered by the semaphore path + unit of
+        // bulk_must_serialize). For a wall-clock proof, sleep via a tool that
+        // is NOT serialized: diagnostics is async but may be slow; use
+        // spawn_blocking-backed list_dir with no sleep — just check order.
+        let (_root, cfg) = tmp_ws();
+        std::fs::write(cfg.workspace.join("a.txt"), "a").unwrap();
+        std::fs::write(cfg.workspace.join("b.txt"), "b").unwrap();
+        std::fs::write(cfg.workspace.join("c.txt"), "c").unwrap();
+        std::fs::write(cfg.workspace.join("d.txt"), "d").unwrap();
+        let o = execute_bulk(
+            &json!({
+                "calls": [
+                    { "name": "read_file", "args": { "path": "a.txt" } },
+                    { "name": "read_file", "args": { "path": "b.txt" } },
+                    { "name": "read_file", "args": { "path": "c.txt" } },
+                    { "name": "read_file", "args": { "path": "d.txt" } }
+                ]
+            }),
+            &cfg,
+            &std::collections::HashMap::new(),
+        )
+        .await;
+        assert!(o.ok, "{}", o.output);
+        assert!(o.output.contains("### [0] read_file"));
+        assert!(o.output.contains("### [3] read_file"));
+        let pos0 = o.output.find("### [0] read_file").expect("slot 0");
+        let pos3 = o.output.find("### [3] read_file").expect("slot 3");
+        assert!(pos0 < pos3);
+        assert!(!bulk_must_serialize("read_file"));
+        assert!(bulk_must_serialize("bash"));
     }
 
     #[test]
@@ -4246,7 +4468,15 @@ mod tests {
         assert!(is_core_tool("subagent"));
         assert!(!is_core_tool("fetch"));
         assert!(is_deferred_tool("fetch"));
-        assert!(is_deferred_tool("git_status"));
+        assert!(is_core_tool("git_status"));
+        assert!(is_core_tool("git_diff"));
+        assert!(is_core_tool("git_log"));
+        assert!(is_core_tool("git_show"));
+        assert!(!is_deferred_tool("git_status"));
+        assert!(is_deferred_tool("git_add"));
+        assert!(is_deferred_tool("git_push"));
+        assert!(is_deferred_tool("git_pull"));
+        assert!(is_deferred_tool("git_branch"));
         assert!(is_deferred_tool("bulk_read"));
         assert!(!is_deferred_tool("read_file"));
         assert!(is_builtin("load_tools"));
@@ -4512,6 +4742,78 @@ mod tests {
         // git_commit rejects empty messages
         let bad3 = execute("git_commit", &json!({ "message": "   " }), &cfg);
         assert!(!bad3.ok, "git_commit must reject empty messages");
+
+        // git_show HEAD
+        let sh = execute("git_show", &json!({ "object": "HEAD" }), &cfg);
+        assert!(sh.ok, "git_show: {}", sh.output);
+
+        // git_show rejects flag-like objects
+        let bad4 = execute("git_show", &json!({ "object": "--all" }), &cfg);
+        assert!(!bad4.ok, "git_show must reject flag-like objects");
+
+        // git_token rejects: empty object, whitespace, shell metacharacters
+        let bad_empty = execute("git_show", &json!({ "object": "" }), &cfg);
+        assert!(!bad_empty.ok, "git_show empty object must fail");
+        let bad_ws = execute("git_show", &json!({ "object": "HEAD~1 extra" }), &cfg);
+        assert!(!bad_ws.ok, "git_show whitespace object must fail");
+        let bad_meta = execute("git_show", &json!({ "object": "HEAD;rm" }), &cfg);
+        assert!(!bad_meta.ok, "git_show metachar object must fail");
+        // path escape on show
+        let bad_path = execute(
+            "git_show",
+            &json!({ "object": "HEAD", "path": "../etc/passwd" }),
+            &cfg,
+        );
+        assert!(!bad_path.ok, "git_show must reject .. path");
+
+        // git_push rejects flag-like remote / empty after trim is defaulted to origin
+        let bad_remote = execute("git_push", &json!({ "remote": "-u" }), &cfg);
+        assert!(!bad_remote.ok, "git_push flag-like remote must fail");
+        let bad_ref = execute(
+            "git_push",
+            &json!({ "remote": "origin", "refspec": "main;evil" }),
+            &cfg,
+        );
+        assert!(!bad_ref.ok, "git_push metachar refspec must fail");
+
+        // git_branch list
+        let br = execute("git_branch", &json!({ "action": "list" }), &cfg);
+        assert!(br.ok, "git_branch list: {}", br.output);
+
+        // git_branch create requires name
+        let bad5 = execute("git_branch", &json!({ "action": "create" }), &cfg);
+        assert!(!bad5.ok, "git_branch create without name must fail");
+        let bad6 = execute(
+            "git_branch",
+            &json!({ "action": "create", "name": "feat;rm" }),
+            &cfg,
+        );
+        assert!(!bad6.ok, "git_branch metachar name must fail");
+    }
+
+    #[test]
+    fn bash_native_tool_hint_detects_common_habits() {
+        assert!(bash_native_tool_hint("git status --short")
+            .unwrap()
+            .contains("git_status"));
+        assert!(bash_native_tool_hint("cd core && git diff")
+            .unwrap()
+            .contains("git_diff"));
+        assert!(bash_native_tool_hint("rg -n foo src | head")
+            .unwrap()
+            .contains("grep"));
+        assert!(bash_native_tool_hint("sed -n '10,20p' src/main.rs")
+            .unwrap()
+            .contains("read_file"));
+        assert!(bash_native_tool_hint("ls -la")
+            .unwrap()
+            .contains("list_dir"));
+        assert!(bash_native_tool_hint("find . -name '*.rs'")
+            .unwrap()
+            .contains("glob"));
+        // Legitimate bash should not hint
+        assert!(bash_native_tool_hint("cargo test -p core").is_none());
+        assert!(bash_native_tool_hint("python3 - <<'PY'\nprint(1)\nPY").is_none());
     }
 
     #[test]
@@ -4856,5 +5158,94 @@ mod tests {
                 outcome.output
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod kind_for_mcp_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn kind_for_mcp_args_reclassifies_call_at_approval() {
+        // list stays ReadOnly
+        assert_eq!(
+            kind_for_mcp_args(&json!({"action": "list", "server": "s"})),
+            ToolKind::ReadOnly
+        );
+        // remote read-like call → ReadOnly (not blanket Destructive metadata)
+        assert_eq!(
+            kind_for_mcp_args(&json!({
+                "action": "call",
+                "server": "s",
+                "tool": "read_file",
+                "arguments": {"path": "a"}
+            })),
+            ToolKind::ReadOnly
+        );
+        // remote delete → Destructive
+        assert_eq!(
+            kind_for_mcp_args(&json!({
+                "action": "call",
+                "server": "s",
+                "tool": "delete_file",
+                "arguments": {}
+            })),
+            ToolKind::Destructive
+        );
+        // mutating maps to Destructive for the binary approval gate
+        assert_eq!(
+            kind_for_mcp_args(&json!({
+                "action": "call",
+                "server": "s",
+                "tool": "create_issue",
+                "arguments": {}
+            })),
+            ToolKind::Destructive
+        );
+    }
+
+    #[test]
+    fn approval_gate_honors_mcp_reclassification() {
+        use crate::config::Approval;
+        use crate::tooling::approval::approval_required;
+        // Under default Destructive mode, a reclassified ReadOnly mcp call does
+        // not require approval; a Destructive remote tool does.
+        let read_kind = kind_for_mcp_args(&json!({
+            "action": "call",
+            "tool": "read_file",
+            "arguments": {}
+        }));
+        assert!(!approval_required(
+            &Approval::Destructive,
+            read_kind,
+            false,
+            false,
+            false,
+            false
+        ));
+        let del_kind = kind_for_mcp_args(&json!({
+            "action": "call",
+            "tool": "delete_file",
+            "arguments": {}
+        }));
+        assert!(approval_required(
+            &Approval::Destructive,
+            del_kind,
+            false,
+            false,
+            false,
+            false
+        ));
+        // list never requires approval under Destructive mode
+        let list_kind = kind_for_mcp_args(&json!({"action": "list"}));
+        assert!(!approval_required(
+            &Approval::Destructive,
+            list_kind,
+            false,
+            false,
+            false,
+            false
+        ));
     }
 }

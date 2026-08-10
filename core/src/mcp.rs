@@ -129,25 +129,39 @@ pub async fn execute(
     let mut configured = configured;
     configured.max_bytes = configured.max_bytes.min(MAX_SURFACE_RESULT_BYTES);
     let mut client = McpClient::connect(configured).await?;
-    match action {
+    // Always tear down the stdio child — success used to leak processes
+    // (CORE_REVIEW MCP process leak).
+    let result = match action {
         "list" => {
             if obj.contains_key("tool") || obj.contains_key("arguments") {
-                return Err(McpSurfaceError::InvalidArguments(
+                Err(McpSurfaceError::InvalidArguments(
                     "list accepts only action and server".into(),
-                ));
+                ))
+            } else {
+                client
+                    .list_tools(Some(cancel))
+                    .await
+                    .map(|tools| json!({ "tools": tools }))
+                    .map_err(Into::into)
             }
-            Ok(json!({ "tools": client.list_tools(Some(cancel)).await? }))
         }
         "call" => {
-            let tool = obj
+            let tool = match obj
                 .get("tool")
                 .and_then(Value::as_str)
                 .filter(|name| !name.trim().is_empty())
-                .ok_or_else(|| {
-                    McpSurfaceError::InvalidArguments("call requires non-empty 'tool'".into())
-                })?;
+            {
+                Some(t) => t,
+                None => {
+                    let _ = client.shutdown().await;
+                    return Err(McpSurfaceError::InvalidArguments(
+                        "call requires non-empty 'tool'".into(),
+                    ));
+                }
+            };
             let arguments = obj.get("arguments").cloned().unwrap_or_else(|| json!({}));
             if !arguments.is_object() {
+                let _ = client.shutdown().await;
                 return Err(McpSurfaceError::InvalidArguments(
                     "'arguments' must be an object".into(),
                 ));
@@ -156,6 +170,7 @@ pub async fn execute(
                 .map_err(|e| McpSurfaceError::InvalidArguments(e.to_string()))?
                 .len();
             if argument_bytes > MAX_TOOL_ARGUMENT_BYTES {
+                let _ = client.shutdown().await;
                 return Err(McpSurfaceError::InvalidArguments(format!(
                     "arguments exceed {MAX_TOOL_ARGUMENT_BYTES} bytes"
                 )));
@@ -166,7 +181,9 @@ pub async fn execute(
                 .map_err(Into::into)
         }
         _ => unreachable!(),
-    }
+    };
+    let _ = client.shutdown().await;
+    result
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -213,6 +230,26 @@ pub fn classify_tool(name: &str, description: Option<&str>, args: &Value) -> App
         ApprovalClass::Mutating
     } else {
         ApprovalClass::ReadOnly
+    }
+}
+
+/// Approval class for the built-in `mcp` surface tool at **approval time**.
+///
+/// - `action=list` → always ReadOnly (discovery only)
+/// - `action=call` → reclassify via [`classify_tool`] on the remote tool name /
+///   description / arguments (CORE_REVIEW Wave 5 — no more blanket Destructive
+///   for every call, and no silent ReadOnly for mutators)
+/// - anything else → Destructive (fail closed)
+pub fn surface_approval_class(args: &Value) -> ApprovalClass {
+    match args.get("action").and_then(Value::as_str).unwrap_or("") {
+        "list" => ApprovalClass::ReadOnly,
+        "call" => {
+            let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
+            let description = args.get("description").and_then(Value::as_str);
+            let call_args = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            classify_tool(tool, description, &call_args)
+        }
+        _ => ApprovalClass::Destructive,
     }
 }
 
@@ -490,6 +527,68 @@ mod tests {
         );
         assert_eq!(
             classify_tool("delete_file", None, &json!({})),
+            ApprovalClass::Destructive
+        );
+        assert_eq!(
+            classify_tool("create_issue", None, &json!({})),
+            ApprovalClass::Mutating
+        );
+    }
+
+    #[test]
+    fn surface_approval_list_stays_readonly() {
+        assert_eq!(
+            surface_approval_class(&json!({"action": "list", "server": "fs"})),
+            ApprovalClass::ReadOnly
+        );
+    }
+
+    #[test]
+    fn surface_approval_call_reclassifies_remote_tool() {
+        // Read-like remote tool → ReadOnly at approval (not blanket Destructive).
+        assert_eq!(
+            surface_approval_class(&json!({
+                "action": "call",
+                "server": "fs",
+                "tool": "read_file",
+                "arguments": {"path": "README.md"}
+            })),
+            ApprovalClass::ReadOnly
+        );
+        // Mutating remote tool → Mutating.
+        assert_eq!(
+            surface_approval_class(&json!({
+                "action": "call",
+                "server": "fs",
+                "tool": "create_file",
+                "arguments": {"path": "x"}
+            })),
+            ApprovalClass::Mutating
+        );
+        // Destructive remote tool → Destructive.
+        assert_eq!(
+            surface_approval_class(&json!({
+                "action": "call",
+                "server": "fs",
+                "tool": "delete_file",
+                "arguments": {"path": "x"}
+            })),
+            ApprovalClass::Destructive
+        );
+        // Description can tip classification when the name is neutral.
+        assert_eq!(
+            surface_approval_class(&json!({
+                "action": "call",
+                "server": "fs",
+                "tool": "run",
+                "description": "execute shell command",
+                "arguments": {}
+            })),
+            ApprovalClass::Destructive
+        );
+        // Unknown action fails closed.
+        assert_eq!(
+            surface_approval_class(&json!({"action": "weird"})),
             ApprovalClass::Destructive
         );
     }

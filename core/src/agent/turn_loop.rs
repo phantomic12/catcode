@@ -380,9 +380,9 @@ pub(crate) async fn run_turn(
     let mut model = model;
     // The provider the user explicitly picked for `model` (from `/models`). It
     // pins routing so an explicit pick wins over the active-provider tie-break.
-    // NOTE: if a vision/plugin remap ever swaps `model`, this pick must be
-    // cleared too — the remapped model may belong to a different provider.
-    let provider = provider;
+    // Cleared whenever vision/plugin remaps `model` so we don't keep a stale
+    // provider pick for a model on another backend (CORE_REVIEW).
+    let mut provider = provider;
 
     // Auto-reflect turn-local state (SELF_LEARNING §11 deterministic seam). The
     // shape (tool names + file categories) is accumulated as tools run; at the
@@ -400,6 +400,7 @@ pub(crate) async fn run_turn(
     let mut turn_tool_calls: u32 = 0;
     let mut shape_tools: Vec<String> = Vec::new();
     let mut shape_files: Vec<String> = Vec::new();
+    let mut shape_paths: Vec<String> = Vec::new();
     // Self-correcting stuck detector (NOT a max-turn cap): tracks a sliding
     // window of recent tool-call signatures and injects a steering nudge when
     // the agent repeats the same read-only call without making filesystem
@@ -557,7 +558,9 @@ pub(crate) async fn run_turn(
                     )),
                 ));
             }
-        } else if has_images {
+        } else {
+            // Always dispatch pre_turn (CORE_REVIEW: was image-gated so non-vision
+            // plugins never ran). Model remap below still only applies on image turns.
             for (plugin_name, config) in &st.plugin_manager.get_hook_configs("pre_turn") {
                 let turn_args = json!({
                     "model": model.clone(),
@@ -579,50 +582,53 @@ pub(crate) async fn run_turn(
                 );
                 let result =
                     execute_plugin_hook_logged(st, "pre_turn", plugin_name, config, &ctx).await;
-                if let Some(new_model) = result
-                    .modify
-                    .as_ref()
-                    .and_then(|m| m.get("model"))
-                    .and_then(|v| v.as_str())
-                {
-                    if new_model != model.as_str() {
-                        let valid = models_snapshot.iter().any(|m| m.id.as_str() == new_model);
-                        if valid {
-                            let why = if result.reason.is_empty() {
-                                "vision handoff".to_string()
-                            } else {
-                                result.reason.clone()
-                            };
-                            emit(&Event::new("info").with(
-                                "message",
-                                json!(format!(
-                                    "vision handoff: {} → {} ({})",
-                                    model, new_model, why
-                                )),
-                            ));
-                            st.logger.log(
+                if has_images {
+                    if let Some(new_model) = result
+                        .modify
+                        .as_ref()
+                        .and_then(|m| m.get("model"))
+                        .and_then(|v| v.as_str())
+                    {
+                        if new_model != model.as_str() {
+                            let valid = models_snapshot.iter().any(|m| m.id.as_str() == new_model);
+                            if valid {
+                                let why = if result.reason.is_empty() {
+                                    "vision handoff".to_string()
+                                } else {
+                                    result.reason.clone()
+                                };
+                                emit(&Event::new("info").with(
+                                    "message",
+                                    json!(format!(
+                                        "vision handoff: {} → {} ({})",
+                                        model, new_model, why
+                                    )),
+                                ));
+                                st.logger.log(
                                 "vision_handoff",
                                 json!({
                                     "from": model, "to": new_model, "plugin": plugin_name.clone(), "reason": why
                                 }),
                             );
-                            model = new_model.to_string();
-                        } else {
-                            emit(&Event::new("info").with(
-                                "message",
-                                json!(format!(
-                                    "vision handoff ignored: '{}' is not a discovered model",
-                                    new_model
-                                )),
-                            ));
+                                model = new_model.to_string();
+                                provider = None; // remap may cross providers
+                            } else {
+                                emit(&Event::new("info").with(
+                                    "message",
+                                    json!(format!(
+                                        "vision handoff ignored: '{}' is not a discovered model",
+                                        new_model
+                                    )),
+                                ));
+                            }
                         }
                     }
-                }
+                } // has_images model-remap gate
             }
             // No vision plugin handed off an image-bearing turn on a non-vision
             // model. Prefer the Rust-ranked recommendation (works even if the
             // plugin is missing / python3 absent), else warn.
-            if model == original_model {
+            if has_images && model == original_model {
                 let current_has_vision = models_snapshot
                     .iter()
                     .find(|m| m.id == model.as_str())
@@ -649,6 +655,7 @@ pub(crate) async fn run_turn(
                                 }),
                             );
                             model = rec.clone();
+                            provider = None;
                         }
                     } else {
                         emit(&Event::new("info").with("message", json!(format!(
@@ -1175,18 +1182,9 @@ pub(crate) async fn run_turn(
                 }
             }
             if let Some(h) = subagent::relevant_skill_hint(&ws, &last_user) {
-                // Utility signal: skill was retrieved (not yet proven followed).
-                if let Some(start) = h.find(char::from_u32(39).unwrap()) {
-                    if let Some(end) = h[start + 1..].find(char::from_u32(39).unwrap()) {
-                        let name = &h[start + 1..start + 1 + end];
-                        if !name.is_empty() {
-                            let _ = skill_metrics::record_outcome(
-                                name,
-                                skill_metrics::OutcomeKind::Success,
-                            );
-                        }
-                    }
-                }
+                // Do NOT record OutcomeKind::Success on mere hint injection —
+                // that auto-promoted skills to Trusted without apply
+                // (CORE_REVIEW). Success is reserved for real follow-through.
                 if tail.is_empty() {
                     tail = h;
                 } else {
@@ -1418,11 +1416,18 @@ pub(crate) async fn run_turn(
                             &mut turn_tool_calls,
                             &mut shape_tools,
                             &mut shape_files,
+                            &mut shape_paths,
                         )
                         .await
                         {
                             ParallelWaveResult::Aborted => return,
-                            ParallelWaveResult::Done => call_offset = wave_end,
+                            ParallelWaveResult::Done => {
+                                call_offset = wave_end;
+                                // Wave early paths only write `conversation`.
+                                // Resync working buffer so finish clone_from
+                                // cannot drop wave tool_results (CORE_REVIEW C2).
+                                messages.clone_from(&*st.conversation.lock().await);
+                            }
                         }
                         // Record the wave calls' signatures for stuck detection
                         // (the sequential loop only handles calls[call_offset..]).
@@ -1432,15 +1437,43 @@ pub(crate) async fn run_turn(
                     }
                 }
                 for tc in &calls[call_offset..] {
-                    // Honor an abort mid-batch: without this, the synchronous
-                    // fall-through tools (write_file/edit/patch/read_file/…)
-                    // run to completion after the user hit /abort — only
-                    // bash/fetch/web_search/diagnostics were cancel-wrapped.
-                    // Check before each call so a batch's remaining
-                    // destructive writes don't execute once the turn is
-                    // cancelled. (Any orphaned tool_calls this leaves are
-                    // repaired by the always-run sanitizer next turn.)
+                    // Honor an abort mid-batch. Pair this and later tool_calls with
+                    // synthetic aborted results so the transcript stays API-valid
+                    // (CORE_REVIEW: abort left orphans until next-turn sanitizer).
                     if cancel.is_cancelled() {
+                        let mut seen = false;
+                        for rem in &calls[call_offset..] {
+                            if !seen {
+                                if std::ptr::eq(rem as *const _, tc as *const _) || rem.id == tc.id
+                                {
+                                    seen = true;
+                                } else {
+                                    continue;
+                                }
+                            }
+                            let rid = rem.id.clone();
+                            let msg = format!(
+                                "tool call '{}' aborted — turn cancelled before execution completed",
+                                rem.function.name
+                            );
+                            emit(
+                                &Event::new("tool_result")
+                                    .with("id", json!(rid))
+                                    .with("ok", json!(false))
+                                    .with("output", json!(msg)),
+                            );
+                            let tool_result = Message::tool(rid, msg);
+                            let est = estimate_message_tokens(&tool_result);
+                            messages.push(tool_result.clone());
+                            {
+                                let mut conv = st.conversation.lock().await;
+                                conv.push(tool_result);
+                                if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                                    let _ = session::append(p, conv.last().unwrap());
+                                }
+                            }
+                            *st.estimated_tokens.lock().await += est;
+                        }
                         sync_session_file(st).await;
                         emit_aborted_done();
                         return;
@@ -1459,8 +1492,9 @@ pub(crate) async fn run_turn(
                     if name != "finish" {
                         turn_tool_calls = turn_tool_calls.saturating_add(1);
                         shape_tools.push(name.clone());
-                        for cat in extract_file_categories(&name, &args_str) {
-                            shape_files.push(cat);
+                        for path in extract_file_paths(&name, &args_str) {
+                            shape_paths.push(path.clone());
+                            shape_files.push(pattern_log::file_category(&path));
                         }
                     }
                     // Self-correcting stuck detection: record this call's
@@ -1481,6 +1515,9 @@ pub(crate) async fn run_turn(
                             );
                             let tool_result = Message::tool(id.clone(), msg);
                             let est = estimate_message_tokens(&tool_result);
+                            // Dual-write working buffer + conversation so finish clone_from
+                            // cannot drop early deny/malformed/hook results (CORE_REVIEW C1).
+                            messages.push(tool_result.clone());
                             let mut conv = st.conversation.lock().await;
                             conv.push(tool_result);
                             if let Some(p) = st.cfg.read().await.session_file.as_ref() {
@@ -1522,6 +1559,9 @@ pub(crate) async fn run_turn(
                         );
                         let tool_result = Message::tool(id.clone(), msg);
                         let est = estimate_message_tokens(&tool_result);
+                        // Dual-write working buffer + conversation so finish clone_from
+                        // cannot drop early deny/malformed/hook results (CORE_REVIEW C1).
+                        messages.push(tool_result.clone());
                         let mut conv = st.conversation.lock().await;
                         conv.push(tool_result);
                         if let Some(p) = st.cfg.read().await.session_file.as_ref() {
@@ -1549,6 +1589,24 @@ pub(crate) async fn run_turn(
                         tool_context.register_resource(ResourceKind::Task, format!("tool:{name}"))
                     else {
                         tool_context.note_stale_result();
+                        let msg =
+                            format!("tool call '{name}' aborted — could not register run resource");
+                        emit(
+                            &Event::new("tool_result")
+                                .with("id", json!(id))
+                                .with("ok", json!(false))
+                                .with("output", json!(msg.clone())),
+                        );
+                        let tool_result = Message::tool(id.clone(), msg);
+                        messages.push(tool_result.clone());
+                        {
+                            let mut conv = st.conversation.lock().await;
+                            conv.push(tool_result);
+                            if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                                session::append(p, conv.last().unwrap());
+                            }
+                        }
+                        emit_aborted_done();
                         return;
                     };
                     let kind = if name == "process"
@@ -1557,6 +1615,10 @@ pub(crate) async fn run_turn(
                             Some("status" | "logs")
                         ) {
                         tools::ToolKind::ReadOnly
+                    } else if name == "mcp" {
+                        // Live reclassification of remote MCP tools at approval
+                        // time (CORE_REVIEW Wave 5) — see tools::kind_for_mcp_args.
+                        tools::kind_for_mcp_args(&args)
                     } else {
                         match st.plugin_manager.tool_config(&name) {
                             Some(tc) if tc.override_builtin || !tools::is_builtin(&name) => tc.kind,
@@ -1608,6 +1670,9 @@ pub(crate) async fn run_turn(
                         );
                         let tool_result = Message::tool(id.clone(), msg);
                         let est = estimate_message_tokens(&tool_result);
+                        // Dual-write working buffer + conversation so finish clone_from
+                        // cannot drop early deny/malformed/hook results (CORE_REVIEW C1).
+                        messages.push(tool_result.clone());
                         let mut conv = st.conversation.lock().await;
                         conv.push(tool_result);
                         if let Some(p) = st.cfg.read().await.session_file.as_ref() {
@@ -1651,6 +1716,9 @@ pub(crate) async fn run_turn(
                                 );
                                 let tool_result = Message::tool(id.clone(), msg);
                                 let est = estimate_message_tokens(&tool_result);
+                                // Dual-write working buffer + conversation so finish clone_from
+                                // cannot drop early deny/malformed/hook results (CORE_REVIEW C1).
+                                messages.push(tool_result.clone());
                                 let mut conv = st.conversation.lock().await;
                                 conv.push(tool_result);
                                 if let Some(p) = st.cfg.read().await.session_file.as_ref() {
@@ -1731,6 +1799,9 @@ pub(crate) async fn run_turn(
                         );
                         let tool_result = Message::tool(id.clone(), msg);
                         let est = estimate_message_tokens(&tool_result);
+                        // Dual-write working buffer + conversation so finish clone_from
+                        // cannot drop early deny/malformed/hook results (CORE_REVIEW C1).
+                        messages.push(tool_result.clone());
                         let mut conv = st.conversation.lock().await;
                         conv.push(tool_result);
                         if let Some(p) = st.cfg.read().await.session_file.as_ref() {
@@ -1796,6 +1867,20 @@ pub(crate) async fn run_turn(
                                             dmsg = Some("denied by permission rule".into());
                                             break;
                                         }
+                                    }
+                                }
+                                // Dangerous-path check per inner call (comment claimed
+                                // this; was missing) (CORE_REVIEW).
+                                if dmsg.is_none()
+                                    && !force_allow
+                                    && !matches!(cfg.approval, Approval::Never)
+                                {
+                                    if let Some(rp) =
+                                        restricted_path_for_tool(&iname, &iargs, &cfg.workspace)
+                                    {
+                                        dmsg = Some(format!(
+                                            "inner call touches restricted path '{rp}' — re-issue outside bulk or get approval for that path"
+                                        ));
                                     }
                                 }
                                 // plugin pre-hooks (the security-relevant ones)
@@ -1976,7 +2061,17 @@ pub(crate) async fn run_turn(
                     } else if name == "lsp" {
                         tokio::select! { o = crate::tooling::ide::execute_lsp(&exec_args, &cfg) => o, _ = cancel.cancelled() => tools::Outcome::err("lsp aborted") }
                     } else if name == "snapshot_edit" {
-                        tools::execute("snapshot_edit", &exec_args, &cfg)
+                        let a = exec_args.clone();
+                        let c = cfg.clone();
+                        tokio::select! {
+                            res = tokio::task::spawn_blocking(move || tools::execute("snapshot_edit", &a, &c)) => {
+                                match res {
+                                    Ok(o) => o,
+                                    Err(e) => tools::Outcome::err(format!("snapshot_edit task failed: {e}")),
+                                }
+                            }
+                            _ = cancel.cancelled() => tools::Outcome::err("snapshot_edit aborted"),
+                        }
                     } else if name == "ast_edit" {
                         tokio::select! { o = crate::tooling::ide::execute_ast_edit(&exec_args, &cfg) => o, _ = cancel.cancelled() => tools::Outcome::err("ast_edit aborted") }
                     } else if name == "eval" {
@@ -2007,11 +2102,16 @@ pub(crate) async fn run_turn(
                     } else if name == "process" {
                         let a = exec_args.clone();
                         let c = cfg.clone();
-                        match tokio::task::spawn_blocking(move || execute_process(&a, &c)).await {
-                            Ok(outcome) => outcome,
-                            Err(error) => {
-                                tools::Outcome::err(format!("process task failed: {error}"))
+                        tokio::select! {
+                            res = tokio::task::spawn_blocking(move || execute_process(&a, &c)) => {
+                                match res {
+                                    Ok(outcome) => outcome,
+                                    Err(error) => {
+                                        tools::Outcome::err(format!("process task failed: {error}"))
+                                    }
+                                }
                             }
+                            _ = cancel.cancelled() => tools::Outcome::err("process aborted"),
                         }
                     } else if name == "spawn" || name == "subagent" {
                         // When goal mode is active, cap concurrency on parallel
@@ -2108,6 +2208,24 @@ pub(crate) async fn run_turn(
                                 Err(_) => tools::Outcome::err("tool task panicked"),
                             }
                         }
+                    } else if crate::sandbox::is_sandbox_enabled()
+                        && matches!(
+                            name.as_str(),
+                            "git_status"
+                                | "git_diff"
+                                | "git_log"
+                                | "git_show"
+                                | "git_add"
+                                | "git_commit"
+                                | "git_push"
+                                | "git_pull"
+                                | "git_branch"
+                        )
+                    {
+                        tokio::select! {
+                            o = crate::tooling::builtin::git::git_dispatch(&name, &exec_args, &cfg) => o,
+                            _ = cancel.cancelled() => tools::Outcome::err(format!("{name} aborted")),
+                        }
                     } else {
                         let n = name.clone();
                         let a = exec_args.clone();
@@ -2142,6 +2260,23 @@ pub(crate) async fn run_turn(
                     if name == "goal_write_plan" && outcome.ok {
                         if st.goal.lock().await.phase == goal::GoalPhase::PlanReady {
                             goal_plan_just_written = true;
+                        }
+                    }
+
+                    // Session-audit nudge: when bash reimplements a native tool,
+                    // append a one-shot hint so the model prefers the native path next.
+                    if name == "bash" {
+                        if let Some(cmd) = exec_args.get("command").and_then(|v| v.as_str()) {
+                            if let Some(hint) = tools::bash_native_tool_hint(cmd) {
+                                if !outcome.output.contains("Prefer the native") {
+                                    outcome.output.push_str(
+                                        "
+
+",
+                                    );
+                                    outcome.output.push_str(&hint);
+                                }
+                            }
                         }
                     }
 
@@ -2252,6 +2387,7 @@ pub(crate) async fn run_turn(
                                 turn_tool_calls,
                                 &shape_tools,
                                 &shape_files,
+                                &shape_paths,
                                 cancel.is_cancelled(),
                             )
                             .await
@@ -2368,7 +2504,11 @@ pub(crate) async fn run_turn(
                     if let Some(note) =
                         maybe_concurrency_note(st, &name, &exec_args, outcome.ok).await
                     {
-                        outcome.output.push_str("\n\n");
+                        outcome.output.push_str(
+                            "
+
+",
+                        );
                         outcome.output.push_str(&note);
                     }
                     // Cache + ingress: store full output for restorable tools so
@@ -2529,6 +2669,9 @@ pub(crate) async fn run_turn(
                                 messages.push(note.clone());
                                 let mut conv = st.conversation.lock().await;
                                 conv.push(note);
+                                if let Some(path) = st.cfg.read().await.session_file.as_ref() {
+                                    session::append(path, conv.last().unwrap());
+                                }
                                 *st.estimated_tokens.lock().await += est;
                             }
                         }
@@ -2569,15 +2712,14 @@ pub(crate) async fn run_turn(
                 if let Some(nudge) = stuck.check_and_nudge() {
                     emit(&Event::new("stuck_nudge").with("message", json!(&nudge)));
                     st.logger.log("stuck_nudge", json!({}));
+                    // Transient only — do not session::append so future turns
+                    // are not permanently polluted with stuck warnings (CORE_REVIEW).
                     let nudge_msg = Message::system(&nudge);
                     let est = estimate_message_tokens(&nudge_msg);
                     messages.push(nudge_msg.clone());
                     {
                         let mut conv = st.conversation.lock().await;
                         conv.push(nudge_msg);
-                        if let Some(p) = st.cfg.read().await.session_file.as_ref() {
-                            session::append(p, conv.last().unwrap());
-                        }
                     }
                     *st.estimated_tokens.lock().await += est;
                 }
@@ -2658,6 +2800,7 @@ pub(crate) async fn run_turn(
                         turn_tool_calls,
                         &shape_tools,
                         &shape_files,
+                        &shape_paths,
                         cancel.is_cancelled(),
                     )
                     .await

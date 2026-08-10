@@ -1,5 +1,6 @@
 ---
 name: session-memory-reviewer
+model: ck-grok-4.5
 description: Review session.rs + memory.rs + staging.rs — session persistence, memory, staging
 build-test-release: true
 allow:

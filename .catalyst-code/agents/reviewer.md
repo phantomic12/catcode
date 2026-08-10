@@ -1,6 +1,6 @@
 ---
 name: reviewer
-model: default
+model: ck-grok-4.5
 systemPromptMode: replace
 ---
 

@@ -117,7 +117,7 @@ fn hostname_is_private(host: &str) -> bool {
 /// Is `host` a private address? IP literals and known local names are checked
 /// synchronously; request execution additionally resolves and pins DNS before
 /// every redirect hop.
-fn host_is_private(host: &str) -> bool {
+pub(crate) fn host_is_private(host: &str) -> bool {
     let normalized = host.trim_end_matches('.');
     if hostname_is_private(normalized) {
         return true;
@@ -132,11 +132,40 @@ fn host_is_private(host: &str) -> bool {
 /// explicitly opted in to exactly those hosts (a listed private host is allowed
 /// — explicit opt-in wins). An empty allowlist allows any PUBLIC host;
 /// private/loopback/link-local ranges are blocked by default (SSRF hardening).
-fn host_allowed(host: &str, allowlist: &[String]) -> bool {
+pub(crate) fn host_allowed(host: &str, allowlist: &[String]) -> bool {
     if !allowlist.is_empty() {
         return allowlist.iter().any(|p| host_matches(host, p));
     }
     !host_is_private(host)
+}
+
+/// Browser navigation policy: honor `--no-network` / `fetch_allowlist` the same
+/// way `fetch` does, and always block private/link-local metadata hosts unless
+/// explicitly allowlisted (CORE_REVIEW browser SSRF).
+pub(crate) fn browser_navigation_allowed(
+    url: &str,
+    no_network: bool,
+    allowlist: &[String],
+) -> Result<(), String> {
+    let lower = url.trim().to_ascii_lowercase();
+    if lower == "about:blank" || lower.starts_with("about:blank#") {
+        return Ok(());
+    }
+    let Some((scheme, host)) = parse_http_host(url) else {
+        return Err("navigation blocked: could not parse http(s) URL host".into());
+    };
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("only http(s) navigation is allowed (got {scheme})"));
+    }
+    if no_network && allowlist.is_empty() {
+        return Err("navigation blocked: --no-network is set and fetch_allowlist is empty".into());
+    }
+    if !host_allowed(&host, allowlist) {
+        return Err(format!(
+            "navigation blocked: host '{host}' is not permitted by network policy"
+        ));
+    }
+    Ok(())
 }
 
 /// A redirect policy that re-checks the fetch_allowlist on EVERY redirect hop,

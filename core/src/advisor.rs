@@ -397,10 +397,31 @@ fn bounded_read(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| e.to_string())
 }
 
+fn path_is_under(child: &Path, root: &Path) -> bool {
+    let Ok(child) = child.canonicalize() else {
+        return false;
+    };
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    child.starts_with(&root)
+}
+
 fn expand_imports(text: &str, base: &Path, depth: u8) -> String {
     if depth >= 4 {
         return text.to_string();
     }
+    // Jail @imports under the watchdog base dir or user catalyst-code homes —
+    // never arbitrary filesystem via @../../.ssh/id_rsa (CORE_REVIEW).
+    let home = crate::config::home_dir().unwrap_or_default();
+    let allowed_roots: Vec<PathBuf> = [
+        base.to_path_buf(),
+        home.join(".catalyst-code"),
+        home.join(".config").join("catalyst-code"),
+    ]
+    .into_iter()
+    .filter(|p| p.exists())
+    .collect();
     text.lines()
         .map(|line| {
             let target = line
@@ -409,11 +430,20 @@ fn expand_imports(text: &str, base: &Path, depth: u8) -> String {
                 .filter(|p| !p.contains(' ') && !p.is_empty());
             match target {
                 Some(target) => {
+                    if target.contains("..") {
+                        return line.to_string();
+                    }
                     let path = if let Some(rest) = target.strip_prefix("~/") {
-                        crate::config::home_dir().unwrap_or_default().join(rest)
+                        home.join(rest)
                     } else {
                         base.join(target)
                     };
+                    if !allowed_roots.iter().any(|r| path_is_under(&path, r)) {
+                        return format!(
+                            "{}\n<!-- @import refused: path escapes allowlist -->",
+                            line
+                        );
+                    }
                     bounded_read(&path)
                         .map(|child| {
                             expand_imports(&child, path.parent().unwrap_or(base), depth + 1)

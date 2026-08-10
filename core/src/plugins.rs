@@ -674,6 +674,8 @@ pub struct ToolConfig {
     pub override_builtin: bool,
     /// Plugin that owns this tool (for UI side-effect framing).
     pub plugin_name: String,
+    /// Declared plugin capabilities (enforced at execute time — CORE_REVIEW).
+    pub capabilities: Vec<String>,
 }
 
 /// How a plugin slash command is executed.
@@ -1515,9 +1517,12 @@ impl PluginManager {
                 ));
             }
 
-            let timeout_ms = entry
-                .timeout_ms
-                .unwrap_or_else(|| default_hook_timeout(hook_name));
+            let timeout_ms = clamp_hook_timeout_ms(
+                hook_name,
+                entry
+                    .timeout_ms
+                    .unwrap_or_else(|| default_hook_timeout(hook_name)),
+            );
 
             hooks.insert(
                 hook_name.clone(),
@@ -1541,7 +1546,8 @@ impl PluginManager {
                 return Err("plugin declares a tool with an empty name".into());
             }
             let canon_script = validate_plugin_script(&canon_dir, &t.script)?;
-            let timeout_ms = t.timeout_ms.unwrap_or(DEFAULT_POST_TIMEOUT_MS);
+            let timeout_ms =
+                clamp_hook_timeout_ms("tool", t.timeout_ms.unwrap_or(DEFAULT_POST_TIMEOUT_MS));
             let kind = match t.kind.as_deref().unwrap_or("destructive") {
                 "readonly" => ToolKind::ReadOnly,
                 "destructive" => ToolKind::Destructive,
@@ -1566,6 +1572,7 @@ impl PluginManager {
                 kind,
                 override_builtin: t.override_builtin,
                 plugin_name: manifest.name.clone(),
+                capabilities: capabilities.clone(),
             });
         }
 
@@ -2743,10 +2750,14 @@ pub async fn execute_hook(
                 }
             };
 
+            // Successful JSON parse: missing `allow` defaults to true so a
+            // hook that only returns `{modify:…}` / `{reason:…}` does not
+            // freeze every tool. Explicit allow:false still denies. Timeout /
+            // nonzero exit / invalid JSON remain fail-closed above (CORE_REVIEW C12).
             let allow = response
                 .get("allow")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .unwrap_or(true);
             let reason = response
                 .get("reason")
                 .and_then(|v| v.as_str())
@@ -2911,6 +2922,18 @@ pub async fn execute_plugin_tool(
     workspace: &str,
     session_id: &str,
 ) -> Outcome {
+    // Runtime capability gate (CORE_REVIEW): destructive handlers need
+    // execute_subprocess; secret-touching tools need access_secrets.
+    if config.kind == ToolKind::Destructive
+        && !config
+            .capabilities
+            .iter()
+            .any(|c| c == "execute_subprocess")
+    {
+        return Outcome::err(format!(
+            "plugin tool '{tool_name}' denied: missing execute_subprocess capability"
+        ));
+    }
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -3396,6 +3419,18 @@ fn parse_memory_provider_stdout(stdout: &str) -> MemoryProviderResult {
 // ---- helpers ----
 
 /// Return the default timeout for a hook point.
+/// Hard caps so a plugin manifest cannot hang the agent for years (CORE_REVIEW).
+fn clamp_hook_timeout_ms(hook_name: &str, ms: u64) -> u64 {
+    let cap = if hook_name.starts_with("pre_") {
+        30_000
+    } else if hook_name.contains("oauth") {
+        300_000
+    } else {
+        120_000
+    };
+    ms.min(cap).max(1)
+}
+
 fn default_hook_timeout(hook_name: &str) -> u64 {
     hook_policy(hook_name).default_timeout_ms
 }
@@ -6380,6 +6415,7 @@ mod tests {
             kind,
             override_builtin: false,
             plugin_name: "test-plugin".into(),
+            capabilities: vec!["execute_subprocess".into()],
         }
     }
 

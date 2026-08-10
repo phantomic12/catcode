@@ -143,6 +143,72 @@ async fn rpc_read(stdout: &mut tokio::process::ChildStdout) -> Result<Value, Str
     serde_json::from_slice(&body).map_err(|e| format!("invalid LSP JSON: {e}"))
 }
 
+/// Language servers the model may spawn. Free-form `command` is otherwise an
+/// arbitrary host process under ReadOnly+Never approval (CORE_REVIEW C4).
+const LSP_COMMAND_ALLOWLIST: &[&str] = &[
+    "rust-analyzer",
+    "gopls",
+    "typescript-language-server",
+    "pyright",
+    "pyright-langserver",
+    "pylsp",
+    "clangd",
+    "lua-language-server",
+    "zls",
+    "jdtls",
+    "kotlin-language-server",
+    "bash-language-server",
+    "yaml-language-server",
+    "vscode-json-language-server",
+    "vscode-css-language-server",
+    "vscode-html-language-server",
+    "texlab",
+    "haskell-language-server",
+    "hls",
+    "solargraph",
+    "ruby-lsp",
+    "intelephense",
+    "phpactor",
+    "omnisharp",
+    "csharp-ls",
+    "ruff",
+    "ruff-lsp",
+    "deno",
+    "biome",
+    "eslint-lsp",
+    "tailwindcss-language-server",
+];
+
+fn validate_lsp_command(command: &str) -> Result<(), String> {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return Err("lsp command must not be empty".into());
+    }
+    // Reject path separators / absolute paths — allowlist is bare names only.
+    if cmd.contains('/') || cmd.contains('\\') || cmd.contains("..") {
+        return Err(format!(
+            "lsp command must be a bare allowlisted server name, not a path ({cmd})"
+        ));
+    }
+    // Reject shell metacharacters.
+    if cmd.chars().any(|c| {
+        matches!(
+            c,
+            ';' | '|' | '&' | '`' | '$' | '(' | ')' | '<' | '>' | '\n' | '\r' | ' '
+        )
+    }) {
+        return Err(format!("lsp command contains disallowed characters: {cmd}"));
+    }
+    let base = cmd.rsplit('/').next().unwrap_or(cmd);
+    if !LSP_COMMAND_ALLOWLIST.iter().any(|a| *a == base) {
+        return Err(format!(
+            "lsp command '{cmd}' is not allowlisted. Allowed: {}",
+            LSP_COMMAND_ALLOWLIST.join(", ")
+        ));
+    }
+    Ok(())
+}
+
 /// Execute a single bounded LSP request. The server is always killed and waited on.
 pub async fn execute_lsp(args: &Value, cfg: &Config) -> Outcome {
     let action = args
@@ -153,6 +219,9 @@ pub async fn execute_lsp(args: &Value, cfg: &Config) -> Outcome {
         .get("command")
         .and_then(Value::as_str)
         .unwrap_or("rust-analyzer");
+    if let Err(e) = validate_lsp_command(command) {
+        return Outcome::err(e);
+    }
     let file = args.get("path").and_then(Value::as_str).unwrap_or("");
     let p = match path(cfg, file) {
         Ok(p) => p,

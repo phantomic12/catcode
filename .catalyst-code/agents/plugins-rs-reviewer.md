@@ -1,5 +1,6 @@
 ---
 name: plugins-rs-reviewer
+model: ck-grok-4.5
 description: Review core/src/plugins.rs — plugin hook dispatch, subprocess lifecycle
 build-test-release: true
 allow:

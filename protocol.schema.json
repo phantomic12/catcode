@@ -84,7 +84,7 @@
             "vision_config", "work_state", "worktree_cleaned", "worktree_promoted",
             "worktree_ready", "worktree_seeded", "provider_models_preview", "sandbox_error",
             "sandbox_prepare_progress", "sandbox_ready", "sandbox_status", "stuck_nudge",
-            "summary_required", "advisor_note", "advisor_status"
+            "summary_required", "advisor_note", "advisor_status", "cleared", "discard_partial"
           ]
         },
         "protocol_version": { "const": 2 },

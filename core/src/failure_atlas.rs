@@ -85,6 +85,7 @@ pub fn record_diagnostic(project_id: &str, class: &str, raw_or_sig: &str) {
     }
     let _ = ProjectLearningPaths::resolve(project_id).ensure();
 
+    let _lock = crate::fsutil::FileLock::acquire(&path.with_extension("lock"));
     let mut rows: Vec<DiagnosticSignature> = learning_store::read_jsonl(&path);
     if let Some(existing) = rows
         .iter_mut()

@@ -125,6 +125,8 @@ export const CORE_EVENT_TYPES = [
   "job_wait_timeout",
   "session_tree",
   "session_branch",
+  "cleared",
+  "discard_partial",
 ] as const;
 
 export type CoreEventType = (typeof CORE_EVENT_TYPES)[number];

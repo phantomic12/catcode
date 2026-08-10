@@ -184,7 +184,16 @@ async fn create_linux(id: &str, args: &Value) -> Outcome {
         .and_then(|v| v.as_str())
         .map(String::from)
         .unwrap_or_else(linux_image);
-    // podman run -d --name <id> -p 0:5900 -p 0:6080 <image>
+    // Reject shell metacharacters / path traversal in image refs (CORE_REVIEW).
+    if image
+        .chars()
+        .any(|c| matches!(c, ';' | '|' | '&' | '`' | '$' | '\n' | '\r' | ' '))
+        || image.contains("..")
+    {
+        return Outcome::err(format!("test_env image name rejected: {image}"));
+    }
+    // Bind VNC/noVNC to loopback only — bare `-p 5900` publishes on all
+    // interfaces (CORE_REVIEW HIGH).
     let cid = match run(
         Command::new("podman")
             .arg("run")
@@ -192,9 +201,9 @@ async fn create_linux(id: &str, args: &Value) -> Outcome {
             .arg("--name")
             .arg(id)
             .arg("-p")
-            .arg("5900")
+            .arg("127.0.0.1::5900")
             .arg("-p")
-            .arg("6080")
+            .arg("127.0.0.1::6080")
             .arg(&image),
         120,
     )

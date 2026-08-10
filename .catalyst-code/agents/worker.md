@@ -1,5 +1,6 @@
 ---
 name: worker
+model: ck-grok-4.5
 description: Implementation agent for normal tasks and approved oracle handoffs
 tools: read_file, grep, glob, list_dir, bash, edit, write_file, contact_supervisor
 thinking: high

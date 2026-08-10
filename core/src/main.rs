@@ -116,6 +116,7 @@ You can read, edit, write, and list files, search with grep/glob, and run shell 
 Judgment (tool schemas own the mechanics):
 - Read/search before changing; prefer the smallest correct edit; verify with a command.
 - Prefer the smallest correct change: `ast_edit` for structural code rewrites when available, otherwise `edit` over `write_file` for targeted text; prefer grep/glob (scoped) before full reads; page with offset/limit.
+- Prefer native tools over bash: `grep` (not rg/`| head`); `read_file` offset/limit (not sed -n/cat); `list_dir`/`glob` (not ls/find); `git_*` for status/diff/log/show; `process` for servers; `fetch` for HTTP GET. Bash for builds, scripts, outside-ws, pipelines.
 - Call tools directly — use `bulk` only for genuinely independent parallel calls. Keep shell commands short; write a script for complex logic.
 - Deferred tool schemas are opt-in — call `load_tools` with a group or name when needed.
 - Paths are workspace-relative; absolute paths and ".." are rejected.
@@ -168,7 +169,7 @@ Rule: plain API key → config; login flow → plugin."#;
 /// group (e.g. browser), list it here AND in handle_load_tools / load_tools schema.
 const DEFERRED_TOOLS_GUIDE: &str = r#"## Deferred tools
 
-Call `load_tools` when needed: `git`, `web`, `bulk`, `runtime` (eval/read), `ide` (lsp/ast_edit/snapshot_edit), `debug`, `mcp`, `browser`, `process`, or `all`. Individual tools such as spawn, workspace_activity, and test_env are also loadable. `goal_write_plan` is available only during /goal planning."#;
+Call `load_tools` when needed: `git` (add/commit/push/pull/branch; status/diff/log/show are core), `web`, `bulk`, `runtime` (eval/read), `ide` (lsp/ast_edit/snapshot_edit), `debug`, `mcp`, `browser`, `process`, or `all`. Also loadable: spawn, workspace_activity, test_env. `goal_write_plan` only during /goal planning."#;
 
 /// Cap standing skill-manifest size so a large skills/ tree does not bloat the
 /// prefix cache. Remaining skills stay discoverable via list_dir / `/skill:`.
@@ -2659,13 +2660,14 @@ fn build_reflect_text(recurring: &[(usize, String)]) -> String {
 
 /// Extract file categories from a tool call's arguments, for shape analysis.
 /// Only file-writing tools contribute a stable path signal (bash etc. do not).
-fn extract_file_categories(tool: &str, args_json: &str) -> Vec<String> {
+/// Raw workspace-relative paths touched by a mutating file tool (for staleness).
+pub(crate) fn extract_file_paths(tool: &str, args_json: &str) -> Vec<String> {
     let args: Value = match serde_json::from_str(args_json) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    let paths: Vec<String> = match tool {
-        "write_file" | "edit" | "patch" | "delete" | "mkdir" => args
+    match tool {
+        "write_file" | "edit" | "patch" | "delete" | "mkdir" | "snapshot_edit" | "ast_edit" => args
             .get("path")
             .and_then(|v| v.as_str())
             .map(|s| vec![s.to_string()])
@@ -2699,8 +2701,11 @@ fn extract_file_categories(tool: &str, args_json: &str) -> Vec<String> {
             })
             .unwrap_or_default(),
         _ => Vec::new(),
-    };
-    paths
+    }
+}
+
+pub(crate) fn extract_file_categories(tool: &str, args_json: &str) -> Vec<String> {
+    extract_file_paths(tool, args_json)
         .into_iter()
         .map(|p| pattern_log::file_category(&p))
         .collect()
@@ -2717,12 +2722,13 @@ fn extract_file_categories(tool: &str, args_json: &str) -> Vec<String> {
 /// core-driven after the planning turn ends, so reflecting here would also
 /// delay `maybe_finish_goal_planning`. The synthesizing wrap-up is itself the
 /// completion summary turn.
-async fn maybe_reflect_prompt(
+pub(crate) async fn maybe_reflect_prompt(
     st: &Arc<State>,
     prompt: &str,
     turn_tool_calls: u32,
     shape_tools: &[String],
     shape_files: &[String],
+    shape_paths: &[String],
     cancelled: bool,
 ) -> Option<(String, usize)> {
     if cancelled {
@@ -2780,16 +2786,25 @@ async fn maybe_reflect_prompt(
             Some(tout),
             None,
         );
-        // Staleness: mark memories whose ref_files overlap changed categories.
-        let _ = memory_staleness::invalidate_for_paths(&workspace, shape_files);
+        // Staleness: mark memories whose ref_files overlap changed paths
+        // (must be raw paths — categories like core/src/*.rs never match
+        // ref_files like core/src/memory.rs) (CORE_REVIEW C3).
+        let _ = memory_staleness::invalidate_for_paths(&workspace, shape_paths);
         // Learning proposals from episode digest (validated; no secrets).
-        for prop in learning_proposals::proposals_from_episode_digest(
-            prompt.lines().next().unwrap_or(prompt),
-            shape_files,
-            &[],
-            &[],
-        ) {
-            let _ = learning_proposals::validate_and_apply(&workspace, &prop);
+        // Prefer raw paths for proposal references. Empty rejected/corrections
+        // still yield no proposals today — skip the no-op loop (CORE_REVIEW).
+        // When undo/correction plumbing lands, pass those slices here.
+        let rejected: &[String] = &[];
+        let corrections: &[String] = &[];
+        if !rejected.is_empty() || !corrections.is_empty() {
+            for prop in learning_proposals::proposals_from_episode_digest(
+                prompt.lines().next().unwrap_or(prompt),
+                shape_paths,
+                rejected,
+                corrections,
+            ) {
+                let _ = learning_proposals::validate_and_apply(&workspace, &prop);
+            }
         }
     }
 
@@ -2822,6 +2837,7 @@ async fn run_parallel_readonly_wave(
     turn_tool_calls: &mut u32,
     shape_tools: &mut Vec<String>,
     shape_files: &mut Vec<String>,
+    shape_paths: &mut Vec<String>,
 ) -> ParallelWaveResult {
     struct Prepared {
         id: String,
@@ -2854,8 +2870,9 @@ async fn run_parallel_readonly_wave(
         );
         *turn_tool_calls = turn_tool_calls.saturating_add(1);
         shape_tools.push(name.clone());
-        for cat in extract_file_categories(&name, &args_str) {
-            shape_files.push(cat);
+        for path in extract_file_paths(&name, &args_str) {
+            shape_paths.push(path.clone());
+            shape_files.push(pattern_log::file_category(&path));
         }
 
         let args: Value = match serde_json::from_str(&args_str) {
@@ -2931,7 +2948,12 @@ async fn run_parallel_readonly_wave(
             context.note_stale_result();
             return ParallelWaveResult::Aborted;
         };
-        let kind = tools::classify(&name);
+        let kind = if name == "mcp" {
+            // Same live MCP reclassification as the sequential path (Wave 5).
+            tools::kind_for_mcp_args(&args)
+        } else {
+            tools::classify(&name)
+        };
         let kind_str: &'static str = match kind {
             tools::ToolKind::ReadOnly => "readonly",
             tools::ToolKind::Destructive => "destructive",
@@ -2940,6 +2962,7 @@ async fn run_parallel_readonly_wave(
 
         let mut force_allow = false;
         let mut force_deny = false;
+        let mut force_ask = false;
         for rule in &cfg.allow_rules {
             if tool_matches_rule(&name, &args, rule) {
                 force_allow = true;
@@ -2950,6 +2973,14 @@ async fn run_parallel_readonly_wave(
             for rule in &cfg.deny_rules {
                 if tool_matches_rule(&name, &args, rule) {
                     force_deny = true;
+                    break;
+                }
+            }
+        }
+        if !force_allow && !force_deny {
+            for rule in &cfg.ask_rules {
+                if tool_matches_rule(&name, &args, rule) {
+                    force_ask = true;
                     break;
                 }
             }
@@ -2984,7 +3015,7 @@ async fn run_parallel_readonly_wave(
             restricted.is_some(),
             force_allow,
             escalated,
-            false,
+            force_ask,
         );
         if needs_approval {
             match request_approval(st, &id, &name, &args_str, kind_str, None, cancel).await {
@@ -4028,7 +4059,15 @@ async fn handle_load_tools(st: &State, args: &Value, tool_defs: &mut Vec<Value>)
                 );
             }
             "git" => {
-                for g in ["git_status", "git_diff", "git_log", "git_add", "git_commit"] {
+                // Read-only git_* are core (always on). Group loads mutators + any
+                // extras the model might name individually.
+                for g in [
+                    "git_add",
+                    "git_commit",
+                    "git_push",
+                    "git_pull",
+                    "git_branch",
+                ] {
                     expanded.push(g.into());
                 }
             }

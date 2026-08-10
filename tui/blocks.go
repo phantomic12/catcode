@@ -438,7 +438,9 @@ func compactToolDetail(b *block) string {
 		if command == "" {
 			command = bareToolArg(b.args)
 		}
-		add(command)
+		// One-line summary only — full multi-line scripts blow the activity
+		// card into a padded wall. Ctrl+O expands to renderBashBlock.
+		add(summarizeBashCommand(command))
 	case "git_commit":
 		if message := b.arg("message"); message != "" {
 			add(`"` + message + `"`)
@@ -1254,12 +1256,14 @@ func (s *session) renderToolBlock(b *block, w int) string {
 		return renderGitStatusBlock(b, w)
 	case "git_log":
 		return renderGitLogBlock(b, w)
-	case "git_diff":
+	case "git_diff", "git_show":
 		return renderGitDiffBlock(b, w)
 	case "git_add":
 		return renderGitAddBlock(b, w)
 	case "git_commit":
 		return renderGitCommitBlock(b, w)
+	case "git_push", "git_pull", "git_branch":
+		return renderGenericToolBlock(b, w)
 	case "todo_write":
 		return renderTodoWriteBlock(b, w)
 	case "todo_read":

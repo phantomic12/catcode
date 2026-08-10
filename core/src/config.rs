@@ -13,18 +13,26 @@ pub enum Approval {
 }
 
 impl Approval {
-    pub fn parse(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "never" | "off" | "none" | "auto" => Approval::Never,
-            "always" | "all" | "y" => Approval::Always,
-            _ => Approval::Destructive,
-        }
-    }
     pub fn as_str(&self) -> &'static str {
         match self {
             Approval::Never => "never",
             Approval::Destructive => "destructive",
             Approval::Always => "always",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        Self::try_parse(s).unwrap_or(Approval::Destructive)
+    }
+
+    /// Strict parse for protocol commands — unknown modes error instead of
+    /// silently becoming Destructive (CORE_REVIEW).
+    pub fn try_parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "never" | "off" | "none" | "auto" => Some(Approval::Never),
+            "always" | "all" | "y" => Some(Approval::Always),
+            "destructive" | "default" | "" => Some(Approval::Destructive),
+            _ => None,
         }
     }
 }
@@ -381,9 +389,13 @@ pub struct SubagentConfig {
     pub max_depth: u32,
     /// Whether subagents receive intercom coordination tools + instructions.
     pub intercom_bridge_mode: IntercomBridgeMode,
-    /// Max tasks in a top-level parallel run.
+    /// Soft advisory max tasks in a top-level parallel run (default 8).
+    /// Exceeding this no longer rejects the call — tasks queue under the
+    /// concurrency semaphore. Callers can request larger batches explicitly.
     pub parallel_max_tasks: u32,
-    /// Default concurrency for parallel runs.
+    /// Default concurrency for parallel runs when the caller omits
+    /// `concurrency`. Explicit requests may exceed this (absolute safety
+    /// max still applies in `run_parallel`).
     pub parallel_concurrency: u32,
     /// Top-level calls use background execution when async is not explicitly set.
     pub async_by_default: bool,
@@ -501,7 +513,7 @@ impl Default for SubagentConfig {
         Self {
             max_depth: 2,
             intercom_bridge_mode: IntercomBridgeMode::Always,
-            parallel_max_tasks: 64,
+            parallel_max_tasks: 8,
             parallel_concurrency: 4,
             async_by_default: false,
             disable_builtins: false,
@@ -866,6 +878,9 @@ pub fn provider_to_json(p: &ProviderConfig) -> Value {
     if let Some(e) = &p.api_key_env {
         o.insert("api_key_env".into(), json!(e));
     }
+    if let Some(ep) = &p.models_endpoint {
+        o.insert("models_endpoint".into(), json!(ep));
+    }
     if !p.headers.is_empty() {
         let h: serde_json::Map<String, Value> = p
             .headers
@@ -1008,6 +1023,43 @@ pub fn save_search_keys(keys: &std::collections::HashMap<String, String>) -> std
 /// That silently signed users in on first launch. Auth is now explicit only:
 /// paste an API key via `/login` or complete a **plugin** OAuth flow. Kept as a
 /// no-op so call sites stay stable.
+
+/// Persist runtime knobs that `/set_config` and `/set_approval` mutate so they
+/// survive restart (CORE_REVIEW). Merges into core-owned config.json.
+pub fn save_runtime_knobs(cfg: &Config) -> std::io::Result<()> {
+    let path = user_config_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = crate::fsutil::FileLock::acquire(&path.with_extension("lock"))?;
+    let mut root: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    if root.as_object().is_none() {
+        root = json!({});
+    }
+    root["bash_timeout_secs"] = json!(cfg.bash_timeout_secs);
+    root["auto_compact"] = json!(cfg.auto_compact);
+    root["sandbox"] = json!(cfg.sandbox.as_str());
+    root["approval"] = json!(cfg.approval.as_str());
+    let mut advisor = serde_json::Map::new();
+    advisor.insert("enabled".into(), json!(cfg.advisor.enabled));
+    advisor.insert("subagents".into(), json!(cfg.advisor.subagents));
+    advisor.insert("nudge".into(), json!(cfg.advisor.nudge));
+    if let Some(m) = &cfg.advisor.model {
+        advisor.insert("model".into(), json!(m));
+    }
+    if let Some(m) = &cfg.advisor.subagent_model {
+        advisor.insert("subagent_model".into(), json!(m));
+    }
+    root["advisor"] = Value::Object(advisor);
+    let data = serde_json::to_string_pretty(&root).unwrap_or_default();
+    crate::fsutil::atomic_write_secure(&path, data.as_bytes())?;
+    Ok(())
+}
+
 pub fn auto_login_env_presets(_cfg: &mut Config) -> Vec<String> {
     Vec::new()
 }

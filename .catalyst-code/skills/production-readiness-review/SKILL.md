@@ -92,9 +92,7 @@ absent). End by offering to implement the P1 fixes.
   omits something (e.g. a Go project whose CI runs `go vet`/`go build`/`go test`
   but NOT `gofmt --check`), call that out as a finding — formatting drift slips
   through silently. `cargo fmt --all` / `gofmt -w .` are one-command fixes.
-- **The subagent hard cap.** If you need >8 parallel reviewers, batch them ≤8
-  (the `tasks` mode rejects > `parallel_max_tasks` instantly). See
-  `parallel-subagent-cap` memory.
+- **Parallel batch size.** Default advisory max is 8 (`parallel_max_tasks`); larger batches are allowed and queue under concurrency. Set `concurrency` higher when you want more than the default 4 running at once. Absolute safety max is 256. See `parallel-subagent-cap` memory.
 
 ## Applying the findings (fix-all)
 

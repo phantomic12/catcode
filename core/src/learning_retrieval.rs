@@ -110,6 +110,9 @@ pub fn rank_memories(
         })
         .filter(|(s, _, _)| *s > 0.0)
         .collect();
+    // Blend activation hit rates when a project id is known via env override of
+    // learning root tests, or via optional thread — call sites that know the
+    // project should prefer rank_memories_in_project (below).
     scored.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -117,6 +120,51 @@ pub fn rank_memories(
     });
     scored.truncate(limit);
     scored
+}
+
+/// Rank with activation-aware utility (CORE_REVIEW: activations were write-only).
+pub fn rank_memories_in_project(
+    memories: &[MemoryEntry],
+    prompt: &str,
+    fp: &TaskFingerprint,
+    limit: usize,
+    project_id: &str,
+) -> Vec<(f32, MemoryEntry, Vec<String>)> {
+    let mut ranked = rank_memories(memories, prompt, fp, limit.saturating_mul(2).max(limit));
+    let acts = crate::learning_activations::load_activations(project_id);
+    let mut hits: std::collections::HashMap<String, (u32, u32)> = std::collections::HashMap::new();
+    for a in &acts {
+        if a.item_kind != "memory" && a.item_kind != "context_pack" {
+            // memory names are the usual item_id
+        }
+        let e = hits.entry(a.item_id.clone()).or_insert((0, 0));
+        e.0 = e.0.saturating_add(1);
+        if a.followed_by_agent == Some(true) || a.explicitly_opened {
+            e.1 = e.1.saturating_add(1);
+        }
+    }
+    for (score, entry, reasons) in ranked.iter_mut() {
+        if let Some(&(n, followed)) = hits.get(&entry.name) {
+            let rate = if n == 0 {
+                0.0
+            } else {
+                followed as f32 / n as f32
+            };
+            // Mild boost/penalty from real injection follow-through.
+            let boost = 0.15 * (rate - 0.3);
+            *score = (*score + boost).clamp(0.0, 1.5);
+            if n >= 2 {
+                reasons.push(format!("activation hits {n} follow-rate {rate:.2}"));
+            }
+        }
+    }
+    ranked.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.name.cmp(&b.1.name))
+    });
+    ranked.truncate(limit);
+    ranked
 }
 
 /// Lexical overlap (TF, no corpus DF) between a memory and a prompt.

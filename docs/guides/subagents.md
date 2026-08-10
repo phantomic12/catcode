@@ -304,7 +304,11 @@ subagent({
 ```
 
 Options:
-- `concurrency`: max parallel tasks (default from config)
+- `concurrency`: max parallel tasks running at once. Defaults to config
+  (`subagents.parallel.concurrency`, default 4) when omitted; **explicit
+  higher values are honored** (clamped only by task count and absolute max 256).
+- Task count soft default: `subagents.parallel.maxTasks` (default 8) is
+  advisory — larger batches queue under concurrency instead of failing.
 - `worktree`: boolean — isolate each task in a git worktree
   (`.catalyst-code/worktrees/<run_id>/`). Requires a git repo.
 - `context`: applied to all tasks

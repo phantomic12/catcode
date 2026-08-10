@@ -329,6 +329,23 @@ pub async fn execute_browser(name: &str, args: &Value, cfg: &Config) -> Outcome 
     if !is_browser_tool(name) {
         return Outcome::err(format!("unknown browser tool: {name}"));
     }
+    // Honor fetch/no_network policy on navigate (and evaluate of absolute URLs
+    // is out of scope — Page.navigate is the SSRF vector) (CORE_REVIEW).
+    if name == "browser_navigate" {
+        if let Some(url) = args.get("url").and_then(|v| v.as_str()) {
+            if let Err(msg) = crate::fetch_tool::browser_navigation_allowed(
+                url,
+                cfg.no_network,
+                &cfg.fetch_allowlist,
+            ) {
+                return Outcome::ok(
+                    BrowserError::new("NAVIGATION_DENIED", msg)
+                        .to_json()
+                        .to_string(),
+                );
+            }
+        }
+    }
     match backend::dispatch(name, args, cfg).await {
         Ok(v) => Outcome::ok(v.to_string()),
         // Structured errors as ok JSON so the model can recover (ELEMENT_STALE, etc.).

@@ -820,7 +820,7 @@ export type CoreEvent =
   | ({ type: "context_breakdown" } & ContextBreakdown)
   | ({ type: "usage" } & UsageSnapshot)
   | { type: "agents"; agents: AgentInfo[] }
-  | { type: "http_retry"; attempt?: number; status?: number; backoff_ms?: number; reason?: string }
+  | { type: "http_retry"; attempt?: number; status?: number; backoff_ms?: number; reason?: string; discard_partial?: boolean | string }
   | { type: "sessions"; sessions: SessionEntry[]; files: string[] }
   | { type: "session_status"; sessions: LiveSessionStatus[] }
   | Stats
@@ -828,6 +828,8 @@ export type CoreEvent =
   | { type: "done" }
   | { type: "aborted" }
   | { type: "reset" }
+  | { type: "cleared"; persist?: boolean }
+  | { type: "discard_partial" }
   | { type: "error"; message: string }
   | { type: "info"; message: string }
   | { type: "steer"; prompt: string }

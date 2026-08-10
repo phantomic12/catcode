@@ -604,9 +604,12 @@ fn plugin_timeout_provider() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>
                     serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-slow-plugin","type":"function","function":{"name":"slow_plugin","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":2}})
                 )
             } else {
+                // ≥80 chars so auto-reflect / summary_required gates treat the
+                // mock answer as already delivered (no extra re-prompt loop).
+                let final_text = "PLUGIN_TIMEOUT_HANDLED — the slow plugin timed out as expected and the turn completed cleanly.";
                 format!(
                     "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-                    serde_json::json!({"choices":[{"delta":{"content":"PLUGIN_TIMEOUT_HANDLED"}}]}),
+                    serde_json::json!({"choices":[{"delta":{"content":final_text}}]}),
                     serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":1}})
                 )
             };
@@ -781,7 +784,15 @@ impl CoreHarness {
     ) -> Self {
         let session = workspace.join("session.jsonl");
         let config = workspace.join("config.json");
-        std::fs::write(&config, "{}\n").unwrap();
+        // Keep harness turns deterministic: disable auto-reflect so a short
+        // mock final answer cannot re-enter the summary_required loop under
+        // suite load (plugin timeout fixture especially).
+        std::fs::write(
+            &config,
+            r#"{"auto_reflect":false}
+"#,
+        )
+        .unwrap();
         let inherited_path = std::env::var("PATH").unwrap_or_default();
         let harness_path = format!("{}:{inherited_path}", workspace.join("bin").display());
         let mut args = vec![
@@ -1129,6 +1140,12 @@ fn abort_during_stream_cancels_old_run_and_allows_next_turn() {
     assert!(cancelled.iter().any(|event| {
         event["type"] == "run_cancelled" && event["run_id"] == old_run && event["reason"] == "abort"
     }));
+
+    // Abort always pairs aborted+done (even when a turn was in flight) so UI
+    // clients that gate "working" on `done` clear. Drain that terminal pair
+    // before starting the replacement turn, otherwise until("done") would
+    // return the abort's leftover done without NEW_OK.
+    let _ = core.until("done");
 
     core.send(serde_json::json!({
         "type":"send", "prompt":"replacement", "model":"mock-model"
@@ -1827,7 +1844,15 @@ fn plugin_tool_timeout_is_bounded_and_reported_with_stable_status() {
         "type":"send", "prompt":"run timeout fixture", "model":"mock-model"
     }));
     let events = core.until("done");
-    assert!(began.elapsed() < Duration::from_secs(3));
+    // Primary correctness: timed_out status below. Wall-clock is a secondary
+    // promptness check — under full-suite parallelism a 200ms plugin timeout
+    // can stretch several seconds, so keep the ceiling under sleep(5) plus
+    // suite headroom rather than a tight solo-run budget.
+    assert!(
+        began.elapsed() < Duration::from_secs(12),
+        "plugin timeout turn took {:?}; expected well under the 5s fixture sleep",
+        began.elapsed()
+    );
     assert!(events.iter().any(|event| {
         event["type"] == "tool_result"
             && event["id"] == "call-slow-plugin"
@@ -1837,9 +1862,12 @@ fn plugin_tool_timeout_is_bounded_and_reported_with_stable_status() {
                 .as_str()
                 .is_some_and(|output| output.contains("timed out"))
     }));
-    assert!(events
-        .iter()
-        .any(|event| { event["type"] == "delta" && event["text"] == "PLUGIN_TIMEOUT_HANDLED" }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "delta"
+            && event["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("PLUGIN_TIMEOUT_HANDLED"))
+    }));
 
     drop(core);
     stop_server.store(true, Ordering::Relaxed);

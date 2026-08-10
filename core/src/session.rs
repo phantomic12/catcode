@@ -348,6 +348,15 @@ pub fn append_activity_state(
     detail: Option<&str>,
 ) {
     ensure_header(path);
+    // Same lock as append/rewrite so run-state lines cannot interleave
+    // with message entries (CORE_REVIEW).
+    let Ok(_lock) = crate::fsutil::FileLock::acquire(&path.with_extension("lock")) else {
+        eprintln!(
+            "[session] activity_state lock failed for {}",
+            path.display()
+        );
+        return;
+    };
     ensure_record_boundary(path);
     let record = RunRecord {
         session_id: session_id.to_string(),
@@ -373,6 +382,10 @@ pub fn append_activity_state(
 pub fn append(path: &Path, msg: &Message) {
     ensure_header(path);
     let Ok(_lock) = crate::fsutil::FileLock::acquire(&path.with_extension("lock")) else {
+        eprintln!(
+            "[session] append lock failed for {}; message not persisted",
+            path.display()
+        );
         return;
     };
     ensure_record_boundary(path);
@@ -383,10 +396,18 @@ pub fn append(path: &Path, msg: &Message) {
         message: Some(msg.clone()),
     };
     let Ok(mut file) = OpenOptions::new().append(true).open(path) else {
+        eprintln!(
+            "[session] append open failed for {}; message not persisted",
+            path.display()
+        );
         return;
     };
     let line = serde_json::json!({"_entry": entry});
     if writeln!(file, "{line}").is_err() || file.flush().is_err() {
+        eprintln!(
+            "[session] append write failed for {}; message not persisted",
+            path.display()
+        );
         return;
     }
     let _ = file.sync_all();
@@ -980,8 +1001,14 @@ pub fn rewrite(path: &Path, messages: &[Message]) {
         .write(true)
         .open(&tmp)
     else {
+        eprintln!(
+            "[session] rewrite open failed for {}; conversation not compacted on disk",
+            path.display()
+        );
         return;
     };
+    // Preserve non-message journal kinds across compact/reset so
+    // branch/compaction/delivery metadata is not wiped (CORE_REVIEW C5).
     let preserved_records: Vec<String> = std::fs::read_to_string(path)
         .ok()
         .into_iter()
@@ -989,14 +1016,30 @@ pub fn rewrite(path: &Path, messages: &[Message]) {
         .filter(|line| {
             serde_json::from_str::<Value>(line)
                 .ok()
-                .is_some_and(|value| value.get("_run").is_some())
+                .is_some_and(|value| {
+                    value.get("_run").is_some()
+                        || value.get("_compaction").is_some()
+                        || value.get("_parent_delivery").is_some()
+                        || value.get("_abandoned_branch").is_some()
+                })
         })
         .collect();
     let _ = writeln!(f, "{}", header_line());
+    // Rebuild a linear _entry chain so tree/branch ops still work after
+    // compact/reset (CORE_REVIEW C5).
+    let mut prev_id: Option<String> = None;
+    let mut last_id: Option<String> = None;
     for m in messages {
-        let mut line = serde_json::to_string(m).unwrap_or_default();
-        line.push('\n');
-        let _ = f.write_all(line.as_bytes());
+        let id = next_entry_id();
+        let entry = SessionEntry {
+            id: id.clone(),
+            parent_id: prev_id.clone(),
+            message: Some(m.clone()),
+        };
+        let line = serde_json::json!({"_entry": entry});
+        let _ = writeln!(f, "{line}");
+        prev_id = Some(id.clone());
+        last_id = Some(id);
     }
     for record in preserved_records {
         let _ = writeln!(f, "{record}");
@@ -1008,6 +1051,9 @@ pub fn rewrite(path: &Path, messages: &[Message]) {
     let _ = std::fs::rename(&tmp, path);
     if let Some(parent) = path.parent() {
         fsync_dir(parent);
+    }
+    if let Some(leaf) = last_id {
+        let _ = set_active_leaf(path, &leaf);
     }
 }
 

@@ -63,7 +63,7 @@ func TestRustEventFixturesRemainGoCompatible(t *testing.T) {
 	if err := scanner.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if len(seen) != 114 {
-		t.Fatalf("got %d event fixtures, want 114", len(seen))
+	if len(seen) != 116 {
+		t.Fatalf("got %d event fixtures, want 116", len(seen))
 	}
 }

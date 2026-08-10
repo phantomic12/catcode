@@ -5,7 +5,7 @@
 | **Agent** | A configurable AI agent with a system prompt, tool set, and optional lifecycle defined as a markdown file with YAML frontmatter (`.catalyst-code/agents/<name>.md`). |
 | **Approval gate** | The human-in-the-loop safety mechanism that prompts before executing destructive tool calls (bash, write_file, edit, …). Three modes: never, destructive (default), always. |
 | **Core** | The Rust binary (`catcode-core`) that manages conversation state, streams model responses, executes tools, and persists sessions. |
-| **Deferred tools** | Tools not included in the default schema; loaded on demand via `load_tools` (e.g. `fetch`, `web_search`, `git_*`, `bulk_*`, `diagnostics`, `spawn`). |
+| **Deferred tools** | Tools not included in the default schema; loaded on demand via `load_tools` (e.g. `fetch`, `web_search`, git mutators, `bulk_*`, `diagnostics`, `spawn`). Read-only `git_status`/`diff`/`log`/`show` are core. |
 | **Goal mode** | Plan-then-deploy subagent orchestration: `/goal` triggers a planning turn that submits a structured plan, then deploys worker subagents under concurrency and model allowlists. |
 | **Hook** | A plugin-declared script that fires at a specific lifecycle point (before/after a tool, session start/stop, etc.), receiving JSON on stdin and returning `{allow, reason?, modify?}` on stdout. |
 | **Intercom** | The peer-to-peer coordination channel that lets subagents communicate with the orchestrator and with each other. |

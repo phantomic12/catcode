@@ -140,6 +140,16 @@ pub fn build_context_pack_for(workspace: &Path, prompt: &str, role: ContextRole)
         append_validation_hints(&mut out, &identity, &fp);
     }
 
+    // Ranked memories (was defined but never called — subagents rely on pack
+    // alone and never saw the main-turn [RELEVANT MEMORIES] tail) (CORE_REVIEW C13).
+    let include_memories = matches!(
+        role,
+        ContextRole::Full | ContextRole::Planner | ContextRole::Worker | ContextRole::Scout
+    );
+    if include_memories {
+        append_ranked_memories(&mut out, workspace, prompt, &fp, true, true);
+    }
+
     // Activation telemetry (fail-open).
     learning_activations::record_pack_activations(
         &identity.id,
@@ -164,7 +174,8 @@ fn append_ranked_memories(
     global: bool,
 ) {
     let memories = memory::scan_all_memories(workspace);
-    let ranked = learning_retrieval::rank_memories(&memories, prompt, fp, 12);
+    let pid = project_identity::resolve_project_identity(workspace).id;
+    let ranked = learning_retrieval::rank_memories_in_project(&memories, prompt, fp, 12, &pid);
     let mut project_n = 0usize;
     let mut global_n = 0usize;
     let mut project_section = String::new();

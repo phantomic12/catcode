@@ -159,7 +159,13 @@ pub(crate) fn spawn_goal_deploy(st: Arc<State>, client: reqwest::Client) {
         st.runtime
             .register_session_resource(&session, ResourceKind::Goal, "goal_deploy")
     else {
-        return;
+        {
+            emit(&Event::new("error").with(
+                "message",
+                json!("goal deploy could not register session resource — session inactive"),
+            ));
+            return;
+        }
     };
     tokio::spawn(runtime::scope_session(session, async move {
         cancel_goal_deploy(&st).await;
@@ -291,15 +297,23 @@ pub(crate) fn spawn_goal_review(st: Arc<State>, client: reqwest::Client) {
         st.runtime
             .register_session_resource(&session, ResourceKind::Goal, "goal_review")
     else {
-        return;
+        {
+            emit(&Event::new("error").with(
+                "message",
+                json!("goal review could not register session resource — session inactive"),
+            ));
+            return;
+        }
     };
     tokio::spawn(runtime::scope_session(session, async move {
         // Wait for the planning turn to release the session slot.
-        for _ in 0..120 {
+        // Wait up to ~2 minutes for the parent turn slot (was ~3s and hard-failed
+        // healthy missions on slow tool drains) (CORE_REVIEW).
+        for _ in 0..2400 {
             if st.current.lock().await.is_none() {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         let wrap = {
             let mut g = st.goal.lock().await;
@@ -391,11 +405,12 @@ pub(crate) async fn start_goal_parent_turn(
     // or deploy tasks that may still briefly hold `st.current`; never skip CEO
     // self-review by silently accepting the plan (that left missions stuck in
     // plan_ready with deploy_after_turn armed and nobody consuming it).
-    for _ in 0..120 {
+    // Wait up to ~2 minutes for the parent turn slot (was ~3s) (CORE_REVIEW).
+    for _ in 0..2400 {
         if st.current.lock().await.is_none() {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     enum BusyAction {
