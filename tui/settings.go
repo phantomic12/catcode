@@ -165,6 +165,7 @@ type settingsStore struct {
 	BashTimeoutSecs      int    `json:"bash_timeout_secs,omitempty"`
 	AutoCompact          bool   `json:"auto_compact"` // not omitempty — default is true; false must survive round-trip
 	AdvisorEnabled       bool   `json:"advisor_enabled,omitempty"`
+	AdvisorNudge         bool   `json:"advisor_nudge,omitempty"`
 	AdvisorSubagents     bool   `json:"advisor_subagents,omitempty"`
 	AdvisorModel         string `json:"advisor_model,omitempty"`
 	AdvisorSubagentModel string `json:"advisor_subagent_model,omitempty"`
@@ -364,6 +365,9 @@ func loadSettingsFrom(path string) *settingsStore {
 	if v, ok := raw["advisor_enabled"].(bool); ok {
 		s.AdvisorEnabled = v
 	}
+	if v, ok := raw["advisor_nudge"].(bool); ok {
+		s.AdvisorNudge = v
+	}
 	if v, ok := raw["advisor_subagents"].(bool); ok {
 		s.AdvisorSubagents = v
 	}
@@ -467,7 +471,7 @@ func (s *settingsStore) save() (err error) {
 		"sandbox": s.Sandbox, "no_network": s.NoNetwork,
 		"idle_timeout": s.IdleTimeout, "max_session_tokens": s.MaxSessionTokens,
 		"footer_metrics": s.FooterMetrics, "reduced_motion": s.ReducedMotion, "bash_timeout_secs": s.BashTimeoutSecs,
-		"advisor_enabled": s.AdvisorEnabled, "advisor_subagents": s.AdvisorSubagents,
+		"advisor_enabled": s.AdvisorEnabled, "advisor_nudge": s.AdvisorNudge, "advisor_subagents": s.AdvisorSubagents,
 		"advisor_model": s.AdvisorModel, "advisor_subagent_model": s.AdvisorSubagentModel,
 		"auto_compact": s.AutoCompact, "active_provider": s.ActiveProvider,
 		"provider_keys":   nonNilStringMap(s.ProviderKeys),

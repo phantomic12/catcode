@@ -50,6 +50,8 @@ pub enum ProviderErrorKind {
     Authentication,
     ContextLength,
     RateLimit,
+    /// Billing / prepaid balance / credit exhaustion — permanent until the user tops up.
+    Balance,
     Server,
     Transport,
     MalformedResponse,
@@ -96,27 +98,47 @@ pub trait ProviderAdapter: Send + Sync {
 
 pub(crate) fn normalize_http_error(status: Option<u16>, body: &str) -> ProviderError {
     let lower = body.to_ascii_lowercase();
-    let kind = match status {
-        Some(401 | 403) => ProviderErrorKind::Authentication,
-        Some(429) => ProviderErrorKind::RateLimit,
-        // 408 Request Timeout is temporary (proxy/gateway stall) — treat as
-        // retryable like a server blip, not a fatal client error.
-        Some(408) => ProviderErrorKind::Server,
-        Some(code) if code >= 500 => ProviderErrorKind::Server,
-        _ if lower.contains("context_length")
-            || lower.contains("context length")
-            || lower.contains("maximum context")
-            || lower.contains("prompt is too long")
-            || lower.contains("input is too long") =>
-        {
-            ProviderErrorKind::ContextLength
+    // Body markers for balance / rate-limit take priority over status so a 5xx
+    // (or other) response that is clearly "out of credits" still fails fast.
+    let kind = if is_balance_or_billing_message(&lower) {
+        ProviderErrorKind::Balance
+    } else if is_rate_limit_message(&lower) || matches!(status, Some(429)) {
+        ProviderErrorKind::RateLimit
+    } else {
+        match status {
+            Some(401 | 403) => ProviderErrorKind::Authentication,
+            // 402 Payment Required is billing/balance, not a transient blip.
+            Some(402) => ProviderErrorKind::Balance,
+            // 408 Request Timeout is temporary (proxy/gateway stall) — treat as
+            // retryable like a server blip, not a fatal client error.
+            Some(408) => ProviderErrorKind::Server,
+            Some(code) if code >= 500 => ProviderErrorKind::Server,
+            _ if lower.contains("context_length")
+                || lower.contains("context length")
+                || lower.contains("maximum context")
+                || lower.contains("prompt is too long")
+                || lower.contains("input is too long") =>
+            {
+                ProviderErrorKind::ContextLength
+            }
+            None => ProviderErrorKind::Transport,
+            // Unknown non-permanent status → treat as transient server blip so the
+            // transport denylist (rate-limit / balance only for fail-fast) can retry.
+            Some(code) if !is_permanent_client_status(code) => ProviderErrorKind::Server,
+            _ => ProviderErrorKind::Fatal,
         }
-        None => ProviderErrorKind::Transport,
-        _ => ProviderErrorKind::Fatal,
     };
-    let retryable = matches!(
+    // Policy: retry provider errors by default. Fail fast only on rate limits,
+    // balance/billing, and permanent request/account failures (auth, context,
+    // malformed, validation). Rewriting the same bad request cannot help those.
+    let retryable = !matches!(
         kind,
-        ProviderErrorKind::RateLimit | ProviderErrorKind::Server | ProviderErrorKind::Transport
+        ProviderErrorKind::Authentication
+            | ProviderErrorKind::ContextLength
+            | ProviderErrorKind::RateLimit
+            | ProviderErrorKind::Balance
+            | ProviderErrorKind::MalformedResponse
+            | ProviderErrorKind::Fatal
     );
     ProviderError {
         kind,
@@ -124,6 +146,93 @@ pub(crate) fn normalize_http_error(status: Option<u16>, body: &str) -> ProviderE
         status,
         message: sanitize_error_message(body),
     }
+}
+
+/// Client statuses that will not succeed on an identical retry.
+/// 408 is intentionally excluded (proxy stall → retry). 429 rate-limit and
+/// 402 payment/balance are fail-fast by policy.
+pub(crate) fn is_permanent_client_status(code: u16) -> bool {
+    matches!(
+        code,
+        400 | 401 | 402 | 403 | 404 | 409 | 413 | 415 | 422 | 429 | 431
+    )
+}
+
+/// Prepaid balance / credit / billing exhaustion markers across providers.
+pub(crate) fn is_balance_or_billing_message(lower: &str) -> bool {
+    (lower.contains("insufficient")
+        && (lower.contains("credit")
+            || lower.contains("balance")
+            || lower.contains("quota")
+            || lower.contains("fund")))
+        || lower.contains("insufficient_quota")
+        || lower.contains("insufficient_balance")
+        || lower.contains("insufficient credits")
+        || lower.contains("insufficient balance")
+        || lower.contains("out of credits")
+        || lower.contains("out of credit")
+        || lower.contains("no credits")
+        || lower.contains("credit balance is too low")
+        || lower.contains("credit balance too low")
+        || lower.contains("credit balance")
+        || (lower.contains("billing")
+            && (lower.contains("hard limit")
+                || lower.contains("exceeded")
+                || lower.contains("required")
+                || lower.contains("issue")))
+        || lower.contains("payment required")
+        || lower.contains("payment_required")
+        || (lower.contains("prepaid") && lower.contains("exhaust"))
+        || lower.contains("top up")
+        || lower.contains("top-up")
+        || lower.contains("add credits")
+        || lower.contains("purchase credits")
+        || lower.contains("plan quota exhausted")
+        || (lower.contains("quota exceeded") && !lower.contains("rate"))
+        || lower.contains("exceeded your current quota")
+}
+
+/// Rate-limit wording (with or without HTTP 429).
+pub(crate) fn is_rate_limit_message(lower: &str) -> bool {
+    lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("ratelimit")
+        || lower.contains("too many requests")
+        || lower.contains("tokens per minute")
+        || lower.contains("requests per minute")
+        || (lower.contains("tpm") && lower.contains("limit"))
+        || (lower.contains("rpm") && lower.contains("limit"))
+}
+
+/// Whether an HTTP failure should be retried at the transport layer.
+/// Default is retry; only permanent account/request failures are excluded.
+/// Rate limits (429) and balance/billing (402 + body markers) fail fast.
+pub(crate) fn is_retryable_http_error(status: u16, body: &str) -> bool {
+    if (200..300).contains(&status) {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    // Body markers win even on 5xx — a gateway that wraps billing as 503
+    // still must not burn retries on an empty wallet.
+    if is_balance_or_billing_message(&lower) || is_rate_limit_message(&lower) {
+        return false;
+    }
+    // 408 + 5xx are always worth another attempt (after body denylist above).
+    if status == 408 || status >= 500 {
+        return true;
+    }
+    if is_permanent_client_status(status) {
+        return false;
+    }
+    // Unknown / uncommon non-success statuses: retry.
+    true
+}
+
+/// Message-level fail-fast for mid-stream / post-accept errors: rate limits and
+/// empty-wallet billing. Everything else may still be retried by the stream loop.
+pub(crate) fn is_non_retryable_provider_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    is_rate_limit_message(&lower) || is_balance_or_billing_message(&lower)
 }
 
 pub(crate) fn malformed_response(preview: &str) -> ProviderError {
@@ -189,13 +298,37 @@ mod tests {
         assert!(!auth.retryable);
         assert!(!auth.message.contains("secret"));
 
+        // Rate limits fail fast — do not burn retries on long cooldowns.
         let rate = normalize_http_error(Some(429), "busy");
         assert_eq!(rate.kind, ProviderErrorKind::RateLimit);
-        assert!(rate.retryable);
+        assert!(!rate.retryable);
 
         let context = normalize_http_error(Some(400), "maximum context length exceeded");
         assert_eq!(context.kind, ProviderErrorKind::ContextLength);
         assert!(!context.retryable);
+    }
+
+    #[test]
+    fn balance_and_billing_errors_are_not_retryable() {
+        for (status, body) in [
+            (Some(402), "payment required"),
+            (Some(403), "insufficient credits — top up your balance"),
+            (Some(400), "exceeded your current quota"),
+            (None, "insufficient_quota: you have no credits left"),
+            (Some(500), "credit balance is too low"), // body wins even on 5xx
+        ] {
+            let err = normalize_http_error(status, body);
+            assert_eq!(err.kind, ProviderErrorKind::Balance, "{body}");
+            assert!(!err.retryable, "{body}");
+        }
+        assert!(!is_retryable_http_error(402, "payment required"));
+        assert!(!is_retryable_http_error(429, "rate limit exceeded"));
+        assert!(is_retryable_http_error(503, "temporarily unavailable"));
+        assert!(is_retryable_http_error(408, "gateway timed out"));
+        assert!(!is_retryable_http_error(401, "invalid api key"));
+        // Body denylist wins over 5xx status.
+        assert!(!is_retryable_http_error(503, "credit balance is too low"));
+        assert!(!is_retryable_http_error(500, "rate limit exceeded"));
     }
 
     #[test]

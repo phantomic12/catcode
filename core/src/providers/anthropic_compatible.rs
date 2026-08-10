@@ -172,10 +172,20 @@ pub(crate) fn decode_anthropic_chunk(value: &Value) -> Vec<NormalizedStreamEvent
                 .and_then(Value::as_str)
                 .unwrap_or("anthropic stream error")
                 .to_string();
-            let retryable = error
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|kind| matches!(kind, "overloaded_error" | "rate_limit_error"));
+            let retryable = {
+                use crate::providers::adapter::is_non_retryable_provider_message;
+                let kind = error
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                // Rate-limit / balance / auth / invalid request → fail fast.
+                // Everything else (overloaded, api_error, unknown) → retry.
+                !(is_non_retryable_provider_message(&message)
+                    || matches!(
+                        kind,
+                        "rate_limit_error" | "authentication_error" | "invalid_request_error"
+                    ))
+            };
             events.push(if retryable {
                 NormalizedStreamEvent::RetryableError(message)
             } else {

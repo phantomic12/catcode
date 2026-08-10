@@ -6,8 +6,8 @@
 //! compacted without an embedding model.
 
 use crate::memory::{
-    forget_memory_scoped, get_memory_scoped, save_memory_scoped, scan_memories_scoped,
-    significant_tokens, slugify_public, Importance, MemoryEntry, Scope, SAVE_COUNT_WARN_THRESHOLD,
+    forget_memory_scoped, get_memory_scoped, scan_memories_scoped, significant_tokens,
+    slugify_public, Importance, MemoryEntry, Scope, SAVE_COUNT_WARN_THRESHOLD,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -367,25 +367,20 @@ fn consolidate_cross_scope(workspace: &Path) -> Result<ConsolidateReport, String
         };
         let surv_name = surv.name.clone();
         let loser_slug = slugify_public(&loser.name);
-        let merge_blob = unique_append_content(&surv.content, &loser.content);
-        let desc = if surv.description.trim().is_empty() {
+        let latest = get_memory_scoped(workspace, surv_scope, &surv_name)?;
+        let merge_blob = unique_append_content(&latest.content, &loser.content);
+        let desc = if latest.description.trim().is_empty() {
             loser.description.clone()
         } else {
-            surv.description.clone()
+            latest.description.clone()
         };
-        let mem_type = if surv.mem_type.trim().is_empty() {
+        let mem_type = if latest.mem_type.trim().is_empty() {
             loser.mem_type.clone()
         } else {
-            surv.mem_type.clone()
+            latest.mem_type.clone()
         };
-        crate::memory::save_memory_scoped_with_importance(
-            workspace,
-            surv_scope,
-            &surv_name,
-            &merge_blob,
-            &mem_type,
-            &desc,
-            surv.importance,
+        crate::memory::merge_memory_scoped(
+            workspace, surv_scope, &surv_name, loser, merge_blob, desc, mem_type,
         )?;
         forget_memory_scoped(workspace, loser_scope, &loser_slug)?;
         absorbed.insert(loser_slug.clone());
@@ -424,14 +419,9 @@ fn consolidate_scope(workspace: &Path, scope: Scope) -> Result<ConsolidateReport
     for e in &entries {
         if let Some(cleaned) = dedupe_appended_blocks(&e.content) {
             if cleaned != e.content {
-                let _ = save_memory_scoped(
-                    workspace,
-                    scope,
-                    &e.name,
-                    &cleaned,
-                    &e.mem_type,
-                    &e.description,
-                );
+                let _ = crate::memory::update_memory_scoped(workspace, scope, &e.name, |entry| {
+                    entry.content = cleaned;
+                });
             }
         }
     }
@@ -468,27 +458,30 @@ fn consolidate_scope(workspace: &Path, scope: Scope) -> Result<ConsolidateReport
         let loser_id = slugify_public(&loser_name);
         let survivor_id = slugify_public(&survivor_name);
 
-        let merge_blob = unique_append_content(&survivor.content, &loser.content);
-        let desc = if survivor.description.trim().is_empty() {
+        // Re-read the survivor for every merge. A survivor may absorb several
+        // entries in this pass; using the original scan here would overwrite
+        // content and metadata accumulated by an earlier pair.
+        let latest = get_memory_scoped(workspace, scope, &survivor_name)?;
+        let merge_blob = unique_append_content(&latest.content, &loser.content);
+        let desc = if latest.description.trim().is_empty() {
             loser.description.clone()
         } else {
-            survivor.description.clone()
+            latest.description.clone()
         };
-        let mem_type = if survivor.mem_type.trim().is_empty() {
+        let mem_type = if latest.mem_type.trim().is_empty() {
             loser.mem_type.clone()
         } else {
-            survivor.mem_type.clone()
+            latest.mem_type.clone()
         };
 
-        let winner_importance = survivor.importance;
-        crate::memory::save_memory_scoped_with_importance(
+        crate::memory::merge_memory_scoped(
             workspace,
             scope,
             &survivor_name,
-            &merge_blob,
-            &mem_type,
-            &desc,
-            winner_importance,
+            loser,
+            merge_blob,
+            desc,
+            mem_type,
         )?;
         forget_memory_scoped(workspace, scope, &loser_id)?;
         absorbed.insert(loser_id);

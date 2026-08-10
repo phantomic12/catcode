@@ -1,5 +1,6 @@
 ---
 name: scout
+model: ck-grok-4.5
 description: Fast codebase recon that returns compressed context for handoff
 tools: read_file, grep, glob, list_dir, bash, write_file, memory, intercom
 thinking: low

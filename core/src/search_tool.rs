@@ -310,10 +310,7 @@ fn rank_searx_instances(doc: &Value) -> Vec<String> {
 }
 
 /// Fetch + cache ranked public SearXNG instances from searx.space.
-async fn load_searx_instances(
-    client: &reqwest::Client,
-    cfg: &Config,
-) -> Result<Vec<String>, String> {
+async fn load_searx_instances(cfg: &Config) -> Result<Vec<String>, String> {
     if let Ok(guard) = SEARX_INSTANCE_CACHE.lock() {
         if let Some((gen, at, urls)) = guard.as_ref() {
             if *gen == SEARX_CACHE_GEN && at.elapsed() < SEARX_CACHE_TTL && !urls.is_empty() {
@@ -327,7 +324,7 @@ async fn load_searx_instances(
     }
 
     let (status, body, _trunc) = fetch_html(
-        client,
+        cfg,
         SEARX_SPACE_INSTANCES,
         // searx.space instances.json is ~1-2MB; the default fetch_max_bytes
         // (256KB) truncates it mid-string → "JSON parse failed: EOF at column
@@ -487,7 +484,6 @@ fn classify_searx_response(
 
 /// Try ranked public SearXNG instances (JSON first, then HTML per host).
 async fn try_searxng(
-    client: &reqwest::Client,
     cfg: &Config,
     query: &str,
     count: usize,
@@ -495,7 +491,7 @@ async fn try_searxng(
     byte_limit: usize,
     failures: &mut Vec<String>,
 ) -> Option<(Backend, Attempt)> {
-    let instances = match load_searx_instances(client, cfg).await {
+    let instances = match load_searx_instances(cfg).await {
         Ok(v) => v,
         Err(e) => {
             failures.push(format!("searx.space: {e}"));
@@ -518,7 +514,7 @@ async fn try_searxng(
             continue;
         }
 
-        match fetch_html_with_ct(client, &json_url, byte_limit).await {
+        match fetch_html_with_ct(cfg, &json_url, byte_limit).await {
             Ok((status, body, ct, _trunc)) => {
                 match classify_searx_response(&host, status, &body, &ct, true, count) {
                     Attempt::Hits(h) => {
@@ -543,7 +539,7 @@ async fn try_searxng(
             failures.push(format!("SearXNG ({host}) HTML: skipped ({err})"));
             continue;
         }
-        match fetch_html_with_ct(client, &html_url, byte_limit).await {
+        match fetch_html_with_ct(cfg, &html_url, byte_limit).await {
             Ok((status, body, ct, _trunc)) => {
                 match classify_searx_response(&host, status, &body, &ct, false, count) {
                     Attempt::Hits(h) => {
@@ -758,25 +754,21 @@ fn classify_response(
 
 /// GET `url`, stream up to `byte_limit` bytes, return (status, body, truncated).
 async fn fetch_html(
-    client: &reqwest::Client,
+    cfg: &Config,
     url: &str,
     byte_limit: usize,
 ) -> Result<(reqwest::StatusCode, String, bool), String> {
-    let (status, body, _ct, truncated) = fetch_html_with_ct(client, url, byte_limit).await?;
+    let (status, body, _ct, truncated) = fetch_html_with_ct(cfg, url, byte_limit).await?;
     Ok((status, body, truncated))
 }
 
-/// Like `fetch_html`, but also returns Content-Type (needed to detect JSON).
 async fn fetch_html_with_ct(
-    client: &reqwest::Client,
+    cfg: &Config,
     url: &str,
     byte_limit: usize,
 ) -> Result<(reqwest::StatusCode, String, String, bool), String> {
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    let resp = crate::fetch_tool::send_resolved(parsed, cfg).await?;
     let status = resp.status();
     let ct = resp
         .headers()
@@ -785,12 +777,12 @@ async fn fetch_html_with_ct(
         .unwrap_or("")
         .to_string();
     use futures_util::StreamExt;
-    let mut collected: Vec<u8> = Vec::with_capacity(byte_limit.min(64 * 1024));
+    let mut collected = Vec::with_capacity(byte_limit.min(64 * 1024));
     let mut truncated = false;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("failed to read body: {e}"))?;
-        let room = byte_limit - collected.len();
+        let room = byte_limit.saturating_sub(collected.len());
         if chunk.len() <= room {
             collected.extend_from_slice(&chunk);
         } else {
@@ -799,8 +791,12 @@ async fn fetch_html_with_ct(
             break;
         }
     }
-    let html = String::from_utf8_lossy(&collected).into_owned();
-    Ok((status, html, ct, truncated))
+    Ok((
+        status,
+        String::from_utf8_lossy(&collected).into_owned(),
+        ct,
+        truncated,
+    ))
 }
 
 fn render_hits(query: &str, backend: &Backend, hits: &[Hit], note: Option<&str>) -> Outcome {
@@ -1240,13 +1236,7 @@ fn parse_tavily_results(doc: &Value, limit: usize) -> Vec<Hit> {
 }
 
 /// Query Exa. Bills 1 search/call. 429 -> cooldown; 402/403 -> quota/auth.
-async fn search_exa(
-    client: &reqwest::Client,
-    cfg: &Config,
-    query: &str,
-    count: usize,
-    byte_limit: usize,
-) -> ApiOutcome {
+async fn search_exa(cfg: &Config, query: &str, count: usize, byte_limit: usize) -> ApiOutcome {
     let Some(key) = ApiProvider::Exa.key(cfg) else {
         return ApiOutcome::Fail("Exa: no API key (set EXA_API_KEY or use /search-key exa)".into());
     };
@@ -1259,15 +1249,16 @@ async fn search_exa(
         "type": "auto",
         "contents": { "text": { "maxCharacters": 300 } }
     });
-    let resp = match client
-        .post(ApiProvider::Exa.endpoint())
-        .header("x-api-key", key.as_str())
-        .json(&body)
-        .send()
-        .await
+    let resp = match crate::fetch_tool::post_resolved_json(
+        ApiProvider::Exa.endpoint(),
+        cfg,
+        ("x-api-key", key.as_str()),
+        &body,
+    )
+    .await
     {
         Ok(r) => r,
-        Err(e) => return ApiOutcome::Fail(format!("Exa: request failed: {e}")),
+        Err(e) => return ApiOutcome::Fail(format!("Exa: {e}")),
     };
     let (status, text, hdrs) = match read_capped(resp, byte_limit).await {
         Ok(v) => v,
@@ -1308,13 +1299,7 @@ async fn search_exa(
 }
 
 /// Query Tavily. Bills `usage.credits` (1 for basic depth). 429/432/433 -> quota.
-async fn search_tavily(
-    client: &reqwest::Client,
-    cfg: &Config,
-    query: &str,
-    count: usize,
-    byte_limit: usize,
-) -> ApiOutcome {
+async fn search_tavily(cfg: &Config, query: &str, count: usize, byte_limit: usize) -> ApiOutcome {
     let Some(key) = ApiProvider::Tavily.key(cfg) else {
         return ApiOutcome::Fail(
             "Tavily: no API key (set TAVILY_API_KEY or use /search-key tavily)".into(),
@@ -1332,15 +1317,16 @@ async fn search_tavily(
         "include_raw_content": false,
         "include_usage": true
     });
-    let resp = match client
-        .post(ApiProvider::Tavily.endpoint())
-        .bearer_auth(key.as_str())
-        .json(&body)
-        .send()
-        .await
+    let resp = match crate::fetch_tool::post_resolved_json(
+        ApiProvider::Tavily.endpoint(),
+        cfg,
+        ("authorization", &format!("Bearer {key}")),
+        &body,
+    )
+    .await
     {
         Ok(r) => r,
-        Err(e) => return ApiOutcome::Fail(format!("Tavily: request failed: {e}")),
+        Err(e) => return ApiOutcome::Fail(format!("Tavily: {e}")),
     };
     let (status, text, hdrs) = match read_capped(resp, byte_limit).await {
         Ok(v) => v,
@@ -1388,7 +1374,6 @@ async fn search_tavily(
 }
 
 async fn search_provider(
-    client: &reqwest::Client,
     cfg: &Config,
     p: ApiProvider,
     query: &str,
@@ -1396,8 +1381,8 @@ async fn search_provider(
     byte_limit: usize,
 ) -> ApiOutcome {
     match p {
-        ApiProvider::Exa => search_exa(client, cfg, query, count, byte_limit).await,
-        ApiProvider::Tavily => search_tavily(client, cfg, query, count, byte_limit).await,
+        ApiProvider::Exa => search_exa(cfg, query, count, byte_limit).await,
+        ApiProvider::Tavily => search_tavily(cfg, query, count, byte_limit).await,
     }
 }
 
@@ -1406,7 +1391,6 @@ async fn search_provider(
 /// failure of one, tries the next; returns None only when none are available or
 /// all failed (caller then falls through to the scrape chain).
 async fn try_api_providers(
-    client: &reqwest::Client,
     cfg: &Config,
     query: &str,
     count: usize,
@@ -1424,7 +1408,7 @@ async fn try_api_providers(
     let start = ROUND_ROBIN.fetch_add(1, Ordering::Relaxed) as usize % avail.len();
     for i in 0..avail.len() {
         let p = avail[(start + i) % avail.len()];
-        match search_provider(client, cfg, p, query, count, byte_limit).await {
+        match search_provider(cfg, p, query, count, byte_limit).await {
             ApiOutcome::Hits(hits) => return Some((p.backend(), Attempt::Hits(hits), p)),
             ApiOutcome::Empty => return Some((p.backend(), Attempt::Empty, p)),
             ApiOutcome::RateLimited {
@@ -1481,22 +1465,6 @@ pub async fn execute_web_search(args: &Value, cfg: &Config) -> Outcome {
         // Narrow allowlist may deny searx.space but still allow DDG — continue.
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(
-            cfg.fetch_timeout_secs.max(1),
-        ))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .redirect(crate::fetch_tool::allowlist_redirect_policy(
-            cfg.fetch_allowlist.clone(),
-        ))
-        // Search engines block obvious bot UAs; use a plain browser UA.
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return Outcome::err(format!("web_search: failed to build HTTP client: {e}")),
-    };
-
     let byte_limit = cfg.fetch_max_bytes.max(64 * 1024);
     let mut failures: Vec<String> = Vec::new();
 
@@ -1504,7 +1472,7 @@ pub async fn execute_web_search(args: &Value, cfg: &Config) -> Outcome {
     //    quota-tracked, cooldown-aware. Only falls through to scraping when no
     //    API key is set or every provider is unavailable / over budget.
     if let Some((backend, attempt, provider)) =
-        try_api_providers(&client, cfg, query, count, byte_limit, &mut failures).await
+        try_api_providers(cfg, query, count, byte_limit, &mut failures).await
     {
         match attempt {
             Attempt::Hits(hits) => {
@@ -1521,16 +1489,8 @@ pub async fn execute_web_search(args: &Value, cfg: &Config) -> Outcome {
     }
 
     // 2) SearXNG via searx.space ranking
-    if let Some((backend, attempt)) = try_searxng(
-        &client,
-        cfg,
-        query,
-        count,
-        region,
-        byte_limit,
-        &mut failures,
-    )
-    .await
+    if let Some((backend, attempt)) =
+        try_searxng(cfg, query, count, region, byte_limit, &mut failures).await
     {
         match attempt {
             Attempt::Hits(hits) => return render_hits(query, &backend, &hits, None),
@@ -1551,7 +1511,7 @@ pub async fn execute_web_search(args: &Value, cfg: &Config) -> Outcome {
             continue;
         }
 
-        let (status, html, truncated) = match fetch_html(&client, url, byte_limit).await {
+        let (status, html, truncated) = match fetch_html(cfg, url, byte_limit).await {
             Ok(v) => v,
             Err(e) => {
                 failures.push(format!("{}: {e}", backend.label()));

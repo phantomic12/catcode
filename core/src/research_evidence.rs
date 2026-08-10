@@ -172,17 +172,37 @@ fn filter_tracking_params(query: Option<&str>) -> Option<String> {
     Some(kept.join("&"))
 }
 
-/// Deduplicate sources by canonical URL, preserving the first (highest-quality)
-/// occurrence. Mirrored/syndicated content collapses.
+/// Deduplicate sources by canonical URL, retaining the strongest record.
+/// Fetched sources always beat discovery snippets; quality and primary-source
+/// status break ties. Claims from every duplicate are merged so contradictions
+/// remain visible.
 pub fn dedup_sources(sources: &[EvidenceSource]) -> Vec<EvidenceSource> {
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut out: Vec<EvidenceSource> = Vec::new();
     for s in sources {
-        let key = s.canonical_url.clone();
+        let key = if s.canonical_url.is_empty() {
+            canonicalize_url(&s.url)
+        } else {
+            s.canonical_url.clone()
+        };
         if let Some(&idx) = seen.get(&key) {
-            // Merge claims from the duplicate into the kept record so evidence
-            // is not lost — but never drop contradictory claims.
             let kept = &mut out[idx];
+            let stronger = (
+                s.fetched,
+                s.quality_score,
+                s.primary_source,
+                std::cmp::Reverse(s.source_type.preference_rank()),
+            ) > (
+                kept.fetched,
+                kept.quality_score,
+                kept.primary_source,
+                std::cmp::Reverse(kept.source_type.preference_rank()),
+            );
+            if stronger {
+                let mut replacement = s.clone();
+                replacement.claims = kept.claims.clone();
+                *kept = replacement;
+            }
             for c in &s.claims {
                 if !kept
                     .claims
@@ -443,6 +463,22 @@ mod tests {
             .count();
         assert_eq!(supports, 1);
         assert_eq!(contradicts, 1, "contradictory evidence preserved");
+    }
+
+    #[test]
+    fn dedup_retains_fetched_high_quality_source() {
+        let snippet = src("snippet", "https://x.com/q", false, vec![]);
+        let mut fetched = src(
+            "fetched",
+            "https://x.com/q",
+            true,
+            vec![claim("p", Support::Supports)],
+        );
+        fetched.quality_score = 5;
+        let out = dedup_sources(&[snippet, fetched]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "fetched");
+        assert!(out[0].fetched);
     }
 
     // ---- citation verification ----

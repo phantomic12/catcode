@@ -1,5 +1,6 @@
 ---
 name: oracle
+model: ck-grok-4.5
 description: High-context decision-consistency oracle; challenges assumptions, prevents drift
 tools: read_file, grep, glob, list_dir, bash, intercom
 thinking: high

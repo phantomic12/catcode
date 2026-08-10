@@ -179,6 +179,7 @@ pub(crate) async fn run() {
         last_turn_metrics: Mutex::new(None),
 
         work_state: Mutex::new(WorkState::default()),
+        open_advisories: Mutex::new(Vec::new()),
         goal: Mutex::new(goal::GoalMode::default()),
         goal_deploy_cancel: Mutex::new(None),
         goal_wrapup_active: std::sync::atomic::AtomicBool::new(false),
@@ -189,11 +190,16 @@ pub(crate) async fn run() {
         last_concurrency_note: Mutex::new(None),
         tool_output_cache: Mutex::new(tool_cache::ToolOutputCache::new()),
         enabled_deferred_tools: Mutex::new(std::collections::HashSet::new()),
+        eval_history: Mutex::new(std::collections::HashMap::new()),
         undo_count: std::sync::atomic::AtomicU64::new(0),
         auto_checkpoint_taken: std::sync::atomic::AtomicBool::new(false),
         skill_read_count: std::sync::atomic::AtomicU64::new(0),
         compaction_count: std::sync::atomic::AtomicU64::new(init_stats.compactions),
     });
+    if let Some(path) = state.cfg.read().await.session_file.clone() {
+        state.intercom.configure_journal(&path);
+        state.intercom.replay_undelivered();
+    }
     protocol::install_runtime(&state.runtime);
 
     // Seed runtime API keys from the TUI-persisted `provider_keys`/`api_key`
@@ -726,7 +732,13 @@ pub(crate) async fn run() {
                         .with("ok", json!(true))
                         .with("provider", json!(name)),
                 );
-                state.refresh_models(&client).await;
+                {
+                    let st_rm = state.clone();
+                    let cl_rm = client.clone();
+                    tokio::spawn(async move {
+                        st_rm.refresh_models(&cl_rm).await;
+                    });
+                }
             }
             Command::SetSearchKey { provider, api_key } => {
                 // Set or clear a search-tool API key (Exa / Tavily) for
@@ -741,7 +753,7 @@ pub(crate) async fn run() {
                             "set_search_key: unknown provider '{provider}' (expected 'exa' or 'tavily')"
                         )),
                     ));
-                    return;
+                    continue;
                 }
                 let key = api_key.trim().to_string();
                 let has_key = !key.is_empty();
@@ -763,7 +775,7 @@ pub(crate) async fn run() {
                         "message",
                         json!(format!("set_search_key: failed to persist: {e}")),
                     ));
-                    return;
+                    continue;
                 }
                 state.logger.log(
                     "set_search_key",
@@ -788,7 +800,7 @@ pub(crate) async fn run() {
                             "message",
                             json!(format!("unknown provider '{name}'; not switching")),
                         ));
-                        return;
+                        continue;
                     }
                 }
                 *state.active_provider.write().await = Some(name.clone());
@@ -811,7 +823,13 @@ pub(crate) async fn run() {
                             .with("provider", json!(rp.name)),
                     );
                 }
-                state.refresh_models(&client).await;
+                {
+                    let st_rm = state.clone();
+                    let cl_rm = client.clone();
+                    tokio::spawn(async move {
+                        st_rm.refresh_models(&cl_rm).await;
+                    });
+                }
             }
             Command::ListProviderPresets => {
                 let cfg = state.cfg.read().await;
@@ -840,7 +858,7 @@ pub(crate) async fn run() {
                             "unknown provider preset '{preset}'; available: {available}"
                         )),
                     ));
-                    return;
+                    continue;
                 };
                 // API-key path: require an explicitly pasted key. Do not scan
                 // the environment. Subscription OAuth is plugin-only
@@ -855,7 +873,7 @@ pub(crate) async fn run() {
                             p.label
                         )),
                     ));
-                    return;
+                    continue;
                 }
                 let configs = config::preset_provider_configs(p, key.clone());
                 let name = configs[0].name.clone();
@@ -917,12 +935,21 @@ pub(crate) async fn run() {
                         .with("base_url", json!(rp.base_url))
                         .with("has_key", json!(rp.api_key.is_some())),
                 );
+                // Keyless local presets (Ollama/LM Studio) are usable without a
+                // key — report ok:true so clients do not block send (CORE_REVIEW).
                 emit(
                     &Event::new("authed")
-                        .with("ok", json!(key.is_some()))
-                        .with("provider", json!(name)),
+                        .with("ok", json!(true))
+                        .with("provider", json!(name))
+                        .with("has_key", json!(key.is_some())),
                 );
-                state.refresh_models(&client).await;
+                {
+                    let st_rm = state.clone();
+                    let cl_rm = client.clone();
+                    tokio::spawn(async move {
+                        st_rm.refresh_models(&cl_rm).await;
+                    });
+                }
             }
             Command::Logout { provider } => {
                 // Log out of a provider: drop its runtime key, remove it from the
@@ -957,7 +984,7 @@ pub(crate) async fn run() {
                         &Event::new("error")
                             .with("message", json!(format!("not logged into '{provider}'"))),
                     );
-                    return;
+                    continue;
                 }
                 // Delete plugin OAuth credential files so the provider is fully
                 // logged out (not just its config/runtime key).
@@ -1009,7 +1036,13 @@ pub(crate) async fn run() {
                             .with("provider", json!(rp.name)),
                     );
                 }
-                state.refresh_models(&client).await;
+                {
+                    let st_rm = state.clone();
+                    let cl_rm = client.clone();
+                    tokio::spawn(async move {
+                        st_rm.refresh_models(&cl_rm).await;
+                    });
+                }
             }
             Command::AddCustomProvider {
                 name,
@@ -1032,7 +1065,7 @@ pub(crate) async fn run() {
                         "message",
                         json!("add_custom_provider: name and base_url are required"),
                     ));
-                    return;
+                    continue;
                 }
                 let kind = kind
                     .as_deref()
@@ -1123,7 +1156,13 @@ pub(crate) async fn run() {
                             .with("provider", json!(rp.name)),
                     );
                 }
-                state.refresh_models(&client).await;
+                {
+                    let st_rm = state.clone();
+                    let cl_rm = client.clone();
+                    tokio::spawn(async move {
+                        st_rm.refresh_models(&cl_rm).await;
+                    });
+                }
             }
             Command::DiscoverProviderModels {
                 base_url,
@@ -1218,7 +1257,7 @@ pub(crate) async fn run() {
                             "'{preset}' has no plugin OAuth login — install a plugin that declares oauth.provider_id=\"{preset}\", or paste an API key via /login"
                         )),
                     ));
-                    return;
+                    continue;
                 }
                 let label = state
                     .plugin_manager
@@ -1305,7 +1344,7 @@ pub(crate) async fn run() {
                             "message",
                             json!("No pending OAuth login. Run /login first — the no-browser flow prints a URL; paste its code here with /oauth-code <code>."),
                         ));
-                        return;
+                        continue;
                     }
                 };
                 let preset = pending.kind.clone();
@@ -1321,7 +1360,7 @@ pub(crate) async fn run() {
                             "no plugin OAuth provider for '{preset}' — pending login discarded"
                         )),
                     ));
-                    return;
+                    continue;
                 }
                 let result = state
                     .plugin_manager
@@ -1345,12 +1384,37 @@ pub(crate) async fn run() {
                 }
             }
             Command::SetApproval { mode } => {
-                let new = Approval::parse(&mode);
+                let Some(new) = Approval::try_parse(&mode) else {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!(
+                            "unknown approval mode '{mode}' (use never|destructive|always)"
+                        )),
+                    ));
+                    continue;
+                };
                 state.cfg.write().await.approval = new.clone();
                 state
                     .logger
                     .log("set_approval", json!({ "mode": new.as_str() }));
-                emit(&Event::new("approval_changed").with("mode", json!(new.as_str())));
+                let snap = state.cfg.read().await.clone();
+                let persist_err = config::save_runtime_knobs(&snap)
+                    .err()
+                    .map(|e| e.to_string());
+                emit(
+                    &Event::new("approval_changed")
+                        .with("mode", json!(new.as_str()))
+                        .with("ephemeral", json!(false))
+                        .with("persisted", json!(persist_err.is_none())),
+                );
+                if let Some(e) = persist_err {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!(
+                            "approval changed in-memory but failed to persist: {e}"
+                        )),
+                    ));
+                }
             }
             Command::SetConfig { key, value } => {
                 // Minimal runtime knob setter for the values the TUI settings
@@ -1372,35 +1436,48 @@ pub(crate) async fn run() {
                 let mut cfg = state.cfg.write().await;
                 let out_key = key.clone();
                 let mut out_val = value.clone();
+                let mut applied = false;
                 match key.as_str() {
                     "bash_timeout_secs" => {
                         if let Some(n) = as_u64(&value) {
                             cfg.bash_timeout_secs = n;
                             out_val = json!(n);
+                            applied = true;
                         }
                     }
                     "auto_compact" => {
                         if let Some(b) = as_bool(&value) {
                             cfg.auto_compact = b;
                             out_val = json!(b);
+                            applied = true;
                         }
                     }
                     "advisor.enabled" => {
                         if let Some(b) = as_bool(&value) {
                             cfg.advisor.enabled = b;
                             out_val = json!(b);
+                            applied = true;
                         }
                     }
                     "advisor.subagents" => {
                         if let Some(b) = as_bool(&value) {
                             cfg.advisor.subagents = b;
                             out_val = json!(b);
+                            applied = true;
+                        }
+                    }
+                    "advisor.nudge" => {
+                        if let Some(b) = as_bool(&value) {
+                            cfg.advisor.nudge = b;
+                            out_val = json!(b);
+                            applied = true;
                         }
                     }
                     "advisor.model" => {
                         if let Some(s) = value.as_str() {
                             cfg.advisor.model = (!s.trim().is_empty()).then(|| s.to_string());
                             out_val = json!(cfg.advisor.model);
+                            applied = true;
                         }
                     }
                     "advisor.subagent_model" => {
@@ -1408,17 +1485,23 @@ pub(crate) async fn run() {
                             cfg.advisor.subagent_model =
                                 (!s.trim().is_empty()).then(|| s.to_string());
                             out_val = json!(cfg.advisor.subagent_model);
+                            applied = true;
                         }
                     }
                     "sandbox" => {
                         let mode = value.as_str().map(String::from).or_else(|| {
-                            value
-                                .as_bool()
-                                .map(|b| if b { "firejail".into() } else { "none".into() })
+                            value.as_bool().map(|b| {
+                                if b {
+                                    "microsandbox".into()
+                                } else {
+                                    "none".into()
+                                }
+                            })
                         });
                         if let Some(mode) = mode {
                             cfg.sandbox = config::Sandbox::parse(&mode);
                             out_val = json!(cfg.sandbox.as_str());
+                            applied = true;
                         }
                     }
                     _ => {
@@ -1427,18 +1510,43 @@ pub(crate) async fn run() {
                             &Event::new("error")
                                 .with("message", json!(format!("unknown config key: {key}"))),
                         );
-                        return;
+                        continue;
                     }
+                }
+                if !applied {
+                    drop(cfg);
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!(
+                            "set_config: could not coerce value for key '{out_key}'"
+                        )),
+                    ));
+                    continue;
                 }
                 state
                     .logger
                     .log("set_config", json!({ "key": out_key, "value": out_val }));
+                // Snapshot for persist before drop.
+                let snap = cfg.clone();
                 drop(cfg);
+                let persist_err = config::save_runtime_knobs(&snap)
+                    .err()
+                    .map(|e| e.to_string());
                 emit(
                     &Event::new("config_changed")
                         .with("key", json!(out_key))
-                        .with("value", json!(out_val)),
+                        .with("value", json!(out_val))
+                        .with("ephemeral", json!(false))
+                        .with("persisted", json!(persist_err.is_none())),
                 );
+                if let Some(e) = persist_err {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(format!(
+                            "config '{out_key}' applied in-memory but failed to persist: {e}"
+                        )),
+                    ));
+                }
             }
             Command::GetSandboxStatus => {
                 let report = crate::sandbox::sandbox_status().await;
@@ -1449,39 +1557,57 @@ pub(crate) async fn run() {
                 );
             }
             Command::PrepareSandbox => {
+                // Off the command loop — runtime download can take minutes and
+                // must not freeze abort/approve/send (CORE_REVIEW).
                 emit(
                     &Event::new("sandbox_prepare_progress")
                         .with("phase", json!("downloading-runtime-and-image")),
                 );
-                match crate::sandbox::prepare_sandbox().await {
-                    Ok(()) => {
-                        let report = crate::sandbox::sandbox_status().await;
-                        emit(
-                            &Event::new("sandbox_ready")
-                                .with("ready", json!(report.ready))
-                                .with("report", serde_json::to_value(&report).unwrap_or_default()),
-                        );
+                tokio::spawn(async move {
+                    match crate::sandbox::prepare_sandbox().await {
+                        Ok(()) => {
+                            let report = crate::sandbox::sandbox_status().await;
+                            emit(
+                                &Event::new("sandbox_ready")
+                                    .with("ready", json!(report.ready))
+                                    .with(
+                                        "report",
+                                        serde_json::to_value(&report).unwrap_or_default(),
+                                    ),
+                            );
+                        }
+                        Err(e) => {
+                            emit(
+                                &Event::new("sandbox_error").with("error", json!(e.user_message())),
+                            );
+                        }
                     }
-                    Err(e) => {
-                        emit(&Event::new("sandbox_error").with("error", json!(e.user_message())));
-                    }
+                });
+            }
+            Command::ResetSandbox => match crate::sandbox::reset_sandbox().await {
+                Ok(()) => {
+                    let report = crate::sandbox::sandbox_status().await;
+                    emit(
+                        &Event::new("sandbox_status")
+                            .with("mode", json!(state.cfg.read().await.sandbox.as_str()))
+                            .with("reset", json!(true))
+                            .with("report", serde_json::to_value(&report).unwrap_or_default()),
+                    );
                 }
-            }
-            Command::ResetSandbox => {
-                let _ = crate::sandbox::reset_sandbox().await;
-                let report = crate::sandbox::sandbox_status().await;
-                emit(
-                    &Event::new("sandbox_status")
-                        .with("mode", json!(state.cfg.read().await.sandbox.as_str()))
-                        .with("reset", json!(true))
-                        .with("report", serde_json::to_value(&report).unwrap_or_default()),
-                );
-            }
+                Err(e) => {
+                    emit(
+                        &Event::new("sandbox_error")
+                            .with("error", json!(e.user_message()))
+                            .with("reset", json!(true)),
+                    );
+                }
+            },
             Command::Reset => {
                 cancel_in_flight_turn(&state, CancellationReason::Reset, false).await;
                 state.conversation.lock().await.clear();
                 state.pending_bash.lock().await.clear();
                 state.enabled_deferred_tools.lock().await.clear();
+                state.eval_history.lock().await.clear();
                 state.tool_output_cache.lock().await.invalidate_all();
                 let cfg = state.cfg.read().await;
                 if let Some(p) = cfg.session_file.as_ref() {
@@ -1498,11 +1624,12 @@ pub(crate) async fn run() {
                 state.conversation.lock().await.clear();
                 state.pending_bash.lock().await.clear();
                 state.enabled_deferred_tools.lock().await.clear();
+                state.eval_history.lock().await.clear();
                 state.tool_output_cache.lock().await.invalidate_all();
                 state.invalidate_real_token_baseline().await;
                 clear_work_state(&state).await;
                 reset_stats(&state).await;
-                emit(&Event::new("reset"));
+                emit(&Event::new("cleared").with("persist", json!(true)));
             }
             Command::Undo => {
                 // Count for telemetry (session_stop human_corrections).
@@ -1632,25 +1759,27 @@ pub(crate) async fn run() {
                 }
             }
             Command::Compact { instructions } => {
-                // Force compaction now, then emit a compacted event. Uses the
-                // summarize strategy (honoring any `/compact <instructions>`
-                // override or the configured `compact_instructions`) when an api
-                // key is present; falls back to naive drop-oldest otherwise.
-                let mut messages = state.conversation.lock().await.clone();
-                if messages.len() > 2 {
-                    dispatch_lifecycle(&state, "pre_compact").await;
+                // Off the command loop — provider summarize can take tens of
+                // seconds and must not freeze abort/approve/send (CORE_REVIEW).
+                let st = state.clone();
+                let client_c = client.clone();
+                tokio::spawn(async move {
+                    let mut messages = st.conversation.lock().await.clone();
+                    if messages.len() <= 2 {
+                        emit(&Event::new("info").with("message", json!("nothing to compact yet")));
+                        return;
+                    }
+                    dispatch_lifecycle(&st, "pre_compact").await;
                     let before_est = estimate_messages_tokens(&messages);
-                    // Size the reclaim against the user's actual model window,
-                    // not a hardcoded 200k.
                     let (model_ctx, model_max_tokens) = {
-                        let last = state.last_model.lock().await.clone();
-                        let models = state.models.read().await;
+                        let last = st.last_model.lock().await.clone();
+                        let models = st.models.read().await;
                         last.as_deref()
                             .and_then(|m| models.iter().find(|mi| mi.id == m))
                             .map(|m| (m.context_window as u64, m.max_tokens))
                             .unwrap_or((200_000, 8_192))
                     };
-                    let cfg = state.cfg.read().await.clone();
+                    let cfg = st.cfg.read().await.clone();
                     let policy = context_policy(
                         &messages,
                         model_ctx,
@@ -1670,25 +1799,21 @@ pub(crate) async fn run() {
                                 json!(utilization_pct(before_est, model_ctx)),
                             ),
                     );
-                    let model_name = state.last_model.lock().await.clone().unwrap_or_default();
-                    let rp = state.resolve_provider_for_model(&model_name).await;
-                    // A `/compact <instructions>` override takes precedence over
-                    // the configured default; empty/whitespace falls back.
-                    let instr = match instructions
+                    let model_name = st.last_model.lock().await.clone().unwrap_or_default();
+                    let rp = st.resolve_provider_for_model(&model_name).await;
+                    let instr_owned: Option<String> = match instructions
                         .as_deref()
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                     {
-                        Some(s) => Some(s),
-                        None => cfg.compact_instructions.as_deref(),
+                        Some(s) => Some(s.to_string()),
+                        None => cfg.compact_instructions.clone(),
                     };
-                    // Manual compact is a one-shot — a fresh (never-cancelled)
-                    // token is fine; there's no in-flight turn to abort it.
                     let cancel = CancellationToken::new();
                     let summary_chars = if rp.api_key.is_some() && !model_name.is_empty() {
-                        let mp = state.plugin_manager.memory_provider();
+                        let mp = st.plugin_manager.memory_provider();
                         compact_with_summary(
-                            &client,
+                            &client_c,
                             &cfg,
                             &rp,
                             &model_name,
@@ -1696,7 +1821,7 @@ pub(crate) async fn run() {
                             &cancel,
                             false,
                             model_ctx,
-                            instr,
+                            instr_owned.as_deref(),
                             mp.as_ref(),
                         )
                         .await
@@ -1704,13 +1829,26 @@ pub(crate) async fn run() {
                         compact_conversation(&mut messages, model_ctx);
                         0
                     };
-                    *state.conversation.lock().await = messages.clone();
+                    *st.conversation.lock().await = messages.clone();
                     let after_est = estimate_messages_tokens(&messages);
-                    *state.estimated_tokens.lock().await = after_est;
-                    // Manual compaction rewrote history; drop the stale baseline.
-                    state.invalidate_real_token_baseline().await;
-                    if let Some(p) = state.cfg.read().await.session_file.as_ref() {
-                        session::rewrite(p, &messages);
+                    *st.estimated_tokens.lock().await = after_est;
+                    st.invalidate_real_token_baseline().await;
+                    if let Some(p) = st.cfg.read().await.session_file.as_ref() {
+                        let retained = session::artifact_run_ids_referenced_by_messages(&messages);
+                        let artifacts: Vec<String> = retained
+                            .iter()
+                            .map(|id| format!("artifact://{id}.json"))
+                            .collect();
+                        if let Err(error) = session::append_compaction(
+                            p,
+                            &messages,
+                            "manual compaction",
+                            &artifacts,
+                        ) {
+                            emit(&Event::new("error").with("message", json!(error)));
+                        } else if let Err(error) = session::shake_artifacts(p, &retained) {
+                            emit(&Event::new("error").with("message", json!(error)));
+                        }
                     }
                     emit(
                         &Event::new("compacted")
@@ -1722,8 +1860,7 @@ pub(crate) async fn run() {
                             .with("hard_limit_tokens", json!(policy.hard_limit))
                             .with("within_limit", json!(after_est <= policy.hard_limit)),
                     );
-                    state
-                        .compaction_count
+                    st.compaction_count
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if after_est > policy.hard_limit {
                         emit(&Event::new("error").with(
@@ -1734,9 +1871,7 @@ pub(crate) async fn run() {
                             )),
                         ));
                     }
-                } else {
-                    emit(&Event::new("info").with("message", json!("nothing to compact yet")));
-                }
+                });
             }
             Command::ListSessions => {
                 let (dir, current_name) = {
@@ -1823,6 +1958,38 @@ pub(crate) async fn run() {
                         p = sess_dir.join(&p);
                     }
                 }
+
+                // Confine session paths under the sessions directory (CORE_REVIEW).
+                if let Some(root) = state
+                    .cfg
+                    .read()
+                    .await
+                    .session_file
+                    .as_ref()
+                    .and_then(|sf| sf.parent().map(|p| p.to_path_buf()))
+                {
+                    let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                    let canon_p = p.canonicalize().unwrap_or_else(|_| p.clone());
+                    if !canon_p.starts_with(&canon_root) {
+                        emit(&Event::new("error").with(
+                            "message",
+                            json!(format!(
+                                "session path escapes sessions directory: {}",
+                                p.display()
+                            )),
+                        ));
+                        continue;
+                    }
+                    p = canon_p;
+                } else if p.is_absolute() {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(
+                            "refusing absolute session path without an active sessions directory"
+                        ),
+                    ));
+                    continue;
+                }
                 let loaded = match session::load(&p) {
                     Ok(v) => v,
                     Err(e) => {
@@ -1838,6 +2005,7 @@ pub(crate) async fn run() {
                 *state.conversation.lock().await = loaded.clone();
                 state.pending_bash.lock().await.clear();
                 state.enabled_deferred_tools.lock().await.clear();
+                state.eval_history.lock().await.clear();
                 state.tool_output_cache.lock().await.invalidate_all();
                 // Restore the loaded session's cumulative stats so `/stats` shows
                 // its real totals, not the prior session's.
@@ -1887,6 +2055,38 @@ pub(crate) async fn run() {
                         p = dir.join(&p);
                     }
                 }
+
+                // Confine session paths under the sessions directory (CORE_REVIEW).
+                if let Some(root) = state
+                    .cfg
+                    .read()
+                    .await
+                    .session_file
+                    .as_ref()
+                    .and_then(|sf| sf.parent().map(|d| d.to_path_buf()))
+                {
+                    let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                    let canon_p = p.canonicalize().unwrap_or_else(|_| p.clone());
+                    if !canon_p.starts_with(&canon_root) {
+                        emit(&Event::new("error").with(
+                            "message",
+                            json!(format!(
+                                "session path escapes sessions directory: {}",
+                                p.display()
+                            )),
+                        ));
+                        continue;
+                    }
+                    p = canon_p;
+                } else if p.is_absolute() {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(
+                            "refusing absolute session path without an active sessions directory"
+                        ),
+                    ));
+                    continue;
+                }
                 let title = title.trim();
                 if title.is_empty() {
                     emit(
@@ -1922,6 +2122,38 @@ pub(crate) async fn run() {
                         p = dir.join(&p);
                     }
                 }
+
+                // Confine session paths under the sessions directory (CORE_REVIEW).
+                if let Some(root) = state
+                    .cfg
+                    .read()
+                    .await
+                    .session_file
+                    .as_ref()
+                    .and_then(|sf| sf.parent().map(|d| d.to_path_buf()))
+                {
+                    let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                    let canon_p = p.canonicalize().unwrap_or_else(|_| p.clone());
+                    if !canon_p.starts_with(&canon_root) {
+                        emit(&Event::new("error").with(
+                            "message",
+                            json!(format!(
+                                "session path escapes sessions directory: {}",
+                                p.display()
+                            )),
+                        ));
+                        continue;
+                    }
+                    p = canon_p;
+                } else if p.is_absolute() {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(
+                            "refusing absolute session path without an active sessions directory"
+                        ),
+                    ));
+                    continue;
+                }
                 match session::update_meta(&p, |meta| meta.pinned = pinned) {
                     Ok(_) => emit(
                         &Event::new("session_pinned")
@@ -1947,6 +2179,38 @@ pub(crate) async fn run() {
                     {
                         p = dir.join(&p);
                     }
+                }
+
+                // Confine session paths under the sessions directory (CORE_REVIEW).
+                if let Some(root) = state
+                    .cfg
+                    .read()
+                    .await
+                    .session_file
+                    .as_ref()
+                    .and_then(|sf| sf.parent().map(|d| d.to_path_buf()))
+                {
+                    let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                    let canon_p = p.canonicalize().unwrap_or_else(|_| p.clone());
+                    if !canon_p.starts_with(&canon_root) {
+                        emit(&Event::new("error").with(
+                            "message",
+                            json!(format!(
+                                "session path escapes sessions directory: {}",
+                                p.display()
+                            )),
+                        ));
+                        continue;
+                    }
+                    p = canon_p;
+                } else if p.is_absolute() {
+                    emit(&Event::new("error").with(
+                        "message",
+                        json!(
+                            "refusing absolute session path without an active sessions directory"
+                        ),
+                    ));
+                    continue;
                 }
                 let current = state.cfg.read().await.session_file.clone();
                 if current.as_ref() == Some(&p) {
@@ -2002,6 +2266,7 @@ pub(crate) async fn run() {
                 *state.conversation.lock().await = Vec::new();
                 state.pending_bash.lock().await.clear();
                 state.enabled_deferred_tools.lock().await.clear();
+                state.eval_history.lock().await.clear();
                 state.tool_output_cache.lock().await.invalidate_all();
                 state.invalidate_real_token_baseline().await;
                 clear_work_state(&state).await;
@@ -2115,47 +2380,46 @@ pub(crate) async fn run() {
                 );
             }
             Command::Usage { model } => {
-                // Provider plan/rate-limit usage for the model the user is on.
-                // Resolve model → owning provider → provider-specific usage
-                // endpoint (Umans / Codex / Claude OAuth / …). Read-only.
-                let model_name = match model.filter(|m| !m.is_empty()) {
-                    Some(m) => m,
-                    None => state.last_model.lock().await.clone().unwrap_or_default(),
-                };
-                // When we still have no model (fresh session, never sent), fall
-                // back to the first discovered model so /usage still works.
-                let model_name = if model_name.is_empty() {
-                    state
-                        .models
-                        .read()
-                        .await
-                        .first()
-                        .map(|m| m.id.clone())
-                        .unwrap_or_default()
-                } else {
-                    model_name
-                };
-                let rp = if model_name.is_empty() {
-                    let rp = state.resolved_provider().await;
-                    oauth::enrich_oauth(rp, &client, Some(&state.plugin_manager)).await
-                } else {
-                    state.resolve_provider_for_model(&model_name).await
-                };
-                let usage = providers::registry::adapter_for(&rp)
-                    .usage_status(providers::adapter::ProviderContext {
-                        client: &client,
-                        provider: &rp,
-                    })
-                    .await;
-                let mut ev = Event::new("usage")
-                    .with("provider", json!(rp.name))
-                    .with("provider_kind", json!(rp.kind.to_string()))
-                    .with("model", json!(model_name))
-                    .with("base_url", json!(rp.base_url));
-                for (k, v) in usage.to_event_fields() {
-                    ev = ev.with(&k, v);
-                }
-                emit(&ev);
+                // Off the command loop — usage HTTP must not freeze stdin (CORE_REVIEW).
+                let st = state.clone();
+                let client_u = client.clone();
+                tokio::spawn(async move {
+                    let model_name = match model.filter(|m| !m.is_empty()) {
+                        Some(m) => m,
+                        None => st.last_model.lock().await.clone().unwrap_or_default(),
+                    };
+                    let model_name = if model_name.is_empty() {
+                        st.models
+                            .read()
+                            .await
+                            .first()
+                            .map(|m| m.id.clone())
+                            .unwrap_or_default()
+                    } else {
+                        model_name
+                    };
+                    let rp = if model_name.is_empty() {
+                        let rp = st.resolved_provider().await;
+                        oauth::enrich_oauth(rp, &client_u, Some(&st.plugin_manager)).await
+                    } else {
+                        st.resolve_provider_for_model(&model_name).await
+                    };
+                    let usage = providers::registry::adapter_for(&rp)
+                        .usage_status(providers::adapter::ProviderContext {
+                            client: &client_u,
+                            provider: &rp,
+                        })
+                        .await;
+                    let mut ev = Event::new("usage")
+                        .with("provider", json!(rp.name))
+                        .with("provider_kind", json!(rp.kind.to_string()))
+                        .with("model", json!(model_name))
+                        .with("base_url", json!(rp.base_url));
+                    for (k, v) in usage.to_event_fields() {
+                        ev = ev.with(&k, v);
+                    }
+                    emit(&ev);
+                });
             }
             Command::Context => {
                 // Token-breakdown: where is the context window being spent?
@@ -2356,6 +2620,13 @@ pub(crate) async fn run() {
             }
             Command::ReloadPlugins => {
                 let summary = state.plugin_manager.reload();
+                // Re-apply config plugins_disabled after reload (CORE_REVIEW).
+                {
+                    let disabled = state.cfg.read().await.plugins_disabled.clone();
+                    for name in &disabled {
+                        let _ = state.plugin_manager.disable(name);
+                    }
+                }
                 let plugins = state.plugin_manager.list();
                 let mut entries: Vec<Value> = plugins
                     .values()
@@ -3082,7 +3353,12 @@ pub(crate) async fn run() {
                 command,
                 exclude_from_context,
             } => {
-                handle_user_bash(&state, command, exclude_from_context).await;
+                // Off the command loop: sudo waits on `sudo_reply`, which is
+                // delivered on this same loop — awaiting here deadlocks.
+                let st = state.clone();
+                tokio::spawn(async move {
+                    handle_user_bash(&st, command, exclude_from_context).await;
+                });
             }
             Command::RefreshMemory => {
                 let msg = refresh_memory_injection(&state).await;
@@ -3351,6 +3627,199 @@ pub(crate) async fn run() {
                     ));
                 }
             }
+            Command::JobList => {
+                let mut runs: std::collections::BTreeMap<String, Value> = state
+                    .subagent_runs
+                    .lock()
+                    .await
+                    .values()
+                    .map(|run| {
+                        (
+                            run.id.clone(),
+                            json!({
+                                "run_id": run.id,
+                                "parent_run_id": run.parent_run_id,
+                                "state": run.state,
+                                "started_at": run.started_at,
+                                "ended_at": run.ended_at,
+                                "summary": run.summary,
+                            }),
+                        )
+                    })
+                    .collect();
+                if let Some(path) = state.cfg.read().await.session_file.clone() {
+                    if let Ok(report) = session::load_report(&path) {
+                        for delivery in report.parent_deliveries {
+                            if let Some(artifact) =
+                                session::read_job_artifact(&path, &delivery.run_id)
+                            {
+                                runs.entry(delivery.run_id.clone()).or_insert(artifact);
+                            }
+                        }
+                    }
+                    if let Ok(entries) = std::fs::read_dir(
+                        path.parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .join("artifacts"),
+                    ) {
+                        for entry in entries.flatten() {
+                            if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+                                continue;
+                            }
+                            if let Ok(raw) = std::fs::read_to_string(entry.path()) {
+                                if let Ok(artifact) = serde_json::from_str::<Value>(&raw) {
+                                    if let Some(id) = artifact.get("run_id").and_then(Value::as_str)
+                                    {
+                                        runs.entry(id.to_string()).or_insert(artifact);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                emit(
+                    &Event::new("job_list")
+                        .with("runs", json!(runs.into_values().collect::<Vec<_>>())),
+                );
+            }
+            Command::JobStatus { run_id } => {
+                let run = state.subagent_runs.lock().await.get(&run_id).cloned();
+                if let Some(run) = run {
+                    emit(
+                        &Event::new("job_status")
+                            .with("run_id", json!(run.id))
+                            .with("parent_run_id", json!(run.parent_run_id))
+                            .with("state", json!(run.state))
+                            .with("started_at", json!(run.started_at))
+                            .with("ended_at", json!(run.ended_at))
+                            .with("summary", json!(run.summary)),
+                    );
+                } else if let Some(path) = state.cfg.read().await.session_file.clone() {
+                    if let Some(artifact) = session::read_job_artifact(&path, &run_id) {
+                        emit(
+                            &Event::new("job_status")
+                                .with("run_id", json!(run_id))
+                                .with("artifact", artifact),
+                        );
+                    } else {
+                        emit(
+                            &Event::new("error")
+                                .with("message", json!(format!("unknown job {run_id}"))),
+                        );
+                    }
+                } else {
+                    emit(
+                        &Event::new("error")
+                            .with("message", json!(format!("unknown job {run_id}"))),
+                    );
+                }
+            }
+            Command::JobCancel { run_id } => {
+                let cancel = state
+                    .subagent_runs
+                    .lock()
+                    .await
+                    .get(&run_id)
+                    .and_then(|run| run.cancel.clone());
+                if let Some(cancel) = cancel {
+                    cancel.cancel();
+                    emit(&Event::new("job_cancel_requested").with("run_id", json!(run_id)));
+                } else if let Some(path) = state.cfg.read().await.session_file.clone() {
+                    if let Some(artifact) = session::read_job_artifact(&path, &run_id) {
+                        emit(
+                            &Event::new("job_cancel_result")
+                                .with("run_id", json!(run_id))
+                                .with("artifact", artifact),
+                        );
+                    } else {
+                        emit(
+                            &Event::new("error")
+                                .with("message", json!(format!("job {run_id} is not live"))),
+                        );
+                    }
+                } else {
+                    emit(
+                        &Event::new("error")
+                            .with("message", json!(format!("job {run_id} is not live"))),
+                    );
+                }
+            }
+            Command::JobWait { run_id, timeout_ms } => {
+                // Off the command loop so abort/approve/send keep flowing while
+                // we poll. Cap raised to 10m; still clamp absurd values.
+                let st = state.clone();
+                let timeout = timeout_ms.unwrap_or(30_000).min(600_000);
+                tokio::spawn(async move {
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(timeout);
+                    loop {
+                        let run = st.subagent_runs.lock().await.get(&run_id).cloned();
+                        if let Some(run) = run {
+                            if run.state != "running" && run.state != "paused" {
+                                emit(
+                                    &Event::new("job_wait_result")
+                                        .with("run_id", json!(run.id))
+                                        .with("state", json!(run.state))
+                                        .with("summary", json!(run.summary)),
+                                );
+                                break;
+                            }
+                        } else if let Some(path) = st.cfg.read().await.session_file.clone() {
+                            if let Some(artifact) = session::read_job_artifact(&path, &run_id) {
+                                emit(
+                                    &Event::new("job_wait_result")
+                                        .with("run_id", json!(run_id))
+                                        .with("artifact", artifact),
+                                );
+                                break;
+                            }
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            emit(&Event::new("job_wait_timeout").with("run_id", json!(run_id)));
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                });
+            }
+            Command::SessionTree => {
+                if let Some(path) = state.cfg.read().await.session_file.clone() {
+                    emit(&Event::new("session_tree").with("tree", session::session_tree(&path)));
+                } else {
+                    emit(&Event::new("error").with("message", json!("no active session")));
+                }
+            }
+            Command::SessionBranch { entry_id } => {
+                if let Some(path) = state.cfg.read().await.session_file.clone() {
+                    match session::create_branch(&path, &entry_id) {
+                        Ok(branch_id) => {
+                            let loaded = session::load(&path).unwrap_or_default();
+                            *state.conversation.lock().await = loaded.clone();
+                            let est = estimate_messages_tokens(&loaded);
+                            *state.estimated_tokens.lock().await = est;
+                            state.invalidate_real_token_baseline().await;
+                            let visible: Vec<Value> = loaded
+                                .iter()
+                                .filter(|m| !m.is_system())
+                                .map(Value::from)
+                                .collect();
+                            emit(
+                                &Event::new("history")
+                                    .with("messages", json!(visible))
+                                    .with("tokens_in", json!(est)),
+                            );
+                            emit(
+                                &Event::new("session_branch")
+                                    .with("entry_id", json!(branch_id))
+                                    .with("parent_id", json!(entry_id)),
+                            );
+                        }
+                        Err(error) => emit(&Event::new("error").with("message", json!(error))),
+                    }
+                } else {
+                    emit(&Event::new("error").with("message", json!("no active session")));
+                }
+            }
             Command::AskReply {
                 request_id,
                 answers,
@@ -3405,7 +3874,10 @@ pub(crate) async fn run() {
                     }
                 }
                 cancel_in_flight_turn(&state, CancellationReason::Abort, false).await;
+                // Always pair aborted+done so clients that gate "working" on
+                // `done` do not stick after Esc on an already-idle core.
                 emit(&Event::new("aborted"));
+                emit(&Event::new("done"));
             }
             Command::ClearQueue => {
                 // Drop a queued follow-up/steer but leave the running turn alone —

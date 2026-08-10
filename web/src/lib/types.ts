@@ -31,6 +31,11 @@ export interface ModelInfo {
   /** Thinking levels the model advertises (e.g. ["low","medium","high"]). */
   thinking_levels: string[];
   vision: boolean;
+  /** Accepted and emitted content modalities. */
+  input?: string[];
+  output?: string[];
+  tool_call?: boolean;
+  structured_output?: boolean;
   /** Owning provider name (e.g. "openai", "gemini", "anthropic"), populated by
    * the core's multi-provider aggregation so a turn routes to the right endpoint
    * when multiple providers are logged in. Empty for legacy single-provider models. */
@@ -59,6 +64,10 @@ export interface ModelOverride {
   max_tokens?: number;
   reasoning?: boolean;
   thinking_levels?: string[];
+  input?: string[];
+  output?: string[];
+  tool_call?: boolean;
+  structured_output?: boolean;
 }
 
 /** Fields for the add_custom_provider form — full config.json parity. */
@@ -684,6 +693,10 @@ export type CoreEvent =
       model?: string;
       severity?: string;
       message?: string;
+      finding?: string;
+      where?: string;
+      action?: string;
+      check?: string;
     }
   | {
       type: "advisor_status";
@@ -691,6 +704,8 @@ export type CoreEvent =
       advisor?: string;
       state?: string;
       model?: string;
+      reason?: string;
+      elapsed_ms?: number;
     }
   | {
       type: "protocol_hello";
@@ -805,16 +820,16 @@ export type CoreEvent =
   | ({ type: "context_breakdown" } & ContextBreakdown)
   | ({ type: "usage" } & UsageSnapshot)
   | { type: "agents"; agents: AgentInfo[] }
-  | { type: "http_retry"; attempt?: number; status?: number; backoff_ms?: number; reason?: string }
+  | { type: "http_retry"; attempt?: number; status?: number; backoff_ms?: number; reason?: string; discard_partial?: boolean | string }
   | { type: "sessions"; sessions: SessionEntry[]; files: string[] }
   | { type: "session_status"; sessions: LiveSessionStatus[] }
   | Stats
   | { type: "history"; messages: unknown[]; tokens_in?: number }
   | { type: "done" }
   | { type: "aborted" }
-  | { type: "advisor_note"; scope: string; advisor: string; model: string; severity: string; message: string }
-  | { type: "advisor_status"; scope: string; advisor: string; state: string; model?: string }
   | { type: "reset" }
+  | { type: "cleared"; persist?: boolean }
+  | { type: "discard_partial" }
   | { type: "error"; message: string }
   | { type: "info"; message: string }
   | { type: "steer"; prompt: string }
@@ -877,7 +892,40 @@ export type CoreEvent =
   | { type: "sandbox_status"; mode: SandboxMode; report: SandboxPreflightReport }
   | { type: "sandbox_prepare_progress"; phase: string }
   | { type: "sandbox_ready"; ready: boolean; report?: SandboxPreflightReport }
-  | { type: "sandbox_error"; error: string };
+  | { type: "job_cancel_result"; run_id: string; artifact: unknown }
+  | { type: "subagent_delivery"; run_id: string; parent_run_id?: string | null; state: string }
+  | { type: "sandbox_error"; error: string }
+  | { type: "job_list"; runs: Array<{ run_id: string; parent_run_id?: string | null; state: string; summary?: string | null }> }
+  | { type: "job_status" | "job_wait_result" | "job_cancel_requested" | "job_wait_timeout"; run_id: string; parent_run_id?: string | null; state?: string; summary?: string | null }
+  | { type: "session_tree"; tree: SessionTreeSnapshot }
+  | { type: "session_branch"; entry_id: string; parent_id?: string };
+
+export interface SessionTreeEntry {
+  id: string;
+  parent_id?: string | null;
+  title?: string;
+  summary?: string;
+  branch?: string;
+  created_at?: number;
+}
+
+export interface SessionTreeSnapshot {
+  leaf?: string | null;
+  ancestry?: string[];
+  siblings?: string[];
+  entries: SessionTreeEntry[];
+}
+
+export interface ProcessStatusView {
+  name: string;
+  pid: number;
+  argv: string[];
+  cwd: string;
+  started_at_ms: number;
+  state: "starting" | "ready" | "exited" | string;
+}
+
+export interface ProcessLogsView { name: string; text: string; truncated?: boolean }
 
 /** Core commands (client → server → core stdin). A typed subset. */
 export type CoreCommand =
@@ -939,6 +987,10 @@ export type CoreCommand =
   | { type: "undo" }
   // ── Subagent / intercom ──
   | { type: "intercom_reply"; request_id: string; reply: string }
+  | { type: "job_list" }
+  | { type: "job_status" | "job_cancel" | "job_wait"; run_id: string; timeout_ms?: number }
+  | { type: "session_tree" }
+  | { type: "session_branch"; entry_id: string }
   // ── Ask tool ──
   | { type: "ask_reply"; request_id: string; answers: Record<string, string> | null }
   // ── Sudo passthrough (bash command invokes sudo) ──
@@ -1123,7 +1175,21 @@ export interface GoalMsg {
   ts: number;
 }
 
-export type UIMessage = UserMsg | AssistantMsg | ToolMsg | BashMsg | GoalMsg;
+/** Durable watchdog lifecycle/finding card in the transcript. */
+export interface AdvisorMsg {
+  id: string;
+  role: "advisor";
+  scope: string;
+  advisor: string;
+  model: string;
+  state: string;
+  severity?: string;
+  text?: string;
+  elapsedMs?: number;
+  ts: number;
+}
+
+export type UIMessage = UserMsg | AssistantMsg | ToolMsg | BashMsg | GoalMsg | AdvisorMsg;
 
 export interface Toast {
   id: string;
@@ -1213,11 +1279,20 @@ export interface AgentState {
   marketplaceResults: MarketplaceSkill[];
   /** Discoverable subagents from core `agents` events. */
   availableAgents: AgentInfo[];
+  /** Intercom transcript retained for the subagent panel. */
+  intercomLog: IntercomEntry[];
+  /** Project plugin trust decisions awaiting the user. */
+  pendingPluginTrust: PluginTrustEntry[] | null;
   pendingIntercom: IntercomPrompt | null;
   pendingOauth: OauthPrompt | null;
-  intercomLog: IntercomEntry[];
   /** Live subagent runs keyed by run_id — the SubagentsPanel list + drill-in chat. */
   subagentRuns: Record<string, SubagentRunView>;
+  /** Durable job/process tree snapshots from job_list/status events. */
+  jobTree: Record<string, { runId: string; parentRunId?: string | null; state: string; summary?: string | null }>;
+  sessionTree: unknown | null;
+  /** Named-process snapshots decoded from ordinary `process` tool results. */
+  processes: Record<string, ProcessStatusView>;
+  processLogs: Record<string, ProcessLogsView>;
   visionConfig: VisionConfig | null;
   /** Last `/context` breakdown for the Diagnostics panel. */
   contextBreakdown: ContextBreakdown | null;

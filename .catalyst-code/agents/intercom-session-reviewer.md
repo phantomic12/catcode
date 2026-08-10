@@ -1,5 +1,6 @@
 ---
 name: intercom-session-reviewer
+model: ck-grok-4.5
 description: Review intercom.rs + config.rs + protocol.rs — intercom, config, wire protocol
 build-test-release: true
 allow:

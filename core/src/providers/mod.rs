@@ -120,7 +120,7 @@ mod fixture_tests {
         .unwrap();
         let cases = [
             ("authentication", ProviderErrorKind::Authentication, false),
-            ("rate_limit", ProviderErrorKind::RateLimit, true),
+            ("rate_limit", ProviderErrorKind::RateLimit, false),
             ("server", ProviderErrorKind::Server, true),
             ("context", ProviderErrorKind::ContextLength, false),
         ];

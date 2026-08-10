@@ -110,9 +110,24 @@ impl StuckDetector {
     pub(crate) fn record(&mut self, name: &str, args: &str) {
         let sig = tool_signature(name, args);
         let mutating = is_mutating_tool(name);
-        // `finish` never counts as a repetition step.
-        if sig != "finish" {
-            // no per-episode counter needed — escalation uses nudge_count.
+        // `finish` never counts as a repetition step — it ends the episode.
+        if sig == "finish" {
+            self.recent.clear();
+            self.recent_mutating.clear();
+            self.nudge_count = 0;
+            return;
+        }
+        // Progress (mutation) or a *different* signature than the current
+        // spin ends the stuck episode — reset escalation so a later
+        // independent spin starts at threshold 3 again (CORE_REVIEW).
+        // Do NOT reset when the window is empty (post-nudge): that would
+        // wipe the escalated threshold before the next spin re-triggers.
+        if mutating {
+            self.nudge_count = 0;
+        } else if let Some(last) = self.recent.last() {
+            if last != &sig {
+                self.nudge_count = 0;
+            }
         }
         self.recent.push(sig);
         self.recent_mutating.push(mutating);

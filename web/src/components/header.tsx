@@ -5,6 +5,7 @@
 // the secondary controls on small screens.
 
 import { useState } from "react";
+import { buildSharedSessionUrl } from "@/lib/session-share";
 import type { Metrics, UmansConc, ModelInfo, CostUpdate, NotificationItem } from "@/lib/types";
 import { formatTokens, formatTps, formatMs, basename } from "@/lib/format";
 import { useOutsideClose } from "@/lib/use-outside-close";
@@ -20,6 +21,7 @@ import {
   RefreshIcon,
   LayoutIdeIcon,
   BoltIcon,
+  CopyIcon,
 } from "./icons";
 
 interface Props {
@@ -73,6 +75,7 @@ const ALL_LEVELS = ["off", "low", "medium", "high", "xhigh", "max"];
 
 export function Header(props: Props) {
   const [modelOpen, setModelOpen] = useState(false);
+  const [shareCopied, setShareCopied] = useState(false);
   const [thinkOpen, setThinkOpen] = useState(false);
   const [approvOpen, setApprovOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
@@ -348,6 +351,27 @@ export function Header(props: Props) {
 
       {/* Metrics + connection */}
       <div className="flex items-center gap-1 pl-1">
+        {props.sessionFile && props.workspace && (
+          <button
+            type="button"
+            onClick={() => {
+              const url = buildSharedSessionUrl(
+                window.location.origin,
+                props.sessionFile!,
+                props.workspace,
+              );
+              void navigator.clipboard?.writeText(url).then(() => {
+                setShareCopied(true);
+                window.setTimeout(() => setShareCopied(false), 1400);
+              });
+            }}
+            className="focus-ring flex h-8 w-8 items-center justify-center rounded-sm text-ink-400 transition-colors hover:bg-ink-850 hover:text-ink-100 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
+            title={shareCopied ? "Session link copied" : "Copy authenticated session link"}
+            aria-label={shareCopied ? "Session link copied" : "Copy session link"}
+          >
+            <CopyIcon width={13} height={13} className={shareCopied ? "text-success" : undefined} />
+          </button>
+        )}
         <NotificationCenter
           notifications={props.notifications}
           currentWorkspace={props.workspace}

@@ -285,6 +285,7 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			s.coreAutoCompact = s.settings.AutoCompact
 		}
 		s.sendCore(map[string]any{"type": "set_config", "key": "advisor.enabled", "value": s.settings.AdvisorEnabled})
+		s.sendCore(map[string]any{"type": "set_config", "key": "advisor.nudge", "value": s.settings.AdvisorNudge})
 		s.sendCore(map[string]any{"type": "set_config", "key": "advisor.subagents", "value": s.settings.AdvisorSubagents})
 		if s.settings.AdvisorModel != "" {
 			s.sendCore(map[string]any{"type": "set_config", "key": "advisor.model", "value": s.settings.AdvisorModel})
@@ -678,6 +679,31 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		s.layout()
 		s.logInfo("conversation reset")
 
+	case "cleared":
+		// In-memory clear from core `/clear` (session file may still persist).
+		s.disarmAbortTimeout()
+		s.clearBlockingPrompts()
+		s.busy = false
+		s.blocks = nil
+		s.cur = nil
+		s.contextTokens = 0
+		s.lastCachePct = 0
+		s.tokensSaved = 0
+		s.summaryChars = 0
+		s.subProgress = nil
+		s.todos = nil
+		s.queued = nil
+		s.queuedNext = false
+		s.follow = true
+		s.invalidateAll()
+		s.layout()
+		s.logInfo("conversation cleared")
+
+	case "discard_partial":
+		// Top-level stream discard (Codex retry path); same effect as
+		// http_retry with discard_partial=true.
+		s.discardPartialStreamOutput()
+
 	case "history":
 		// Loading a session / undo is a conversation boundary — clear any in-flight
 		// turn/queue so a mid-turn /load or /sessions doesn't wedge the TUI with
@@ -954,19 +980,29 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 		// paints View after this Update; skip transcript renderBlocks/SetContent.
 
 	case "advisor_note":
-		severity := ev.get("severity")
-		msg := ev.get("message")
-		if msg != "" {
-			if severity == "concern" || severity == "blocker" {
-				s.logWarn("Advisor (" + severity + "): " + msg)
-			} else {
-				s.logInfo("Advisor: " + msg)
-			}
+		detail := ev.get("finding")
+		if detail == "" {
+			detail = ev.get("message")
 		}
+		s.recordAdvisorReview(
+			ev.get("scope"), ev.get("advisor"), ev.get("model"),
+			"finding", detail, ev.get("severity"), 0,
+		)
 
 	case "advisor_status":
-		// Reviewing/no-key state is available to protocol clients; keep the TUI
-		// quiet during normal reviews and surface only actionable notes.
+		state := ev.get("state")
+		if state == "duplicate" {
+			break
+		}
+		detail := ev.get("reason")
+		var elapsed time.Duration
+		if ms, err := strconv.ParseInt(ev.get("elapsed_ms"), 10, 64); err == nil && ms > 0 {
+			elapsed = time.Duration(ms) * time.Millisecond
+		}
+		s.recordAdvisorReview(
+			ev.get("scope"), ev.get("advisor"), ev.get("model"),
+			state, detail, "", elapsed,
+		)
 	case "info":
 		// Informational notices from the core (first-run staging, subagent
 		// lifecycle, plugin handoffs, etc.). Surface them in the transcript.
@@ -1338,6 +1374,14 @@ func (s *session) handleCoreEvent(ev *coreEvent) tea.Cmd {
 			rows = append(rows, mutedStyle.Render(id)+"  "+baseStyle.Render(text)+tags)
 		}
 		s.logRaw(strings.Join(rows, "\n"))
+	case "job_status", "job_wait_result", "job_wait_timeout", "job_list", "job_cancel_requested":
+		s.jobStatusRaw = append(s.jobStatusRaw[:0], ev.Raw...)
+		s.logInfo("job: " + string(ev.Raw))
+	case "session_tree":
+		s.sessionTreeRaw = append(s.sessionTreeRaw[:0], ev.Raw...)
+		s.logInfo("session tree: " + string(ev.Raw))
+	case "session_branch":
+		s.logSuccess("switched session branch: " + ev.get("entry_id"))
 	case "error":
 		msg := ev.get("message")
 		// Capture turn-started before logError — pushing an error block finalizes
@@ -2631,6 +2675,40 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			}
 			s.logInfo(fmt.Sprintf("model: %s", s.models[idx].ID))
 			return nil
+		case "/jobs":
+			s.sendCore(map[string]any{"type": "job_list"})
+			return nil
+		case "/tree":
+			s.sendCore(map[string]any{"type": "session_tree"})
+			return nil
+		case "/branch":
+			if len(parts) != 2 {
+				s.logError("usage: /branch <entry-id>")
+				return nil
+			}
+			s.sendCore(map[string]any{"type": "session_branch", "entry_id": parts[1]})
+			return nil
+		case "/job":
+			if len(parts) != 2 {
+				s.logError("usage: /job <run-id>")
+				return nil
+			}
+			s.sendCore(map[string]any{"type": "job_status", "run_id": parts[1]})
+			return nil
+		case "/wait-job":
+			if len(parts) != 2 {
+				s.logError("usage: /wait-job <run-id>")
+				return nil
+			}
+			s.sendCore(map[string]any{"type": "job_wait", "run_id": parts[1]})
+			return nil
+		case "/cancel-job":
+			if len(parts) != 2 {
+				s.logError("usage: /cancel-job <run-id>")
+				return nil
+			}
+			s.sendCore(map[string]any{"type": "job_cancel", "run_id": parts[1]})
+			return nil
 		case "/reset":
 			s.openDestructiveConfirm("reset", "", "wipe the conversation and its session file")
 			return nil
@@ -3083,6 +3161,15 @@ func (s *session) handleUserLine(text string) tea.Cmd {
 			// startup when undecided plugins exist).
 			s.sendCore(map[string]any{"type": "plugin_trust_prompt"})
 			s.logInfo("checking plugin trust…")
+			return nil
+		case "/control":
+			prefill := ""
+			if len(parts) >= 2 {
+				prefill = strings.TrimSpace(strings.TrimPrefix(text, parts[0]))
+			}
+			s.openGoalModal(prefill)
+			s.goalDraft.ceoMode = true
+			s.goalDraft.reviewBeforeDeploy = false
 			return nil
 		case "/goal":
 			prefill := ""

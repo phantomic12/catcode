@@ -290,8 +290,10 @@ const SECRET_PATTERNS: &[&str] = &[
     "_SECRET",
     "_PASSWORD",
     "_API_KEY",
+    "_APIKEY",
     "_CREDENTIAL",
     "_KEY",
+    "_PASS",
 ];
 
 /// Whether a variable name matches a secret-bearing pattern. Conservative:
@@ -323,6 +325,17 @@ pub fn is_secret_var(name: &str) -> bool {
             | "DOCKER_HOST"
             | "DOCKER_CONFIG"
             | "KUBECONFIG"
+            | "PGPASSWORD"
+            | "PGUSER"
+            | "MYSQL_PWD"
+            | "DATABASE_URL"
+            | "REDIS_URL"
+            | "OPENAI_APIKEY"
+            | "OPENAI_API_KEY"
+            | "ANTHROPIC_API_KEY"
+            | "TOKEN"
+            | "SECRET"
+            | "PASSWORD"
     )
 }
 
@@ -369,10 +382,10 @@ pub fn effective_cwd(cfg: &Config, rel: &str) -> Result<PathBuf, String> {
 /// sandboxed, Windows users are told the guest is Linux `bash` (not PowerShell).
 pub fn bash_tool_description() -> &'static str {
     if is_sandbox_enabled() {
-        return "Run a bash command inside the sandbox microVM (Linux guest). The workspace is mounted at /workspace; stdout+stderr are captured, truncated to 32KB, default 30s timeout. Pass timeout for slow builds. Keep commands short; for complex logic write a script with write_file and run `bash script.sh`. The environment is isolated: host secrets and the host home directory are not available.";
+        return "Run a bash command inside the sandbox microVM (Linux guest). The workspace is mounted at /workspace; stdout+stderr are captured, truncated to 32KB, default 30s timeout. Pass timeout for slow builds. Keep commands short; for complex logic write a script with write_file and run `bash script.sh`. Do not use for git status/diff/log/show, grep/rg, cat/sed -n, ls, or find when native tools apply. The environment is isolated: host secrets and the host home directory are not available.";
     }
     match effective_shell_kind() {
-        ShellKind::Posix => "Run a bash command in the workspace (stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a script with write_file and run bash script.sh.",
+        ShellKind::Posix => "Run a bash command in the workspace (stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a script with write_file and run bash script.sh. Do not use for git status/diff/log/show, grep/rg, cat/sed -n, ls, or find when native tools apply.",
         ShellKind::PowerShell => "Run a shell command in the workspace (PowerShell; stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a .ps1 script with write_file and run `powershell -File script.ps1`.",
         ShellKind::Cmd => "Run a shell command in the workspace (cmd.exe; stdout+stderr, truncated to 32KB, default 30s timeout). Pass timeout for slow builds. Keep commands short; for complex logic write a .cmd/.bat script with write_file and run it via `cmd /c script.cmd`. Use cmd.exe syntax (`%VAR%`, `&&`, `dir`), not PowerShell.",
     }

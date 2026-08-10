@@ -12,7 +12,8 @@ use crate::message::{self, Message};
 use crate::protocol::ModelInfo;
 use crate::protocol::{emit, Event};
 use crate::providers::adapter::{
-    malformed_response, ProviderAdapter, ProviderProtocol, ProviderRequest,
+    is_non_retryable_provider_message, is_retryable_http_error, malformed_response,
+    ProviderAdapter, ProviderProtocol, ProviderRequest,
 };
 pub use crate::providers::discovery::*;
 use crate::providers::registry::{adapter_for, protocol_for};
@@ -1068,6 +1069,67 @@ async fn stream_turn_codex(
     prompt_est: u64,
     quiet: bool,
 ) -> Result<(Value, String, u64, u64, u64), String> {
+    // Outer stream retry parity with OpenAI/Anthropic paths (CORE_REVIEW).
+    let max_attempts = 3u32;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match stream_turn_codex_once(
+            client,
+            provider,
+            idle_timeout_secs,
+            model,
+            messages,
+            tools,
+            reasoning_effort,
+            thinking_levels,
+            max_tokens,
+            cancel,
+            timer,
+            prompt_est,
+            quiet,
+        )
+        .await
+        {
+            Ok(v) => return Ok(v),
+            Err(e) if e == "aborted" => return Err(e),
+            Err(e) => {
+                let emitted = timer.first_token.is_some();
+                if !should_retry_stream_attempt(&e, emitted, attempt, max_attempts) {
+                    return Err(e);
+                }
+                let backoff = backoff_ms(attempt, None);
+                let reason = if emitted {
+                    "retryable codex stream error after partial output"
+                } else {
+                    "codex stream error before first token"
+                };
+                emit_stream_retry(attempt, reason, backoff, emitted);
+                if emitted && !quiet {
+                    emit(&Event::new("discard_partial"));
+                }
+                timer.call_first_token = None;
+                let _ = sleep_or_cancel(Duration::from_millis(backoff), cancel).await;
+            }
+        }
+    }
+}
+
+async fn stream_turn_codex_once(
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    idle_timeout_secs: u64,
+    model: &str,
+    messages: &[Message],
+    tools: &[Value],
+    reasoning_effort: &str,
+    thinking_levels: &[String],
+    max_tokens: u32,
+    cancel: &CancellationToken,
+    timer: &mut TurnTimer,
+    prompt_est: u64,
+    quiet: bool,
+) -> Result<(Value, String, u64, u64, u64), String> {
     let api_key = provider.api_key.as_deref().unwrap_or("");
     let adapter = adapter_for(provider);
     let built = adapter.build_request(&ProviderRequest {
@@ -1774,7 +1836,7 @@ async fn stream_turn_openai(
         // Retry transient stream failures even after partial tokens: the TUI
         // discards the partial on `discard_partial` so a successful retry cannot
         // duplicate visible output. Non-retryable failures (malformed SSE,
-        // auth, idle after partial) still fail immediately.
+        // auth) still fail immediately.
         if !should_retry_stream_attempt(&msg, emitted, attempt, max_attempts) {
             return Err(msg);
         }
@@ -2279,8 +2341,10 @@ fn iflow_signed_headers(api_key: &str, headers: &[(String, String)]) -> Vec<(Str
     out
 }
 
-/// POST with retry on 429/5xx. Exponential backoff: 0.5s, 1s, 2s, 4s (cap 8s),
-/// honoring Retry-After if present. Up to 4 attempts. Cancellation-aware.
+/// POST with retry on transient provider errors (5xx, 408, transport, etc.).
+/// Rate limits (429) and balance/billing failures fail fast. Exponential
+/// backoff: 0.5s, 1s, 2s, 4s (cap 8s), honoring Retry-After if present. Up to
+/// 4 attempts. Cancellation-aware.
 async fn send_with_retry(
     client: &reqwest::Client,
     url: &str,
@@ -2411,33 +2475,9 @@ async fn send_with_retry(
             return Ok(resp);
         }
 
-        // Retryable: 429 (rate limit), 408 (request timeout), and 5xx.
-        // Other 4xx → fatal (do not burn attempts on auth/validation errors).
-        let retryable = is_retryable_http_status(status);
-        if !retryable || attempt >= 4 {
-            let text = resp.text().await.unwrap_or_default();
-            if logging::debug_verbose() {
-                let (body_text, body_len, truncated) =
-                    logging::truncate_for_log(&text, logging::VERBOSE_PAYLOAD_CAP);
-                logging::global_log(
-                    "http_response",
-                    json!({
-                        "attempt": attempt,
-                        "url": url,
-                        "status": status.as_u16(),
-                        "ok": false,
-                        "body": body_text,
-                        "body_len": body_len,
-                        "truncated": truncated,
-                    }),
-                );
-            }
-            let normalized = adapter.normalize_error(Some(status.as_u16()), &text);
-            return Err(format!("HTTP {status}: {}", normalized.message));
-        }
-
-        // Providers use both standard Retry-After and non-standard
-        // retry-after-ms/x-ratelimit-reset-after headers. Normalize all three.
+        // Read the body first so balance/billing wording can fail fast even on
+        // statuses that look transient. Policy: retry provider errors by default;
+        // only rate limits and balance/billing (plus permanent client 4xx) stop us.
         let retry_after_ms = resp
             .headers()
             .get("retry-after-ms")
@@ -2457,8 +2497,29 @@ async fn send_with_retry(
                     .and_then(parse_retry_after)
                     .map(|seconds| seconds.saturating_mul(1000))
             });
-        // Drain body before retry to free the connection.
         let err_body = resp.text().await.unwrap_or_default();
+        let retryable = is_retryable_http_error(status.as_u16(), &err_body);
+        if !retryable || attempt >= 4 {
+            if logging::debug_verbose() {
+                let (body_text, body_len, truncated) =
+                    logging::truncate_for_log(&err_body, logging::VERBOSE_PAYLOAD_CAP);
+                logging::global_log(
+                    "http_response",
+                    json!({
+                        "attempt": attempt,
+                        "url": url,
+                        "status": status.as_u16(),
+                        "ok": false,
+                        "body": body_text,
+                        "body_len": body_len,
+                        "truncated": truncated,
+                    }),
+                );
+            }
+            let normalized = adapter.normalize_error(Some(status.as_u16()), &err_body);
+            return Err(format!("HTTP {status}: {}", normalized.message));
+        }
+
         if logging::debug_verbose() {
             let (body_text, body_len, truncated) =
                 logging::truncate_for_log(&err_body, logging::VERBOSE_PAYLOAD_CAP);
@@ -2576,12 +2637,12 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> Option<u64> {
     Some(days as u64)
 }
 
-/// HTTP statuses worth retrying at the transport layer.
-/// 429 rate-limit, 408 request-timeout (proxy stall), and any 5xx.
-/// Other 4xx (auth, validation, not-found) fail immediately.
+/// HTTP statuses worth retrying at the transport layer when no body is available.
+/// Prefer [`is_retryable_http_error`] when the response body can be inspected so
+/// rate-limit / balance wording can fail fast. 408 + any 5xx retry; permanent
+/// client 4xx (incl. 429 rate-limit / 402 balance) do not.
 fn is_retryable_http_status(status: reqwest::StatusCode) -> bool {
-    let code = status.as_u16();
-    code == 429 || code == 408 || status.is_server_error()
+    is_retryable_http_error(status.as_u16(), "")
 }
 
 fn backoff_ms(attempt: u32, retry_after: Option<u64>) -> u64 {
@@ -2646,14 +2707,44 @@ fn is_recoverable_truncated_chunked_body(
 }
 
 /// Transient mid-stream failures worth a fresh POST even after the TUI already
-/// saw partial tokens. Covers reqwest/hyper body drops (h2 "unexpected internal
-/// error", connection reset mid-SSE) and gateway blips that surface as stream
-/// or provider error frames (504/502/503, overloaded). Non-transient failures
-/// (auth, validation, malformed SSE, idle timeout after partial) stay fatal so
-/// we never loop on a broken request shape or hang-then-retry forever.
+/// saw partial tokens. Covers reqwest/hyper body drops, idle timeouts, and
+/// gateway/server blips. Rate limits and balance/billing are *not* retryable
+/// (fail fast — see [`is_non_retryable_provider_message`]). Permanent request
+/// failures (auth, validation, malformed SSE, context length) also stay fatal.
 fn is_retryable_stream_failure(message: &str) -> bool {
+    if is_non_retryable_provider_message(message) {
+        return false;
+    }
     let lower = message.to_ascii_lowercase();
+    // Permanent request/account failures — never loop on a broken shape.
+    // Prefer specific phrases over bare tokens ("authentication"/"forbidden")
+    // so retryable rate-limit copy containing those words stays retryable.
+    if lower.contains("malformed provider stream")
+        || lower.contains("invalid credentials")
+        || lower.contains("invalid_api_key")
+        || lower.contains("invalid api key")
+        || lower.contains("authentication failed")
+        || lower.contains("authentication error")
+        || lower.contains("unauthorized")
+        || lower.contains("access denied")
+        || lower.contains("permission denied")
+        || lower.contains("context_length")
+        || lower.contains("context length")
+        || lower.contains("maximum context")
+        || lower.contains("prompt is too long")
+        || lower.contains("input is too long")
+        || lower.contains("http 400")
+        || lower.contains("http 401")
+        || lower.contains("http 402")
+        || lower.contains("http 403")
+        || lower.contains("http 404")
+        || lower.contains("http 422")
+    {
+        return false;
+    }
     // Body/transport drops while reading an otherwise-accepted SSE response.
+    // Idle timeout is the same class: the connection is up but the provider
+    // stopped sending frames; a fresh POST often recovers (with discard_partial).
     if lower.contains("stream read:")
         || lower.contains("error decoding response body")
         || lower.contains("error reading a body from connection")
@@ -2661,6 +2752,7 @@ fn is_retryable_stream_failure(message: &str) -> bool {
         || lower.contains("unexpected internal error")
         || lower.contains("connection reset")
         || lower.contains("broken pipe")
+        || lower.contains("stream idle timeout")
         || (lower.contains("connection")
             && (lower.contains("closed") || lower.contains("aborted") || lower.contains("reset")))
     {
@@ -2668,14 +2760,12 @@ fn is_retryable_stream_failure(message: &str) -> bool {
     }
     // Gateway / provider overload frames (HTTP 5xx already retried on the
     // initial POST; this path covers mid-stream error events and body text).
+    // Deliberately omits rate-limit / 429 — those fail fast.
     if lower.contains("gateway timeout")
         || lower.contains("temporarily unavailable")
         || lower.contains("overloaded")
         || lower.contains("server_error")
-        || lower.contains("rate limit")
-        || lower.contains("too many requests")
         || lower.contains("http 408")
-        || lower.contains("http 429")
         || lower.contains("http 500")
         || lower.contains("http 502")
         || lower.contains("http 503")
@@ -2694,16 +2784,20 @@ fn is_retryable_stream_failure(message: &str) -> bool {
     {
         return true;
     }
-    false
+    // Default after partial output: retry unclassified provider stream errors
+    // unless they look permanent above. Matches the user policy of retrying
+    // any provider error except rate-limit / balance.
+    true
 }
 
-/// Decide whether a failed stream attempt may be retried. Before any visible
-/// output we retry broadly (same as historical behaviour). After partial
-/// deltas we only retry classified transport/gateway failures, and always ask
-/// the TUI to discard the partial so a successful retry cannot duplicate text.
+/// Decide whether a failed stream attempt may be retried. Rate limits and
+/// balance/billing always fail fast. Permanent request failures (auth, context,
+/// malformed, validation) also stay fatal. Everything else — including before
+/// the first token and after partial output — may retry (with discard_partial
+/// after partial so a successful retry cannot duplicate text).
 fn should_retry_stream_attempt(
     message: &str,
-    emitted: bool,
+    _emitted: bool,
     attempt: u32,
     max_attempts: u32,
 ) -> bool {
@@ -2713,9 +2807,6 @@ fn should_retry_stream_attempt(
     // Policy/DoS caps (H3) are permanent for this request shape — never retry.
     if message.contains("exceeds cap") || message.contains("exceed cap") {
         return false;
-    }
-    if !emitted {
-        return true;
     }
     is_retryable_stream_failure(message)
 }
@@ -3313,29 +3404,6 @@ async fn send_anthropic_request(
                     }
                     return Ok(r);
                 }
-                let retryable = is_retryable_http_status(status);
-                if !retryable || attempt >= 4 {
-                    let text = r.text().await.unwrap_or_default();
-                    if logging::debug_verbose() {
-                        let (body_text, body_len, truncated) =
-                            logging::truncate_for_log(&text, logging::VERBOSE_PAYLOAD_CAP);
-                        logging::global_log(
-                            "http_response",
-                            json!({
-                                "attempt": attempt,
-                                "url": url,
-                                "status": status.as_u16(),
-                                "ok": false,
-                                "provider_kind": "anthropic",
-                                "body": body_text,
-                                "body_len": body_len,
-                                "truncated": truncated,
-                            }),
-                        );
-                    }
-                    let normalized = adapter.normalize_error(Some(status.as_u16()), &text);
-                    return Err(format!("HTTP {status}: {}", normalized.message));
-                }
                 let retry_after_ms = r
                     .headers()
                     .get("retry-after-ms")
@@ -3356,6 +3424,30 @@ async fn send_anthropic_request(
                             .map(|seconds| seconds.saturating_mul(1000))
                     });
                 let err_body = r.text().await.unwrap_or_default();
+                // Same denylist as OpenAI: retry by default; rate-limit + balance
+                // (and permanent client 4xx) fail fast.
+                let retryable = is_retryable_http_error(status.as_u16(), &err_body);
+                if !retryable || attempt >= 4 {
+                    if logging::debug_verbose() {
+                        let (body_text, body_len, truncated) =
+                            logging::truncate_for_log(&err_body, logging::VERBOSE_PAYLOAD_CAP);
+                        logging::global_log(
+                            "http_response",
+                            json!({
+                                "attempt": attempt,
+                                "url": url,
+                                "status": status.as_u16(),
+                                "ok": false,
+                                "provider_kind": "anthropic",
+                                "body": body_text,
+                                "body_len": body_len,
+                                "truncated": truncated,
+                            }),
+                        );
+                    }
+                    let normalized = adapter.normalize_error(Some(status.as_u16()), &err_body);
+                    return Err(format!("HTTP {status}: {}", normalized.message));
+                }
                 if logging::debug_verbose() {
                     let (body_text, body_len, truncated) =
                         logging::truncate_for_log(&err_body, logging::VERBOSE_PAYLOAD_CAP);
@@ -4519,18 +4611,20 @@ mod tests {
     #[test]
     fn retryable_http_status_policy() {
         use reqwest::StatusCode;
-        assert!(is_retryable_http_status(StatusCode::TOO_MANY_REQUESTS));
+        // 408 + 5xx still retry. 429 rate-limit is now fail-fast (balance/rate denylist).
+        assert!(!is_retryable_http_status(StatusCode::TOO_MANY_REQUESTS));
         assert!(is_retryable_http_status(StatusCode::REQUEST_TIMEOUT));
         assert!(is_retryable_http_status(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(is_retryable_http_status(StatusCode::BAD_GATEWAY));
         assert!(is_retryable_http_status(StatusCode::SERVICE_UNAVAILABLE));
         assert!(is_retryable_http_status(StatusCode::GATEWAY_TIMEOUT));
-        // Non-retryable client errors must fail fast.
+        // Permanent client errors must fail fast.
         assert!(!is_retryable_http_status(StatusCode::BAD_REQUEST));
         assert!(!is_retryable_http_status(StatusCode::UNAUTHORIZED));
         assert!(!is_retryable_http_status(StatusCode::FORBIDDEN));
         assert!(!is_retryable_http_status(StatusCode::NOT_FOUND));
         assert!(!is_retryable_http_status(StatusCode::UNPROCESSABLE_ENTITY));
+        assert!(!is_retryable_http_status(StatusCode::PAYMENT_REQUIRED));
         assert!(!is_retryable_http_status(StatusCode::OK));
     }
     #[test]
@@ -4571,15 +4665,47 @@ mod tests {
         ));
         assert!(is_retryable_stream_failure("connection reset by peer"));
 
+        // Idle timeout is retryable even after partial tokens (provider hung
+        // mid-stream; discard_partial prevents duplicate visible output).
+        assert!(is_retryable_stream_failure(
+            "stream idle timeout (120s with no data)"
+        ));
+        assert!(should_retry_stream_attempt(
+            "stream idle timeout (120s with no data)",
+            true,
+            1,
+            3
+        ));
+        assert!(should_retry_stream_attempt(
+            "stream idle timeout (90s with no data)",
+            false,
+            1,
+            3
+        ));
+        assert!(!should_retry_stream_attempt(
+            "stream idle timeout (120s with no data)",
+            true,
+            3,
+            3
+        ));
+
         // Non-transient: stay fatal once tokens were shown.
         assert!(!is_retryable_stream_failure(
             "malformed provider stream event: {not json"
         ));
         assert!(!is_retryable_stream_failure(
-            "stream idle timeout (90s with no data)"
-        ));
-        assert!(!is_retryable_stream_failure(
             "HTTP 401: invalid credentials"
+        ));
+        // Mid-stream auth frames (e.g. Cursor SDK) must fail fast — never burn
+        // retries or leave a multi-accept mock hanging on server.await.
+        assert!(!is_retryable_stream_failure(
+            "provider stream error: Cursor SDK authentication failed"
+        ));
+        assert!(!should_retry_stream_attempt(
+            "provider stream error: Cursor SDK authentication failed",
+            false,
+            1,
+            3
         ));
         assert!(!should_retry_stream_attempt(
             "malformed provider stream event: nope",
@@ -4587,12 +4713,45 @@ mod tests {
             1,
             3
         ));
-        // Pre-token still retries broadly (historical behaviour).
-        assert!(should_retry_stream_attempt(
-            "stream idle timeout (90s with no data)",
+
+        // Rate limits and balance issues fail fast even before first token.
+        assert!(!is_retryable_stream_failure(
+            "HTTP 429: rate limit exceeded"
+        ));
+        assert!(!should_retry_stream_attempt(
+            "rate limit exceeded — too many requests",
             false,
             1,
             3
+        ));
+        assert!(!should_retry_stream_attempt(
+            "insufficient credits — top up your balance",
+            false,
+            1,
+            3
+        ));
+        assert!(!should_retry_stream_attempt("payment required", true, 1, 3));
+
+        // Unclassified provider stream errors now retry (denylist policy).
+        assert!(is_retryable_stream_failure(
+            "provider stream error: upstream hiccup, try again"
+        ));
+        assert!(should_retry_stream_attempt(
+            "provider stream error: upstream hiccup, try again",
+            true,
+            1,
+            3
+        ));
+        // Incidental bare tokens in retryable copy must not force FatalError.
+        assert!(is_retryable_stream_failure(
+            "provider stream error: upstream said forbidden briefly; retry"
+        ));
+        assert!(is_retryable_stream_failure(
+            "provider stream error: transient authentication hiccup from gateway"
+        ));
+        // Specific auth/context phrases remain non-retryable.
+        assert!(!is_retryable_stream_failure(
+            "provider stream error: prompt is too long for this model"
         ));
     }
 
@@ -4943,6 +5102,7 @@ mod tests {
                     max_tokens: Some(4_096),
                     reasoning: Some(true),
                     thinking_levels: Some(vec!["low".into(), "high".into()]),
+                    ..Default::default()
                 },
                 // An override for a model NOT in the discovered list is a no-op.
                 ModelOverride {
@@ -5933,6 +6093,9 @@ mod tests {
 
     #[tokio::test]
     async fn openai_sse_error_frames_are_provider_failures() {
+        // Auth/account failures fail fast (no stream retries). The mock must
+        // only serve one response — extra accepts would hang forever on
+        // server.await after the client stops.
         let failure = format!(
             "data: {}\n\n",
             json!({
@@ -5942,8 +6105,7 @@ mod tests {
                 }
             })
         );
-        let (base, server) =
-            mock_openai_sse_server(vec![failure.clone(), failure.clone(), failure]).await;
+        let (base, server) = mock_openai_sse_server(vec![failure]).await;
         let provider = mock_provider(base);
         let mut timer = TurnTimer::new();
         let error = stream_turn_openai(
@@ -5965,7 +6127,7 @@ mod tests {
         .expect_err("an SSE error object must not become a successful empty completion");
 
         assert!(error.contains("Cursor SDK authentication failed"));
-        assert_eq!(server.await.unwrap().len(), 3);
+        assert_eq!(server.await.unwrap().len(), 1);
     }
 
     #[tokio::test]

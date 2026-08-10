@@ -1,5 +1,6 @@
 ---
 name: context-builder
+model: ck-grok-4.5
 description: Stronger setup pass before planning; gathers context and writes handoff material
 tools: read_file, grep, glob, list_dir, bash, write_file, memory, intercom
 thinking: low

@@ -100,7 +100,10 @@ function toModel(info: any, provider: string): Model<any> {
     reasoning: !!info.reasoning,
     vision: !!info.vision,
     thinkingLevels: (info.thinking_levels ?? []) as ThinkingLevel[],
-    input: { text: true, image: !!info.vision },
+    input: {
+      text: (info.input ?? ["text"]).includes("text"),
+      image: (info.input ?? []).includes("image") || !!info.vision,
+    },
   };
 }
 

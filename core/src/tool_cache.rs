@@ -50,6 +50,7 @@ impl ToolOutputCache {
                 | "git_status"
                 | "git_diff"
                 | "git_log"
+                | "git_show"
                 | "todo_read"
                 | "workspace_activity"
         )
@@ -126,7 +127,13 @@ pub fn invalidates_cache(tool: &str) -> bool {
             | "mkdir"
             | "git_add"
             | "git_commit"
+            | "git_push"
+            | "git_pull"
+            | "git_branch"
             | "bulk" // may contain writes
+            | "snapshot_edit"
+            | "ast_edit"
+            | "collections" // index/add/remove mutate durable store
     )
 }
 

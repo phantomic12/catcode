@@ -3,10 +3,13 @@
 //! MVP surface the agent actually calls. Full ~50-tool design lives in memory
 //! as roadmap — do not expand schemas here until a tool is implemented.
 //!
-//! Backend: WRY/tao when built with `--features native-browser`. Without the
-//! feature, tools return structured `BROWSER_UNAVAILABLE`.
+//! Backend: shared Chromium/CDP when built with `--features chromium-cdp`.
+//! WRY/tao is an explicit fallback with `--features native-browser`. Without
+//! either feature, tools return structured `BROWSER_UNAVAILABLE`.
 
 mod backend;
+#[cfg(feature = "chromium-cdp")]
+mod chromium_cdp;
 #[cfg(feature = "native-browser")]
 mod headless_display;
 #[cfg(feature = "native-browser")]
@@ -325,6 +328,23 @@ pub(crate) fn next_snapshot_id() -> String {
 pub async fn execute_browser(name: &str, args: &Value, cfg: &Config) -> Outcome {
     if !is_browser_tool(name) {
         return Outcome::err(format!("unknown browser tool: {name}"));
+    }
+    // Honor fetch/no_network policy on navigate (and evaluate of absolute URLs
+    // is out of scope — Page.navigate is the SSRF vector) (CORE_REVIEW).
+    if name == "browser_navigate" {
+        if let Some(url) = args.get("url").and_then(|v| v.as_str()) {
+            if let Err(msg) = crate::fetch_tool::browser_navigation_allowed(
+                url,
+                cfg.no_network,
+                &cfg.fetch_allowlist,
+            ) {
+                return Outcome::ok(
+                    BrowserError::new("NAVIGATION_DENIED", msg)
+                        .to_json()
+                        .to_string(),
+                );
+            }
+        }
     }
     match backend::dispatch(name, args, cfg).await {
         Ok(v) => Outcome::ok(v.to_string()),

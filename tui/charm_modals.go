@@ -225,12 +225,7 @@ func (s *session) renderPickerList() string {
 		}
 		body = extra.String() + body
 	}
-	box := lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(c.accent)).
-		Padding(0, 1).
-		Width(w).
-		Render(body)
+	box := modalBox(w, body)
 	if s.height > 0 {
 		lines := strings.Split(box, "\n")
 		if len(lines) > s.height {

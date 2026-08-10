@@ -313,6 +313,9 @@ async fn plugin_run_sandboxed(
         .plugin_dir
         .canonicalize()
         .unwrap_or_else(|_| cfg.plugin_dir.clone());
+    let global_dir = crate::config::home_dir()
+        .map(|home| home.join(".catalyst-code/plugins"))
+        .and_then(|p| p.canonicalize().ok());
     let script_canon = match script.canonicalize() {
         Ok(p) => p,
         Err(e) => {
@@ -324,12 +327,14 @@ async fn plugin_run_sandboxed(
     };
     let guest_path = if let Ok(rel) = script_canon.strip_prefix(&ws) {
         std::path::PathBuf::from("/workspace").join(rel)
-    } else if plugin_dir.exists() {
-        if let Ok(rel) = script_canon.strip_prefix(&plugin_dir) {
+    } else if let Ok(rel) = script_canon.strip_prefix(&plugin_dir) {
+        std::path::PathBuf::from("/catcode-plugins").join(rel)
+    } else if let Some(global_dir) = global_dir.as_ref() {
+        if let Ok(rel) = script_canon.strip_prefix(global_dir) {
             std::path::PathBuf::from("/catcode-plugins").join(rel)
         } else {
             return Ok(Err(std::io::Error::other(format!(
-                "script {:?} is not under the workspace or the global plugin dir; it cannot run in the sandbox",
+                "script {:?} is not under a mounted plugin directory",
                 script
             ))));
         }
@@ -675,6 +680,8 @@ pub struct ToolConfig {
     pub override_builtin: bool,
     /// Plugin that owns this tool (for UI side-effect framing).
     pub plugin_name: String,
+    /// Declared plugin capabilities (enforced at execute time — CORE_REVIEW).
+    pub capabilities: Vec<String>,
 }
 
 /// How a plugin slash command is executed.
@@ -1437,6 +1444,14 @@ impl PluginManager {
         if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
             return Err(format!("plugin name contains a path separator: {name:?}"));
         }
+        if !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Err(format!(
+                "plugin name contains unsupported characters: {name:?}"
+            ));
+        }
         if Path::new(name).components().count() != 1 {
             return Err(format!(
                 "plugin name must be a single directory name: {name:?}"
@@ -1512,9 +1527,12 @@ impl PluginManager {
                 ));
             }
 
-            let timeout_ms = entry
-                .timeout_ms
-                .unwrap_or_else(|| default_hook_timeout(hook_name));
+            let timeout_ms = clamp_hook_timeout_ms(
+                hook_name,
+                entry
+                    .timeout_ms
+                    .unwrap_or_else(|| default_hook_timeout(hook_name)),
+            );
 
             hooks.insert(
                 hook_name.clone(),
@@ -1538,7 +1556,8 @@ impl PluginManager {
                 return Err("plugin declares a tool with an empty name".into());
             }
             let canon_script = validate_plugin_script(&canon_dir, &t.script)?;
-            let timeout_ms = t.timeout_ms.unwrap_or(DEFAULT_POST_TIMEOUT_MS);
+            let timeout_ms =
+                clamp_hook_timeout_ms("tool", t.timeout_ms.unwrap_or(DEFAULT_POST_TIMEOUT_MS));
             let kind = match t.kind.as_deref().unwrap_or("destructive") {
                 "readonly" => ToolKind::ReadOnly,
                 "destructive" => ToolKind::Destructive,
@@ -1563,6 +1582,7 @@ impl PluginManager {
                 kind,
                 override_builtin: t.override_builtin,
                 plugin_name: manifest.name.clone(),
+                capabilities: capabilities.clone(),
             });
         }
 
@@ -1823,11 +1843,31 @@ impl PluginManager {
         }
 
         let dest_root = self.install_dir_for(scope)?;
-        let _ = std::fs::create_dir_all(&dest_root);
+        std::fs::create_dir_all(&dest_root)
+            .map_err(|e| format!("create plugin install root: {e}"))?;
         Self::validate_plugin_name(&plugin.name)?;
+        let root_canon = dest_root
+            .canonicalize()
+            .map_err(|e| format!("canonicalize plugin install root: {e}"))?;
         let dest_dir = dest_root.join(&plugin.name);
+        if std::fs::symlink_metadata(&dest_dir)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err("plugin destination must not be a symlink".into());
+        }
         if dest_dir.exists() {
-            let _ = std::fs::remove_dir_all(&dest_dir);
+            let dest_canon = dest_dir
+                .canonicalize()
+                .map_err(|e| format!("canonicalize plugin destination: {e}"))?;
+            if dest_canon.parent() != Some(root_canon.as_path()) {
+                return Err(format!(
+                    "plugin destination escapes install root: {}",
+                    dest_dir.display()
+                ));
+            }
+            std::fs::remove_dir_all(&dest_dir)
+                .map_err(|e| format!("remove existing plugin: {e}"))?;
         }
 
         copy_dir(&source, &dest_dir)?;
@@ -1861,12 +1901,29 @@ impl PluginManager {
         Ok(installed)
     }
 
-    /// Remove a plugin by name. Deletes the plugin directory from disk and
-    /// unregisters it from the in-memory registry.
+    /// Remove a plugin by name. Deletes only a managed plugin directory.
     pub fn remove(&self, name: &str) -> Result<(), String> {
+        Self::validate_plugin_name(name)?;
         let mut plugins = self.plugins.write().unwrap();
         if let Some(plugin) = plugins.remove(name) {
-            let _ = std::fs::remove_dir_all(&plugin.source_path);
+            let root = if plugin.source_path.starts_with(&self.plugins_dir) {
+                self.plugins_dir
+                    .canonicalize()
+                    .map_err(|e| format!("canonicalize plugin install root: {e}"))?
+            } else {
+                self.install_dir_for(self.scope_of_path(&plugin.source_path))?
+                    .canonicalize()
+                    .map_err(|e| format!("canonicalize plugin install root: {e}"))?
+            };
+            let target = plugin
+                .source_path
+                .canonicalize()
+                .map_err(|e| format!("canonicalize plugin path: {e}"))?;
+            if target.parent() != Some(root.as_path()) {
+                plugins.insert(name.to_string(), plugin);
+                return Err("plugin path is outside its managed install root".into());
+            }
+            std::fs::remove_dir_all(&target).map_err(|e| format!("remove plugin: {e}"))?;
             Ok(())
         } else {
             Err(format!("plugin '{}' not found", name))
@@ -2713,10 +2770,14 @@ pub async fn execute_hook(
                 }
             };
 
+            // Successful JSON parse: missing `allow` defaults to true so a
+            // hook that only returns `{modify:…}` / `{reason:…}` does not
+            // freeze every tool. Explicit allow:false still denies. Timeout /
+            // nonzero exit / invalid JSON remain fail-closed above (CORE_REVIEW C12).
             let allow = response
                 .get("allow")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .unwrap_or(true);
             let reason = response
                 .get("reason")
                 .and_then(|v| v.as_str())
@@ -2881,6 +2942,18 @@ pub async fn execute_plugin_tool(
     workspace: &str,
     session_id: &str,
 ) -> Outcome {
+    // Runtime capability gate (CORE_REVIEW): destructive handlers need
+    // execute_subprocess; secret-touching tools need access_secrets.
+    if config.kind == ToolKind::Destructive
+        && !config
+            .capabilities
+            .iter()
+            .any(|c| c == "execute_subprocess")
+    {
+        return Outcome::err(format!(
+            "plugin tool '{tool_name}' denied: missing execute_subprocess capability"
+        ));
+    }
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -3366,6 +3439,18 @@ fn parse_memory_provider_stdout(stdout: &str) -> MemoryProviderResult {
 // ---- helpers ----
 
 /// Return the default timeout for a hook point.
+/// Hard caps so a plugin manifest cannot hang the agent for years (CORE_REVIEW).
+fn clamp_hook_timeout_ms(hook_name: &str, ms: u64) -> u64 {
+    let cap = if hook_name.starts_with("pre_") {
+        30_000
+    } else if hook_name.contains("oauth") {
+        300_000
+    } else {
+        120_000
+    };
+    ms.min(cap).max(1)
+}
+
 fn default_hook_timeout(hook_name: &str) -> u64 {
     hook_policy(hook_name).default_timeout_ms
 }
@@ -4415,9 +4500,10 @@ const PLUGIN_COPY_SKIP: &[&str] = &[
 ];
 
 /// Recursively copy a directory from `src` to `dst`.
-/// Skips junk dirs (see [`PLUGIN_COPY_SKIP`]). Symlinks are recreated when
-/// possible; broken / unsupported link types are skipped with a warning rather
-/// than failing the whole install.
+///
+/// Source symlinks are never recreated: a plugin archive or local source may
+/// point outside its tree, so preserving links would reintroduce an escape
+/// from the managed install root. Symlink entries are skipped.
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {:?}: {e}", dst))?;
 
@@ -4442,29 +4528,8 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
         let dst_path = dst.join(&name);
 
         if ft.is_symlink() {
-            match std::fs::read_link(&src_path) {
-                Ok(target) => {
-                    #[cfg(unix)]
-                    {
-                        if let Err(e) = std::os::unix::fs::symlink(&target, &dst_path) {
-                            eprintln!("[plugins] skip symlink {:?} -> {:?}: {e}", src_path, target);
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        // Best-effort: if the link points at a regular file, copy it.
-                        let resolved = src_path.parent().unwrap_or(src).join(&target);
-                        if resolved.is_file() {
-                            let _ = std::fs::copy(&resolved, &dst_path);
-                        } else {
-                            eprintln!("[plugins] skip symlink {:?} (non-unix)", src_path);
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[plugins] skip unreadable symlink {:?}: {e}", src_path);
-                }
-            }
+            eprintln!("[plugins] skip source symlink {:?}", src_path);
+            continue;
         } else if ft.is_dir() {
             copy_dir(&src_path, &dst_path)?;
         } else if ft.is_file() {
@@ -5014,6 +5079,54 @@ mod tests {
         mgr.remove("fresh").unwrap();
         assert!(mgr.list().is_empty());
         assert!(!tmp.path.join("managed/fresh").exists());
+    }
+
+    #[test]
+    fn install_rejects_malicious_plugin_names_before_touching_destination() {
+        let tmp = TmpDir::new("install_name_containment");
+        let managed = tmp.path.join("managed");
+        let mgr = PluginManager::new(managed.clone(), PathBuf::from("/__pm_test_ws__"), true);
+        let src = TmpDir::new("install_bad_name_source");
+        fs::write(
+            src.path.join("plugin.json"),
+            r#"{"name":"../outside","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let sentinel = tmp.path.join("outside");
+        fs::create_dir_all(&sentinel).unwrap();
+        fs::write(sentinel.join("keep"), "safe").unwrap();
+
+        let err = mgr
+            .install(&src.path, PluginInstallScope::Workspace)
+            .unwrap_err();
+        assert!(err.contains("path separator"), "{err}");
+        assert_eq!(fs::read_to_string(sentinel.join("keep")).unwrap(), "safe");
+        assert!(!managed.join("outside").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_refuses_symlinked_destination_before_deletion() {
+        let tmp = TmpDir::new("install_symlink_containment");
+        let managed = tmp.path.join("managed");
+        fs::create_dir_all(&managed).unwrap();
+        let mgr = PluginManager::new(managed.clone(), PathBuf::from("/__pm_test_ws__"), true);
+        let src = TmpDir::new("install_symlink_source");
+        fs::write(
+            src.path.join("plugin.json"),
+            r#"{"name":"safe","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let outside = tmp.path.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), "safe").unwrap();
+        std::os::unix::fs::symlink(&outside, managed.join("safe")).unwrap();
+
+        let err = mgr
+            .install(&src.path, PluginInstallScope::Workspace)
+            .unwrap_err();
+        assert!(err.contains("must not be a symlink"), "{err}");
+        assert_eq!(fs::read_to_string(outside.join("keep")).unwrap(), "safe");
     }
 
     #[test]
@@ -6325,6 +6438,7 @@ mod tests {
             kind,
             override_builtin: false,
             plugin_name: "test-plugin".into(),
+            capabilities: vec!["execute_subprocess".into()],
         }
     }
 

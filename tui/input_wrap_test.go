@@ -33,6 +33,16 @@ func TestInputBoxEmptyUsesOpenComposer(t *testing.T) {
 	}
 }
 
+func TestAnimatedComposerOptionKeepsNewChrome(t *testing.T) {
+	t.Setenv("CATCODE_ANIMATED_BORDER", "1")
+	s := newInputSession(t, 80)
+	s.busy = true
+	box := stripANSI(s.renderInputBox())
+	if !strings.Contains(box, "compose") {
+		t.Fatalf("animated composer option bypassed the shared chrome:\n%s", box)
+	}
+}
+
 // TestInputBoxWrapsLongMessage: a value longer than the box width soft-wraps
 // onto multiple rows instead of scrolling one line — every char is still
 // visible and continuation rows align beneath the prompt.

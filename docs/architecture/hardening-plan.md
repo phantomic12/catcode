@@ -194,3 +194,54 @@ reviewed ownership boundaries; the readonly wave's formerly detached scheduler
 spawn has been removed. Remaining spawn sites are explicit executor/bootstrap
 implementations and are covered by outer runtime leases plus cancellation/drop
 cleanup when they belong to a run.
+
+
+## Agent OS roadmap implementation status
+
+Issue #8 is the source of truth for the staged Agent OS program. The current
+repository has landed the P0a correctness slice (cancelled subagents do not
+promote worktrees, writes require an explicit content value, and streamed tool
+indices are bounded), plus browser scheme lockdown, bounded sandbox output,
+plugin install-root validation, UTF-8-safe indexing, and memory append metadata
+preservation. Remaining P0/P1/P2/P3 work must retain these invariants and land
+with targeted regression coverage; no safety claim should depend on an
+unimplemented roadmap item.
+
+### Design contracts for the next slices
+
+**Async jobs and hub.** A job is identified by `session_id`, `run_id`, and
+`parent_run_id`; its durable record lives below the session directory and moves
+through `queued`, `running`, `done`, `failed`, or `cancelled`. Completion writes
+an artifact before emitting a parent-delivery event. Cancellation is terminal
+and never promotes a worktree. Hub messaging builds on `IntercomBus`; wait and
+cancel operate on the durable job id and return the terminal record.
+
+**Session tree and compaction.** Additive entry fields `id` and `parentId` keep
+existing JSONL readable. A leaf pointer selects the active branch; `/tree`
+enumerates ancestry and siblings, while `/branch` creates a child from a
+selected entry without rewriting prior entries. Compaction is an append-only
+entry containing the retained summary and artifact references; display history
+remains non-destructive. Shake may replace oversized tool output with an
+artifact reference only after the original is durably stored.
+
+**Deferred IDE tools.** New IDE tools belong in `tooling/` and are exposed only
+through `load_tools`; diagnostics/refs are read-only and parallel-safe, while
+rename/edit operations are sequential and use the existing approval policy.
+`ast_edit` uses an embedded ast-grep 0.44 engine with bundled Rust, Go,
+JavaScript, TypeScript/TSX, Python, JSON, YAML, and Markdown grammars. It has
+bounded single-file input, dry-run diffs, atomic apply, workspace confinement,
+and no external `ast-grep` executable dependency.
+
+## Verification status for issue #8
+
+Verified on 2026-08-08 and rechecked locally:
+- Core: `cargo test --locked` — 1,036 unit tests and 25 protocol harness tests passed; 3 tests ignored.
+- Core formatting: `cargo fmt --all -- --check` passed.
+- Core lint: `cargo clippy --all-targets` completed without errors.
+- TUI: `gofmt`, `go vet ./...`, `go test ./...`, and `go build ./...` passed.
+- Web: protocol and architecture consistency checks, `bun run typecheck`, `bun run lint`, and `bun test` passed (180 tests).
+- SDK: `bun run typecheck` and `bun test` passed.
+
+Implemented issue slices: P0 trust/correctness hardening; durable job status/wait/cancel and artifact delivery; bounded intercom coordination; project-scoped named process supervision with readiness, logs, stop, restart, and stale recovery; append-only session entries, active-leaf navigation, ancestry/sibling tree output, branch summaries, compaction checkpoints, and artifact shake retention; replay-bounded eval lifecycle; deferred IDE tools including embedded ast-grep structural rewrites; MCP client with trusted user-only transports; multi-root `skill://` resolution; provider/extensibility scaffolding; and TUI/web job-tree and plugin-trust surfaces.
+
+The session tree contract is deliberately non-destructive: `session_branch` appends a durable message-less branch entry under the selected node, makes that entry the active leaf, and the next normal session append becomes its child. Marker entries are excluded from reconstructed model history, so branching never injects synthetic content. The web hub exposes authenticated session links that reopen the same authorized workspace/session on another signed-in device; the URL is not a bearer credential. Its process panel exposes observed process state and requests logs or a stop through the existing approved process-tool path. No issue #8 acceptance gap remains in the current local implementation; the remaining architecture warnings concern decomposition debt, not missing program-level behavior.

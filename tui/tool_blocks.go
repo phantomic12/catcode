@@ -82,15 +82,29 @@ func (b *block) argStrArr(key string) []string {
 }
 
 // keyArgFor returns the single most relevant arg for a tool (the path, command,
-// pattern, url, …), used by the collapsed sub-agent one-liner, the generic
-// fallback head, and the approval banner — so each surface shows the actual
-// target instead of a raw JSON blob.
+// pattern, url, …), used by the collapsed sub-agent one-liner and the generic
+// fallback head — so each surface shows the actual target instead of a raw
+// JSON blob.
+//
+// Bash commands are summarized to one line for activity rows / sub-agent
+// chatter. Approval banners intentionally do NOT go through this path — see
+// approvalSummary, which keeps the full (flattened) command for consent.
+// Expanded bash blocks still render the full script via renderBashBlock.
 func keyArgFor(name, args string) string {
 	switch name {
-	case "bash", "git_commit":
+	case "bash":
+		return summarizeBashCommand(argField(args, "command"))
+	case "git_commit":
 		return argField(args, "command")
-	case "read_file", "list_dir", "edit", "write_file", "patch", "diagnostics", "git_diff", "git_log":
+	case "read_file", "list_dir", "edit", "write_file", "patch", "diagnostics", "git_diff", "git_log", "git_show", "git_status":
 		return argField(args, "path")
+	case "git_push", "git_pull":
+		return argField(args, "remote")
+	case "git_branch":
+		if n := argField(args, "name"); n != "" {
+			return n
+		}
+		return argField(args, "action")
 	case "grep", "glob":
 		return argField(args, "pattern")
 	case "fetch":
@@ -101,26 +115,101 @@ func keyArgFor(name, args string) string {
 	return ""
 }
 
+// summarizeBashCommand collapses a shell command to a single scannable preview
+// for activity rows and sub-agent one-liners (NOT the approval banner).
+//
+// Rules:
+//   - single-line commands: whitespace collapsed, returned as-is
+//   - multi-line scripts: first meaningful line (skip blanks/comments); if that
+//     line is only `cd <dir>`, pair it with the next meaningful line so heredoc
+//     runners still read as "cd … · python3 <<'PY' · N lines"
+//   - always one physical line so compact activity cards stay one row tall
+func summarizeBashCommand(cmd string) string {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return ""
+	}
+	rawLines := strings.Split(cmd, "\n")
+	totalLines := len(rawLines)
+
+	var meaningful []string
+	for _, line := range rawLines {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		meaningful = append(meaningful, collapseWS(t))
+	}
+	if len(meaningful) == 0 {
+		return collapseWS(cmd)
+	}
+
+	lead := meaningful[0]
+	if totalLines == 1 {
+		return lead
+	}
+	// A leading bare `cd dir` is setup, not the work — pair with the next line.
+	if isCdOnly(lead) && len(meaningful) > 1 {
+		lead = lead + " · " + meaningful[1]
+	}
+	return fmt.Sprintf("%s · %d lines", lead, totalLines)
+}
+
+// collapseWS flattens internal whitespace so a command preview stays one line.
+func collapseWS(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// isCdOnly reports whether line is a bare directory change (no &&/;/| chain).
+func isCdOnly(line string) bool {
+	fields := strings.Fields(line)
+	if len(fields) == 0 || fields[0] != "cd" {
+		return false
+	}
+	if strings.ContainsAny(line, "|&;") || strings.Contains(line, "&&") {
+		return false
+	}
+	// `cd` alone or `cd <path>` (optionally with flags like -P/-L).
+	return true
+}
+
 // toolKeyArg returns keyArgFor for a block.
 func toolKeyArg(b *block) string { return keyArgFor(b.name, b.args) }
 
 // approvalSummary builds the plain detail string for an approval prompt
 // (keyarg + an optional count), so the sticky banner reads
 // "approve ✎ edit src/main.rs · 3 replacements" instead of a JSON blob.
+//
+// Bash is special: consent must surface the real script body, not the
+// aggressive activity one-liner (which can hide a sensitive later line behind
+// a benign leading `cd`). We flatten newlines so the banner stays one row,
+// then let renderApprovalBanner's truncate clip to available width — the
+// start of the flattened script still includes later payload lines.
 func approvalSummary(name, args string) string {
 	var segs []string
-	if ka := keyArgFor(name, args); ka != "" {
-		segs = append(segs, ka)
-	}
 	switch name {
+	case "bash":
+		if cmd := argField(args, "command"); cmd != "" {
+			segs = append(segs, collapseWS(cmd))
+		}
 	case "edit":
+		if ka := keyArgFor(name, args); ka != "" {
+			segs = append(segs, ka)
+		}
 		if n := len(argObjArrField(args, "edits")); n > 0 {
 			segs = append(segs, fmt.Sprintf("· %d replacement%s", n, pluralS(n)))
 		}
 	case "write_file":
+		if ka := keyArgFor(name, args); ka != "" {
+			segs = append(segs, ka)
+		}
 		if content := argField(args, "content"); content != "" {
 			nl := strings.Count(content, "\n") + 1
 			segs = append(segs, fmt.Sprintf("· %d line%s", nl, pluralS(nl)))
+		}
+	default:
+		if ka := keyArgFor(name, args); ka != "" {
+			segs = append(segs, ka)
 		}
 	}
 	return strings.Join(segs, "  ")

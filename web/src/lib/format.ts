@@ -53,6 +53,64 @@ export function truncate(s: string, n = 80): string {
   return flat.length > n ? flat.slice(0, n - 1) + "…" : flat;
 }
 
+/** Flatten internal whitespace so a preview stays one physical line. */
+function collapseWS(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/** True when a line is only a directory change (no chained operators). */
+function isCdOnly(line: string): boolean {
+  const fields = line.trim().split(/\s+/).filter(Boolean);
+  if (fields.length === 0 || fields[0] !== "cd") return false;
+  if (/[|&;]/.test(line) || line.includes("&&")) return false;
+  return true;
+}
+
+/**
+ * Collapse a multi-line bash script to a one-line activity preview.
+ * Mirrors tui/tool_blocks.go summarizeBashCommand: first meaningful line,
+ * pair bare `cd` with the next work line, append total line count.
+ */
+export function summarizeBashCommand(cmd: string): string {
+  const trimmed = cmd.trim();
+  if (!trimmed) return "";
+  const rawLines = trimmed.split("\n");
+  const totalLines = rawLines.length;
+  const meaningful = rawLines
+    .map((l) => l.trim())
+    .filter((t) => t !== "" && !t.startsWith("#"))
+    .map(collapseWS);
+  if (meaningful.length === 0) return collapseWS(trimmed);
+  let lead = meaningful[0];
+  if (totalLines === 1) return lead;
+  if (isCdOnly(lead) && meaningful.length > 1) {
+    lead = `${lead} · ${meaningful[1]}`;
+  }
+  return `${lead} · ${totalLines} lines`;
+}
+
+/** One-line preview for a collapsed tool-call header. */
+export function toolArgPreview(
+  name: string,
+  args: Record<string, unknown>,
+  argString?: string,
+  max = 72,
+): string {
+  if (name === "bash") {
+    const cmd = typeof args.command === "string" ? args.command : "";
+    const summary = summarizeBashCommand(cmd);
+    if (summary) return truncate(summary, max);
+  }
+  if (name === "read_file" || name === "edit" || name === "write_file" || name === "patch") {
+    if (typeof args.path === "string" && args.path) return truncate(args.path, max);
+  }
+  if (name === "grep" || name === "glob") {
+    if (typeof args.pattern === "string" && args.pattern) return truncate(args.pattern, max);
+  }
+  if (name === "fetch" && typeof args.url === "string") return truncate(args.url, max);
+  return truncate(argString || JSON.stringify(args), max);
+}
+
 // Mirrors the core's ToolKind::Destructive classification (core/src/tools.rs
 // classify()). Read-only tools (read_file, grep, glob, …) are intentionally
 // absent — only tools that write/execute get the destructive badge + amber
@@ -75,6 +133,9 @@ const DANGEROUS_TOOLS = new Set([
   "fetch",
   "git_add",
   "git_commit",
+  "git_push",
+  "git_pull",
+  "git_branch",
   "test_env",
 ]);
 
@@ -108,8 +169,12 @@ const TOOL_ICONS: Record<string, string> = {
   git_status: "⎇",
   git_diff: "⎇",
   git_log: "⎇",
+  git_show: "⎇",
   git_add: "⎇",
   git_commit: "⎇",
+  git_push: "⎇",
+  git_pull: "⎇",
+  git_branch: "⎇",
   delete: "🗑",
   rename: "↔",
   mkdir: "📁",

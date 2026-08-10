@@ -16,6 +16,7 @@ import {
 } from "./commands";
 import type { AgentState, ApproveDecision, CoreCommand, CoreEvent, CustomProviderDraft, LiveSessionStatus, ModelInfo, NotificationItem } from "./types";
 import { setTabBadge, desktopNotify, isDesktopEnabled, attentionLabel } from "./notifications";
+import { parseSharedSession } from "./session-share";
 
 let notifSeq = 0;
 
@@ -117,6 +118,7 @@ export interface AgentApi {
   enablePlugin: (name: string) => Promise<void>;
   disablePlugin: (name: string) => Promise<void>;
   listPlugins: () => Promise<void>;
+  pluginTrustDecisions: (decisions: Record<string, "trust" | "deny">) => Promise<void>;
   listAgents: () => Promise<void>;
   // ── Usage ──
   usage: (model?: string) => Promise<void>;
@@ -204,9 +206,15 @@ export function useAgent(): AgentApi {
   // (null = the default workspace session); changing it reopens the stream.
   // `activeRef`/`workspaceRef` route commands to the viewed session and are kept
   // in sync from snapshots WITHOUT reopening the stream.
-  const [streamSessionId, setStreamSessionId] = useState<string | null>(null);
-  const activeRef = useRef<string | null>(null);
-  const workspaceRef = useRef<string>("");
+  const sharedTarget = useMemo(
+    () => (typeof window === "undefined" ? null : parseSharedSession(window.location.search)),
+    [],
+  );
+  const [streamSessionId, setStreamSessionId] = useState<string | null>(
+    sharedTarget?.session ?? null,
+  );
+  const activeRef = useRef<string | null>(sharedTarget?.session ?? null);
+  const workspaceRef = useRef<string>(sharedTarget?.workspace ?? "");
   /** Bumps on each stream effect so stale EventSource handlers are ignored. */
   const streamGenRef = useRef(0);
   /** Serializes undo so rapid double-/undo can't soft+hard wipe. */
@@ -495,8 +503,8 @@ export function useAgent(): AgentApi {
         followUpQueued: false,
         pendingUndo: false,
         pendingApproval: null,
+        pendingPluginTrust: null,
         pendingIntercom: null,
-        pendingAsk: null,
         pendingSudo: null,
         pendingOauth: null,
         workState: null,
@@ -812,6 +820,7 @@ export function useAgent(): AgentApi {
       pendingSudo: null,
       pendingIntercom: null,
       pendingOauth: null,
+      pendingPluginTrust: null,
       workState: null,
       goalMode: null,
       goalPlan: null,
@@ -1112,6 +1121,12 @@ export function useAgent(): AgentApi {
       await post({ type: "list_plugins" });
     },
     [send, post],
+  );
+  const pluginTrustDecisions = useCallback(
+    async (decisions: Record<string, "trust" | "deny">) => {
+      await send({ type: "plugin_trust_decisions", decisions });
+    },
+    [send],
   );
   const listPlugins = useCallback(() => fire({ type: "list_plugins" }), [fire]);
   const listAgents = useCallback(() => fire({ type: "list_agents" }), [fire]);
@@ -1450,6 +1465,7 @@ export function useAgent(): AgentApi {
       dismissOauth,
       undo,
       clear,
+      pluginTrustDecisions,
       saveMemory,
       listMemory,
       forgetMemory,

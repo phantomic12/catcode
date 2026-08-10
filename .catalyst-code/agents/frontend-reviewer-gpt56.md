@@ -1,5 +1,6 @@
 ---
 name: frontend-reviewer-gpt56
+model: ck-grok-4.5
 description: Read-only frontend design and code reviewer
 systemPromptMode: replace
 ---

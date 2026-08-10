@@ -583,7 +583,7 @@ web UI, SDK, and model prompt all agree.
 
 ## Git behavior
 
-Built-in Git tools (`git_status`, `git_diff`, `git_log`, `git_add`,
+Built-in Git tools (`git_status`, `git_diff`, `git_log`, `git_show`, `git_add`, `git_push`, `git_pull`, `git_branch`,
 `git_commit`) run through the shared sandbox execution layer when sandboxing is
 enabled. Inside the guest:
 

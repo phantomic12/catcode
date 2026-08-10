@@ -19,22 +19,22 @@ Use when asked to "review the whole codebase" / "audit everything" / find bugs a
 
 1. **Map structure + sizes first.** `list_dir` each component, then `wc -l` the files sorted descending. Split the largest component (often Rust core) into multiple reviewers by file/group so no single reviewer drowns. Rule of thumb: ≤1.5k LOC per reviewer for depth.
 
-2. **The hard cap gotcha.** The `subagent` tool's parallel `tasks` mode rejects > `parallel_max_tasks` (default **8**) instantly with `"parallel has N tasks (max M)"` and registers NO runs. So **split reviewers into batches of ≤8**. (Single-mode has no cap but blocks one-at-a-time.) Within a batch, set `concurrency` = batch size to run all at once.
+2. **Soft default, not a hard reject.** The `subagent` tool's parallel `tasks` mode uses a soft default max of **8** (`parallel_max_tasks`). Larger batches are allowed — they queue under the concurrency semaphore (only `concurrency` run at once) and emit an info note. Set `concurrency` to the batch size when you want them all running together. Absolute safety max is 256 tasks. (Single-mode has no task-count cap but blocks one-at-a-time.)
 
 3. **Each task = fresh context, so be self-contained.** Give every reviewer: the exact files to read (with approx LOC), the focus areas, the output contract (`file:line` evidence + severity critical/high/medium/low + suggested fix), and "be thorough and evidence-based." Don't assume it inherited anything from your conversation.
 
 4. **Pick the model per the request.** Pass `model: "<id>"` on each task (per-task model override is supported: `{agent, task, model?}`). Verify the model resolves first with ONE cheap single-mode test (`task: "Reply with the single word OK"`) — if it fails, the model likely isn't in the discovered-models cache; the failure is instant (0.0s, no runs).
 
-5. **Dispatch batch 1 (≤8), await aggregated result**, then batch 2, etc. Each parallel batch returns concatenated `=== Parallel Task N (agent) ===` blocks.
+5. **Dispatch in one parallel call when practical**, or split only if you prefer smaller waves. Each parallel call returns concatenated `=== Parallel Task N (agent) ===` blocks. Prefer setting `concurrency` to the number of tasks so they run together rather than queue behind the default concurrency (4).
 
 6. **Synthesize, don't dump.** Dedupe related findings across reviewers, group by severity (not by reviewer), and rank. Keep full detail in a written report file (e.g. `REVIEW.md`); give the user a tight exec summary + pointer.
 
-7. **Verify surprising Criticals before reporting.** Small models (e.g. `deepseek-v4-flash`) are accurate on spot-checks but line numbers drift. For any Critical claim that is surprising/high-stakes, re-read the cited lines yourself before asserting it. This converts "the reviewer said" into "verified."
+7. **Verify surprising Criticals before reporting.** Reviewer models can drift on line numbers. For any Critical claim that is surprising/high-stakes, re-read the cited lines yourself before asserting it. This converts "the reviewer said" into "verified."
 
-8. **Save the reusable dispatch gotcha** to memory once (`parallel-subagent-cap`) — don't rediscover the 8-task limit next time.
+8. **Remember the soft default** (`parallel-subagent-cap` memory): default advisory max is 8, but explicit larger batches + higher `concurrency` are honored (absolute max 256).
 
 ## Example shape (this repo)
-12 reviewers → 2 batches of 8 + 4, all `model: "deepseek-v4-flash"`:
+12 reviewers → one parallel call with `concurrency: 12`, all `model: "ck-grok-4.5"`:
 - 6 Rust-core reviewers (main.rs / tools.rs / provider.rs / subagent+intercom / plugins+config / smaller modules)
 - 3 Go-TUI reviewers (dispatch+lifecycle / modal+keybinds / rendering)
 - 1 SDK, 1 web, 1 build/CI/Docker

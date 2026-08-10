@@ -1,5 +1,6 @@
 ---
 name: oauth-fetch-reviewer
+model: ck-grok-4.5
 description: Review oauth.rs + fetch_tool.rs + search_tool.rs + vision.rs — auth, fetch, search, vision
 build-test-release: true
 allow:

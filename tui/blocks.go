@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"html"
 	"path/filepath"
 	"strings"
 	"time"
@@ -28,6 +29,7 @@ const (
 	blkThinking
 	blkTool
 	blkToolResult
+	blkAdvisor // durable watchdog review record; finalized in place from advisor_status/note
 	blkInfo
 	blkSuccess
 	blkWarn
@@ -47,29 +49,30 @@ const (
 )
 
 type block struct {
-	kind        blockKind
-	text        strings.Builder // streamed content (assistant / thinking) or raw
-	name        string          // tool name (blkTool / blkApprove)
-	args        string          // tool args
-	output      string          // blkToolResult
-	diff        string          // blkTool: unified-diff text (tool_result only); shown instead of output when present
-	started     time.Time       // blkTool: when the call began
-	dur         time.Duration   // blkTool: elapsed until result
-	collapsed   bool            // blkThinking only
-	model       string          // blkAssistant: model id (for the role line)
-	sub         bool            // blkTool: a spawn:* sub-agent internal call (collapsed)
-	id          string          // blkTool: tool-call id, to match results out of order
-	expanded    bool            // blkTool / blkToolResult: full output shown (ctrl+o)
-	ok          bool            // blkTool: outcome.ok from tool_result (false on error/deny)
-	hasOk       bool            // blkTool: true once a result landed (distinguishes in-flight)
-	renderW     int             // P1-12: width the streaming block was last rendered at
-	renderLen   int             // P1-12: text length at last render (throttle)
-	renderStr   string          // cached render (pre-decoration) keyed by renderW + renderTheme
-	renderTheme string          // activeTheme.name when renderStr was produced (theme invalidation)
-	renderStart int             // first rendered transcript line (zero based)
-	renderEnd   int             // last rendered transcript line (inclusive)
-	approval    approvalBlockState
-	trimmed     int // blkTrimmed: number of evicted blocks
+	kind         blockKind
+	text         strings.Builder // streamed content (assistant / thinking) or raw
+	name         string          // tool name (blkTool / blkApprove)
+	args         string          // tool args
+	output       string          // blkToolResult
+	diff         string          // blkTool: unified-diff text (tool_result only); shown instead of output when present
+	started      time.Time       // blkTool: when the call began
+	dur          time.Duration   // blkTool: elapsed until result
+	collapsed    bool            // blkThinking only
+	model        string          // blkAssistant: model id (for the role line)
+	sub          bool            // blkTool: a spawn:* sub-agent internal call (collapsed)
+	id           string          // blkTool: tool-call id, to match results out of order
+	expanded     bool            // blkTool / blkToolResult: full output shown (ctrl+o)
+	ok           bool            // blkTool: outcome.ok from tool_result (false on error/deny)
+	hasOk        bool            // blkTool: true once a result landed (distinguishes in-flight)
+	advisorState string          // blkAdvisor: reviewing/clear/finding/failed/etc.
+	renderW      int             // P1-12: width the streaming block was last rendered at
+	renderLen    int             // P1-12: text length at last render (throttle)
+	renderStr    string          // cached render (pre-decoration) keyed by renderW + renderTheme
+	renderTheme  string          // activeTheme.name when renderStr was produced (theme invalidation)
+	renderStart  int             // first rendered transcript line (zero based)
+	renderEnd    int             // last rendered transcript line (inclusive)
+	approval     approvalBlockState
+	trimmed      int // blkTrimmed: number of evicted blocks
 }
 
 // push appends a block and updates the streaming cursor. Streaming kinds
@@ -163,7 +166,7 @@ func (s *session) hasConversation() bool {
 			continue
 		}
 		switch b.kind {
-		case blkUser, blkAssistant, blkThinking, blkTool, blkToolResult, blkApprove:
+		case blkUser, blkAssistant, blkThinking, blkTool, blkToolResult, blkAdvisor, blkApprove:
 			return true
 		}
 	}
@@ -435,7 +438,9 @@ func compactToolDetail(b *block) string {
 		if command == "" {
 			command = bareToolArg(b.args)
 		}
-		add(command)
+		// One-line summary only — full multi-line scripts blow the activity
+		// card into a padded wall. Ctrl+O expands to renderBashBlock.
+		add(summarizeBashCommand(command))
 	case "git_commit":
 		if message := b.arg("message"); message != "" {
 			add(`"` + message + `"`)
@@ -533,25 +538,31 @@ func bareToolArg(args string) string {
 	return ""
 }
 
-// scheduleStreamRefresh coalesces token deltas into one viewport rebuild per
-// frame. The core-event pump remains armed, so streaming throughput and tool /
-// approval latency are unaffected while long transcripts avoid SetContent on
-// every token.
+// scheduleStreamRefresh coalesces token deltas into bounded terminal repaint
+// work. The core event pump remains armed, so tool/approval latency is not
+// coupled to visual refresh. Terminal output is materially costlier than an
+// in-memory UI frame, especially over multiplexers and SSH: cap short sessions
+// at 15 FPS and progressively reduce repaint frequency for larger transcripts.
 func (s *session) scheduleStreamRefresh() tea.Cmd {
 	wait := waitForEvent(s.coreEvents, s.coreStartGen)
 	if s.streamRefreshPending {
 		return wait
 	}
 	s.streamRefreshPending = true
-	frameDelay := 33 * time.Millisecond
-	if len(s.blocks) > 300 {
-		frameDelay = 100 * time.Millisecond
-	} else if len(s.blocks) > 100 {
-		frameDelay = 66 * time.Millisecond
-	}
-	return tea.Batch(wait, tea.Tick(frameDelay, func(time.Time) tea.Msg {
+	return tea.Batch(wait, tea.Tick(streamRefreshInterval(len(s.blocks)), func(time.Time) tea.Msg {
 		return streamRefreshMsg{}
 	}))
+}
+
+func streamRefreshInterval(blocks int) time.Duration {
+	switch {
+	case blocks > 300:
+		return 150 * time.Millisecond
+	case blocks > 100:
+		return 100 * time.Millisecond
+	default:
+		return 66 * time.Millisecond
+	}
 }
 
 func (s *session) renderCoreFailure() string {
@@ -702,6 +713,125 @@ func (s *session) logTool(name, args string, sub bool) *block {
 	b.started = time.Now()
 	s.refresh()
 	return b
+}
+
+// recordAdvisorReview adds or updates one durable reviewer record. Status and
+// note events share a stable id, so a live review is one transcript entry.
+func (s *session) recordAdvisorReview(scope, advisor, model, state, detail, severity string, elapsed time.Duration) {
+	if advisor == "" {
+		advisor = "default"
+	}
+	key := scope + ":" + advisor + ":" + model
+	var b *block
+	if state != "reviewing" {
+		for i := len(s.blocks) - 1; i >= 0; i-- {
+			candidate := s.blocks[i]
+			if candidate != nil && candidate.kind == blkAdvisor && candidate.id == key {
+				b = candidate
+				break
+			}
+		}
+	}
+	if b == nil {
+		b = s.push(blkAdvisor)
+		b.id, b.name, b.model = key, advisor, model
+	}
+	b.advisorState = state
+	if detail != "" {
+		b.output = capOutput(detail)
+	}
+	if severity != "" {
+		b.args = severity
+	}
+	if elapsed > 0 {
+		b.dur = elapsed
+	}
+	b.renderStr = ""
+	s.invalidateAll()
+	s.refresh()
+}
+
+func renderAdvisorBlock(b *block, w int) string {
+	state := b.advisorState
+	if state == "" {
+		state = "finding"
+	}
+	severity := strings.ToLower(strings.TrimSpace(b.args))
+	label, dot, tone := "reviewing", "◷", roToolNameStyle
+	failure := false
+	switch state {
+	case "clear":
+		label, dot, tone = "clear", "✓", successStyle
+	case "finding":
+		label = severity
+		if label == "" {
+			label = "finding"
+		}
+		if severity == "concern" || severity == "blocker" {
+			dot, tone = "!", warnStyle
+		} else {
+			dot, tone = "·", mutedStyle
+		}
+	case "failed", "no_key", "invalid_response":
+		label, dot, tone, failure = state, "✗", errStyle, true
+	case "duplicate":
+		label, dot, tone = "duplicate", "·", mutedStyle
+	}
+	left := tone.Render(dot+" advisor") + " " + toolNameStyleFor("read_file").Render(b.name)
+	if b.model != "" {
+		left += dimStyle.Render("  " + b.model)
+	}
+	right := tone.Render(label)
+	if b.dur > 0 {
+		right = dimStyle.Render(fmt.Sprintf("%.1fs", b.dur.Seconds())) + " " + right
+	}
+	head := fitRow(w, left, right)
+	body := strings.TrimSpace(b.output)
+	if body == "" && state == "reviewing" {
+		body = "Checking the completed work against the request…"
+	} else if body == "" && state == "clear" {
+		body = "No actionable finding."
+	} else if body == "" && failure {
+		body = "Reviewer was unavailable; the executor continued."
+	}
+	if body == "" {
+		return head
+	}
+	style := mutedStyle
+	if failure {
+		style = errOutStyle
+	} else if severity == "concern" || severity == "blocker" {
+		style = warnStyle
+	}
+	return head + "\n" + style.Render(renderMarkdown(body, max(12, w-2)))
+}
+
+func parseHistoricalAdvisory(raw string) (advisor, severity, finding string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(raw, "<advisory ") {
+		return "", "", "", false
+	}
+	close, end := strings.Index(raw, ">"), strings.LastIndex(raw, "</advisory>")
+	if close < 0 || end <= close {
+		return "", "", "", false
+	}
+	attrs := raw[:close]
+	attr := func(name string) string {
+		prefix := name + `="`
+		start := strings.Index(attrs, prefix)
+		if start < 0 {
+			return ""
+		}
+		start += len(prefix)
+		finish := strings.Index(attrs[start:], `"`)
+		if finish < 0 {
+			return ""
+		}
+		return html.UnescapeString(attrs[start : start+finish])
+	}
+	advisor, severity = attr("advisor"), attr("severity")
+	finding = strings.TrimSpace(html.UnescapeString(raw[close+1 : end]))
+	return advisor, severity, finding, advisor != "" && finding != ""
 }
 
 // captureTodos parses a todo_write args blob and stores the latest todo list in
@@ -881,12 +1011,10 @@ func (s *session) logRaw(styled string) {
 // boxed card around every message. Tool output gets a left `│` rule panel.
 // ---------------------------------------------------------------------------
 
-// renderBlock renders a block, throttling re-renders of the LIVE streaming
-// block (s.cur) so a long reply isn't O(L^2): reuse the last render until the
-// text grows by >= streamBatch bytes or a newline / width change forces a fresh
-// full render. Every actual render is a complete re-render of the current text,
-// so this is purely a frequency cap (<= streamBatch bytes of display latency),
-// not a correctness compromise.
+// renderBlock renders a live streaming block only after enough new content has
+// accumulated to justify a complete markdown/layout pass. The stream refresh
+// clock bounds visual latency; this byte threshold avoids repeated full renders
+// for tiny deltas between clocks.
 //
 // Finalized blocks additionally cache their full render (Glamour + lipgloss
 // output, PRE-decoration) keyed by (width, theme). invalidateAll drops only the
@@ -959,7 +1087,7 @@ func (s *session) renderKeyHints(out string) string {
 	return out
 }
 
-const streamBatch = 64 // P1-12: bytes of streaming growth between full re-renders
+const streamBatch = 128 // bytes of display latency before a live block re-renders
 
 func (s *session) renderBlockFull(b *block, w int) string {
 	switch b.kind {
@@ -1002,6 +1130,8 @@ func (s *session) renderBlockFull(b *block, w int) string {
 		return s.renderToolBlock(b, w)
 	case blkToolResult:
 		return renderOutputPanel(strings.TrimSpace(b.output), b.expanded, w, "lines", false)
+	case blkAdvisor:
+		return renderAdvisorBlock(b, w)
 	case blkSuccess:
 		return renderStatusLine("✓ ", successStyle, baseStyle, b.text.String(), w)
 	case blkWarn:
@@ -1126,12 +1256,14 @@ func (s *session) renderToolBlock(b *block, w int) string {
 		return renderGitStatusBlock(b, w)
 	case "git_log":
 		return renderGitLogBlock(b, w)
-	case "git_diff":
+	case "git_diff", "git_show":
 		return renderGitDiffBlock(b, w)
 	case "git_add":
 		return renderGitAddBlock(b, w)
 	case "git_commit":
 		return renderGitCommitBlock(b, w)
+	case "git_push", "git_pull", "git_branch":
+		return renderGenericToolBlock(b, w)
 	case "todo_write":
 		return renderTodoWriteBlock(b, w)
 	case "todo_read":
@@ -1436,30 +1568,18 @@ func bodyIndent(body string) string {
 	return strings.Join(lines, "\n")
 }
 
-// renderUserBubble wraps the user's message in a right-aligned rounded surface
-// card. The bubble width is capped so long conversations keep a clear rhythm
-// and short messages don't stretch across the whole terminal.
+// Turns use compact labeled rails. The small header carries role identity while
+// preserving stable transcript rows for navigation and text selection.
 func (s *session) renderUserBubble(text string, w int) string {
-	maxW := max(24, w*6/10)
-	if maxW > w-4 {
-		maxW = w - 4
-	}
-	innerW := maxW - 4 // card border + horizontal padding
-	content := renderMarkdown(text, innerW)
-	card := cardStyle.Width(maxW).Render(content)
-	return lipgloss.NewStyle().Width(w).Align(lipgloss.Right).Render(card)
+	return turnHeader("YOU", c.user, w) + "\n" + heavyRail(renderMarkdown(text, max(1, w-2)), userRailStyle)
 }
 
-// renderAssistantTurn renders the model's reply as full-width prose with a
-// quiet model tag above and a thin accent rail down the left.
 func (s *session) renderAssistantTurn(meta, text string, w int, markdown func(string, int) string) string {
-	var out strings.Builder
+	label := "CATALYST"
 	if meta != "" {
-		out.WriteString(dimStyle.Render("  " + truncate(meta, 48)))
-		out.WriteByte('\n')
+		label += "  " + truncate(meta, max(8, w/2))
 	}
-	out.WriteString(turnRail(markdown(text, w-2), railStyle))
-	return out.String()
+	return turnHeader(label, c.accent, w) + "\n" + bodyIndent(markdown(text, max(1, w-2)))
 }
 
 // turnHeader renders a ledger section header: the role tag on the left, then a
@@ -1491,100 +1611,62 @@ var welcomeExamples = []string{
 	"Review recent changes",
 }
 
-// surfacePanel returns the shared "card" chrome for centred empty-state panels
-// (welcome / login / starting): hairline railDim border + a lifted surface fill,
-// the same material as the composer so all card chrome reads as one system.
+// surfacePanel is the shared quiet focus surface for empty and blocking states.
+// It uses theme-derived depth and hairline rails, never a new authored color.
 func surfacePanel(width int) lipgloss.Style {
 	return lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
+		BorderStyle(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color(c.railDim)).
-		BorderBackground(lipgloss.Color(c.surface)).
 		Background(lipgloss.Color(c.surface)).
-		Padding(0, 1).
+		Padding(1, 2).
 		Width(width)
 }
 
 func (s *session) renderWelcome() string {
 	w := s.viewport.Width()
 	h := s.viewport.Height()
-
 	if s.showingSplash() {
 		return s.renderSplashScreen(w, h)
 	}
-
-	// Unauthed first-run: lead with login instead of example prompts.
-	// canSend (not bare authed) so multi-provider sessions with a broken
-	// active provider still show the normal welcome once models are ready.
 	if !s.canSend() {
-		panelW := 50
-		if w-4 < panelW {
-			panelW = w - 4
-		}
-		if panelW < 1 {
-			panelW = 1
-		}
+		panelW := min(58, max(1, w-4))
 		rows := []string{
-			accentStyle.Render("◆ Get started"),
+			accentStyle.Render("◆  CONNECT CATALYST"),
+			dimStyle.Render("Authentication required before the workspace can run."),
 			"",
 			baseStyle.Render("No API key yet — log in to start chatting."),
-			"",
-			dimStyle.Render("Enter opens /login · / for commands · ? help"),
+			keyHintStyle.Render("Enter opens /login · / commands · ? help"),
 		}
 		panel := surfacePanel(panelW).Render(strings.Join(rows, "\n"))
 		return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, panel)
 	}
+	idx := min(max(0, s.welcomeIdx), len(welcomeExamples)-1)
 	if h < 10 || w < 32 {
-		idx := min(max(0, s.welcomeIdx), len(welcomeExamples)-1)
 		lines := []string{
-			accentStyle.Render("What would you like to build?"),
-			accentStyle.Render(fmt.Sprintf("▸ %d. %s", idx+1, welcomeExamples[idx])),
-			dimStyle.Render("↑↓ choose · enter use · / commands"),
+			boldBaseStyle.Render("START A SESSION"),
+			accentStyle.Render(fmt.Sprintf("▸ %d  %s", idx+1, welcomeExamples[idx])),
+			keyHintStyle.Render("↑↓ choose  ·  enter use  ·  / commands"),
 		}
 		return lipgloss.Place(w, h, lipgloss.Left, lipgloss.Center, strings.Join(lines, "\n"))
 	}
-
-	// build the example panel
-	panelW := 50
-	if w-4 < panelW {
-		panelW = w - 4
+	panelW := min(58, max(1, w-4))
+	rows := []string{
+		accentStyle.Render("◆  CATALYST CODE"),
+		boldBaseStyle.Render("What would you like to build?"),
+		dimStyle.Render("Choose a starting point or type below."),
+		"",
 	}
-	if panelW < 1 {
-		panelW = 1
-	}
-	var rows []string
-	rows = append(rows, accentStyle.Render("What would you like to build?"), "")
 	for i, ex := range welcomeExamples {
 		marker := "  "
-		if i == s.welcomeIdx {
+		text := baseStyle.Render(ex)
+		if i == idx {
 			marker = accentStyle.Render("▸ ")
+			text = accentStyle.Render(ex)
 		}
-		num := dimStyle.Render(fmt.Sprintf("%d.", i+1))
-		textStyle := baseStyle
-		if i == s.welcomeIdx {
-			textStyle = accentStyle
-		}
-		prefix := marker + num + " "
-		wrapped := strings.Split(wrapPlain(ex, max(8, panelW-lipgloss.Width(prefix)-4)), "\n")
-		for j, line := range wrapped {
-			if j == 0 {
-				rows = append(rows, prefix+textStyle.Render(line))
-			} else {
-				rows = append(rows, strings.Repeat(" ", lipgloss.Width(prefix))+textStyle.Render(line))
-			}
-		}
+		rows = append(rows, marker+dimStyle.Render(fmt.Sprintf("%d", i+1))+"  "+text)
 	}
-	rows = append(rows, "")
-	rows = append(rows, dimStyle.Render("↑↓ pick · enter to use · / commands · ? help"))
-	panel := strings.Join(rows, "\n")
-
-	// wrap the panel in a subtle rounded border
-	panel = lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(c.decor)).
-		Padding(0, 1).
-		Width(panelW).
-		Render(panel)
-
+	rows = append(rows, "", keyHintStyle.Render("↑↓ select   Enter use   / commands"))
+	panel := surfacePanel(panelW).Render(strings.Join(rows, "\n"))
 	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, panel)
 }
 
@@ -1667,6 +1749,16 @@ func (s *session) rebuildBlocksFromHistory(msgs []map[string]json.RawMessage) {
 				}
 				msg["tool_calls"] = nil
 			}
+		case "system":
+			if advisor, severity, finding, ok := parseHistoricalAdvisory(contentText(msg["content"])); ok {
+				b := s.push(blkAdvisor)
+				b.name = advisor
+				b.advisorState = "finding"
+				b.output = finding
+				b.args = severity
+				b.dur = 1 // historical entry: finalized
+			}
+			msg["content"] = nil
 		case "tool":
 			out := contentText(msg["content"])
 			msg["content"] = nil

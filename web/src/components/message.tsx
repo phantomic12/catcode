@@ -9,7 +9,7 @@ import { memo, useState, useEffect, useRef, type ReactNode } from "react";
 import type { ComponentPropsWithoutRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { AssistantMsg, BashMsg, GoalMsg, ToolMsg, UserMsg, UIMessage } from "@/lib/types";
+import type { AdvisorMsg, AssistantMsg, BashMsg, GoalMsg, ToolMsg, UserMsg, UIMessage } from "@/lib/types";
 import { formatTokens } from "@/lib/format";
 import { Markdown } from "./markdown";
 import { Thinking } from "./thinking";
@@ -323,6 +323,47 @@ function BashMessage({ m }: { m: BashMsg }) {
   );
 }
 
+function AdvisorMessage({ m }: { m: AdvisorMsg }) {
+  const failed = ["failed", "no_key", "invalid_response"].includes(m.state);
+  const actionable = m.severity === "concern" || m.severity === "blocker";
+  const tone = failed
+    ? { bar: "border-danger", dot: "bg-danger", label: "text-danger" }
+    : actionable
+      ? { bar: "border-warning", dot: "bg-warning", label: "text-warning" }
+      : m.state === "clear"
+        ? { bar: "border-success", dot: "bg-success", label: "text-success" }
+        : { bar: "border-accent", dot: "bg-accent-soft", label: "text-accent-soft" };
+  const label = m.severity || m.state || "reviewing";
+  const text = m.text || (m.state === "reviewing"
+    ? "Checking the completed work against the request…"
+    : m.state === "clear"
+      ? "No actionable finding."
+      : failed
+        ? "Reviewer was unavailable; the executor continued."
+        : "");
+  return (
+    <article className="chat-turn chat-turn--meta chat-msg-enter pr-2 sm:pr-4">
+      <span className="chat-turn-tick" aria-hidden="true" />
+      <span className="sr-only">Advisor review</span>
+      <div className={`chat-run-record my-2 border border-ink-800 border-l-2 bg-ink-925 px-3.5 py-2.5 ${tone.bar}`}>
+        <div className="flex min-w-0 items-center gap-2 font-mono text-[10px] uppercase tracking-[0.12em]">
+          <span className={`h-1.5 w-1.5 shrink-0 rounded-none ${tone.dot}`} aria-hidden="true" />
+          <span className={tone.label}>advisor</span>
+          <span className="truncate text-ink-300">{m.advisor || "default"}</span>
+          {m.model && <span className="truncate text-ink-600 normal-case">{m.model}</span>}
+          <span className="ml-auto shrink-0 text-ink-500">{label}</span>
+          {m.elapsedMs != null && <span className="shrink-0 text-ink-600">{(m.elapsedMs / 1000).toFixed(1)}s</span>}
+        </div>
+        {text && (
+          <pre className={`mt-1.5 max-h-48 overflow-auto whitespace-pre-wrap break-words text-[12px] leading-relaxed ${failed ? "text-danger" : "text-ink-300"}`}>
+            {text}
+          </pre>
+        )}
+      </div>
+    </article>
+  );
+}
+
 function GoalMessage({ m }: { m: GoalMsg }) {
   const tone =
     m.ok === false || m.status === "failed"
@@ -388,6 +429,7 @@ export const Message = memo(function Message({
       />
     );
   if (m.role === "bash") return <BashMessage m={m} />;
+  if (m.role === "advisor") return <AdvisorMessage m={m} />;
   if (m.role === "goal") return <GoalMessage m={m} />;
   return <ToolMessage m={m} />;
 });

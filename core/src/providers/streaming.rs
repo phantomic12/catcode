@@ -176,6 +176,8 @@ fn stream_error_detail(error: &Value) -> String {
 }
 
 fn is_retryable_stream_error(error: &Value, detail: &str) -> bool {
+    use crate::providers::adapter::is_non_retryable_provider_message;
+
     let code = error
         .get("code")
         .and_then(|code| {
@@ -193,33 +195,88 @@ fn is_retryable_stream_error(error: &Value, detail: &str) -> bool {
     let kind_l = kind.to_ascii_lowercase();
     let detail_l = detail.to_ascii_lowercase();
 
-    matches!(
+    // Rate limits and balance/billing fail fast — check type/code/message.
+    if is_non_retryable_provider_message(detail)
+        || matches!(
+            code_l.as_str(),
+            "rate_limit"
+                | "rate_limit_exceeded"
+                | "rate_limit_error"
+                | "insufficient_quota"
+                | "insufficient_balance"
+                | "billing_not_active"
+                | "429"
+                | "402"
+        )
+        || matches!(
+            kind_l.as_str(),
+            "rate_limit" | "rate_limit_error" | "rate_limit_exceeded" | "insufficient_quota"
+        )
+    {
+        return false;
+    }
+
+    // Permanent account/request failures stay fatal even if not rate/balance.
+    // Message phrases catch vendors that invent types (e.g. cursor_sdk_error
+    // with "authentication failed"). Keep matches specific — bare tokens like
+    // "forbidden"/"authentication" alone false-positive rate-limit copy.
+    if matches!(
         code_l.as_str(),
-        "rate_limit"
-            | "rate_limit_exceeded"
-            | "server_error"
+        "invalid_api_key"
+            | "invalid_request"
+            | "invalid_request_error"
+            | "authentication_error"
+            | "permission_error"
+            | "not_found_error"
+            | "context_length_exceeded"
+            | "401"
+            | "403"
+            | "404"
+            | "422"
+    ) || matches!(
+        kind_l.as_str(),
+        "invalid_request_error" | "authentication_error" | "permission_error" | "not_found_error"
+    ) || detail_l.contains("authentication failed")
+        || detail_l.contains("authentication error")
+        || detail_l.contains("unauthorized")
+        || detail_l.contains("invalid_api_key")
+        || detail_l.contains("invalid api key")
+        || detail_l.contains("invalid credentials")
+        || detail_l.contains("access denied")
+        || detail_l.contains("permission denied")
+        || detail_l.contains("context_length")
+        || detail_l.contains("context length")
+        || detail_l.contains("maximum context")
+        || detail_l.contains("prompt is too long")
+        || detail_l.contains("input is too long")
+    {
+        return false;
+    }
+
+    // Explicit transient codes/kinds.
+    if matches!(
+        code_l.as_str(),
+        "server_error"
             | "overloaded"
             | "overloaded_error"
             | "timeout"
-            | "429"
             | "500"
             | "502"
             | "503"
             | "504"
     ) || matches!(
         kind_l.as_str(),
-        "rate_limit"
-            | "rate_limit_error"
-            | "rate_limit_exceeded"
-            | "server_error"
-            | "overloaded"
-            | "overloaded_error"
-            | "api_error"
-            | "timeout"
-    ) || detail_l.contains("rate limit")
-        || detail_l.contains("too many requests")
-        || detail_l.contains("overloaded")
+        "server_error" | "overloaded" | "overloaded_error" | "api_error" | "timeout"
+    ) || detail_l.contains("overloaded")
         || detail_l.contains("temporarily unavailable")
+        || detail_l.contains("server_error")
+    {
+        return true;
+    }
+
+    // Default: retry any other provider stream error (user policy — everything
+    // except rate-limit / balance). Permanent codes already returned false.
+    true
 }
 
 /// Normalize one parsed OpenAI-compatible SSE data object. Transport framing,
@@ -390,9 +447,90 @@ mod tests {
 
     #[test]
     fn normalizes_provider_error_without_panicking() {
+        // Unclassified provider stream errors default to retryable.
         assert_eq!(
             decode_openai_chunk(&fixture("error")),
             vec![NormalizedStreamEvent::RetryableError("busy".into())]
+        );
+    }
+
+    #[test]
+    fn rate_limit_stream_errors_are_fatal() {
+        assert_eq!(
+            decode_openai_chunk(&json!({
+                "error": { "type": "rate_limit_error", "message": "slow down" }
+            })),
+            vec![NormalizedStreamEvent::FatalError("slow down".into())]
+        );
+        assert_eq!(
+            decode_openai_chunk(&json!({
+                "error": { "code": "rate_limit_exceeded", "message": "too many requests" }
+            })),
+            vec![NormalizedStreamEvent::FatalError(
+                "too many requests".into()
+            )]
+        );
+        assert_eq!(
+            decode_openai_chunk(&json!({
+                "error": { "message": "insufficient credits — top up" }
+            })),
+            vec![NormalizedStreamEvent::FatalError(
+                "insufficient credits — top up".into()
+            )]
+        );
+        // Vendor-specific type still fatal when message is clearly auth.
+        assert_eq!(
+            decode_openai_chunk(&json!({
+                "error": {
+                    "type": "cursor_sdk_error",
+                    "message": "Cursor SDK authentication failed"
+                }
+            })),
+            vec![NormalizedStreamEvent::FatalError(
+                "Cursor SDK authentication failed".into()
+            )]
+        );
+        // Context-length message path (no standard code/type).
+        assert_eq!(
+            decode_openai_chunk(&json!({
+                "error": {
+                    "type": "provider_error",
+                    "message": "prompt is too long for this model"
+                }
+            })),
+            vec![NormalizedStreamEvent::FatalError(
+                "prompt is too long for this model".into()
+            )]
+        );
+        // Rate-limit payload that merely mentions "forbidden" stays Retryable
+        // only when type/code are not rate-limit; with rate_limit type it is Fatal.
+        // Bare incidental words must NOT flip an otherwise-retryable server blip.
+        assert_eq!(
+            decode_openai_chunk(&json!({
+                "error": {
+                    "type": "server_error",
+                    "message": "upstream said forbidden briefly; retry"
+                }
+            })),
+            vec![NormalizedStreamEvent::RetryableError(
+                "upstream said forbidden briefly; retry".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn retryable_error_from_type_and_string_error() {
+        assert_eq!(
+            decode_openai_chunk(&json!({
+                "error": { "type": "server_error", "message": "blip" }
+            })),
+            vec![NormalizedStreamEvent::RetryableError("blip".into())]
+        );
+        assert_eq!(
+            decode_openai_chunk(&json!({ "error": "overloaded right now" })),
+            vec![NormalizedStreamEvent::RetryableError(
+                "overloaded right now".into()
+            )]
         );
     }
 
@@ -455,22 +593,6 @@ mod tests {
         assert_eq!(
             events,
             vec![NormalizedStreamEvent::FatalError("nope".into())]
-        );
-    }
-
-    #[test]
-    fn retryable_error_from_type_and_string_error() {
-        assert_eq!(
-            decode_openai_chunk(&json!({
-                "error": { "type": "rate_limit_error", "message": "slow down" }
-            })),
-            vec![NormalizedStreamEvent::RetryableError("slow down".into())]
-        );
-        assert_eq!(
-            decode_openai_chunk(&json!({ "error": "overloaded right now" })),
-            vec![NormalizedStreamEvent::RetryableError(
-                "overloaded right now".into()
-            )]
         );
     }
 

@@ -40,6 +40,7 @@
             "search_marketplace_skills", "install_marketplace_skill", "update_marketplace_skill",
             "remove_marketplace_skill", "refresh_models", "apply_skill", "start_goal",
             "cancel_goal", "goal_status", "approve_goal_plan", "revise_goal",
+            "job_list", "job_status", "job_wait", "job_cancel", "session_tree", "session_branch",
             "user_bash", "add_custom_provider", "discover_provider_models",
             "get_sandbox_status", "prepare_sandbox", "reset_sandbox"
           ]
@@ -74,16 +75,16 @@
             "session_changed", "session_deleted", "session_pinned",
             "session_recovered", "session_renamed", "sessions", "skills",
             "skill_marketplace_state", "skill_marketplace_results", "skill_marketplace_changed",
-            "skill_marketplace_error", "stats",
-            "steer", "subagent_done", "subagent_message", "subagent_progress",
-            "subagent_start", "subagent_tool_call", "subagent_tool_result",
-            "sudo_request", "thinking", "tool_call", "tool_call_args",
-            "tool_call_name", "tool_call_start", "tool_result", "umans_conc",
-            "usage", "vision_config", "work_state", "worktree_cleaned",
-            "worktree_promoted", "worktree_ready", "worktree_seeded",
-            "provider_models_preview", "sandbox_error",
+            "skill_marketplace_error", "job_list", "job_status", "job_wait_result",
+            "job_cancel_requested", "job_cancel_result", "job_wait_timeout", "session_tree",
+            "session_branch", "subagent_delivery", "stats", "steer", "subagent_done",
+            "subagent_message", "subagent_progress", "subagent_start", "subagent_tool_call",
+            "subagent_tool_result", "sudo_request", "thinking", "tool_call", "tool_call_args",
+            "tool_call_name", "tool_call_start", "tool_result", "umans_conc", "usage",
+            "vision_config", "work_state", "worktree_cleaned", "worktree_promoted",
+            "worktree_ready", "worktree_seeded", "provider_models_preview", "sandbox_error",
             "sandbox_prepare_progress", "sandbox_ready", "sandbox_status", "stuck_nudge",
-            "summary_required", "advisor_note", "advisor_status"
+            "summary_required", "advisor_note", "advisor_status", "cleared", "discard_partial"
           ]
         },
         "protocol_version": { "const": 2 },

@@ -173,10 +173,7 @@ fn star_match_rule(pattern: &str, text: &str) -> bool {
 /// If `resolve` fails (e.g. the path escapes the workspace) the raw-check
 /// result stands unchanged.
 ///
-/// Covers the content-touching tools: `read_file` (read), `write_file`/
-/// `edit`/`patch` (write), and the bulk variants (each inner path is checked).
-/// Search/list tools (`grep`/`glob`/`list_dir`) and `bash` are intentionally
-/// excluded — they don't read a single restricted file's content by path.
+/// Covers content-touching tools and file-targeted searches/collection indexing.
 pub(crate) fn restricted_path_for_tool(
     name: &str,
     args: &Value,
@@ -207,6 +204,14 @@ pub(crate) fn restricted_path_for_tool(
         "read_file" | "write_file" | "edit" | "patch" | "delete" | "mkdir" => {
             path_of(args).and_then(|raw| check(raw, root))
         }
+        "grep" | "collections" => path_of(args).and_then(|raw| {
+            let resolved = workspace::resolve(root, raw).ok()?;
+            if resolved.is_file() {
+                check(raw, root)
+            } else {
+                None
+            }
+        }),
         "rename" => {
             let from = args
                 .get("from")

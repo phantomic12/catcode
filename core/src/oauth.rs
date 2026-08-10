@@ -190,8 +190,12 @@ async fn handle_redirect_stream(
             st = Some(percent_decode(v));
         }
     }
-    // Empty `state` = no CSRF check (plugin chose not to use state).
-    if state.is_empty() || st.as_deref() == Some(state) {
+    // Require non-empty state for CSRF (CORE_REVIEW). Use state "-" only when
+    // a plugin deliberately opts out of CSRF (discouraged).
+    if state.is_empty() {
+        return Err("OAuth CSRF state is required (empty state is no longer accepted)".into());
+    }
+    if state == "-" || st.as_deref() == Some(state) {
         return code
             .map(Some)
             .ok_or_else(|| "no code in redirect".to_string());

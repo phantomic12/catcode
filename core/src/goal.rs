@@ -1117,16 +1117,33 @@ pub fn emit_goal_certified(mode: &GoalMode, summary: &str) {
 /// - pass/certify: `VERDICT: PASS` | `VERDICT: CERTIFY` | `VERDICT: CERTIFIED`
 /// - fail/revise:  `VERDICT: FAIL` | `VERDICT: REVISE` | `VERDICT: REMAINING_GAPS`
 ///
-/// Fail synonyms win when both appear. Missing verdict → fail (safe default).
+/// Last non-fence `VERDICT:` line wins. Missing verdict → fail (safe default).
 pub fn parse_ceo_verdict(text: &str) -> (bool, String, Vec<String>) {
-    let upper = text.to_ascii_uppercase();
-    let fail = upper.contains("VERDICT: FAIL")
-        || upper.contains("VERDICT: REVISE")
-        || upper.contains("VERDICT: REMAINING_GAPS");
-    let pass = upper.contains("VERDICT: PASS")
-        || upper.contains("VERDICT: CERTIFY")
-        || upper.contains("VERDICT: CERTIFIED");
-    let ok = if fail { false } else { pass };
+    // Prefer the last non-code-fence line matching ^VERDICT: so prose like
+    // "do not use VERDICT: PASS until…" cannot flip the state machine (CORE_REVIEW).
+    let mut last_verdict: Option<bool> = None;
+    let mut in_fence = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let upper = trimmed.to_ascii_uppercase();
+        if !upper.starts_with("VERDICT:") {
+            continue;
+        }
+        if upper.contains("FAIL") || upper.contains("REVISE") || upper.contains("REMAINING_GAPS") {
+            last_verdict = Some(false);
+        } else if upper.contains("PASS") || upper.contains("CERTIFY") || upper.contains("CERTIFIED")
+        {
+            last_verdict = Some(true);
+        }
+    }
+    let ok = last_verdict.unwrap_or(false);
     let mut gaps: Vec<String> = Vec::new();
     let mut in_gaps = false;
     for line in text.lines() {
@@ -3660,6 +3677,24 @@ GAPS:
         assert_eq!(m.phase, GoalPhase::Planning);
         assert_eq!(m.iteration, 1);
         assert!(!m.remaining_gaps.is_empty());
+    }
+
+    #[test]
+    fn verify_failure_evidence_becomes_remaining_gap() {
+        let mut m = base_mode();
+        m.ceo_mode = true;
+        m.max_iterations = 2;
+        m.phase = GoalPhase::Verifying;
+        assert_eq!(
+            finish_verifying(
+                &mut m,
+                false,
+                "VERDICT: FAIL\nGAPS:\n- evidence validation failed: required summary unavailable"
+            ),
+            VerifyOutcome::Replan
+        );
+        assert!(!m.certified);
+        assert!(m.remaining_gaps[0].contains("evidence validation failed"));
     }
 
     #[test]

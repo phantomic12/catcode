@@ -178,6 +178,15 @@ pub fn metadata(name: &str) -> Option<ToolMetadata> {
             KillSubprocess,
             READ,
         ),
+        "git_show" => entry(
+            name_static("git_show"),
+            ReadOnly,
+            Read,
+            Safe,
+            Never,
+            KillSubprocess,
+            READ,
+        ),
         "workspace_activity" => entry(
             name_static("workspace_activity"),
             ReadOnly,
@@ -196,12 +205,23 @@ pub fn metadata(name: &str) -> Option<ToolMetadata> {
             Cooperative,
             NETWORK,
         ),
+        // Align with fetch: network egress should not be auto-approved under
+        // default Destructive mode while fetch is gated (CORE_REVIEW).
         "web_search" => entry(
             name_static("web_search"),
-            ReadOnly,
+            Destructive,
             External,
             Safe,
-            Never,
+            Inherit,
+            Cooperative,
+            NETWORK,
+        ),
+        "mcp" => entry(
+            "mcp",
+            Destructive,
+            External,
+            Sequential,
+            Inherit,
             Cooperative,
             NETWORK,
         ),
@@ -218,25 +238,33 @@ pub fn metadata(name: &str) -> Option<ToolMetadata> {
             Immediate,
             NONE,
         ),
-        "memory" | "knowledge" => entry(
-            if name == "memory" {
-                "memory"
-            } else {
-                "knowledge"
-            },
+        // memory/collections mutate durable state (save/forget/index/remove).
+        // Classify Destructive + Inherit so default Destructive mode prompts;
+        // knowledge is read-only ranking over existing stores (CORE_REVIEW).
+        "memory" => entry(
+            "memory",
+            Destructive,
+            Control,
+            Sequential,
+            Inherit,
+            Cooperative,
+            WRITE,
+        ),
+        "knowledge" => entry(
+            "knowledge",
             ReadOnly,
             Control,
             Sequential,
             Never,
             Cooperative,
-            WRITE,
+            READ,
         ),
         "collections" => entry(
             name_static("collections"),
-            ReadOnly,
+            Destructive,
             Control,
             Sequential,
-            Never,
+            Inherit,
             Cooperative,
             READ_WRITE,
         ),
@@ -253,6 +281,16 @@ pub fn metadata(name: &str) -> Option<ToolMetadata> {
             Cooperative,
             INTERACTIVE,
         ),
+        "eval" => entry(
+            "eval",
+            ReadOnly,
+            External,
+            Sequential,
+            Never,
+            KillSubprocess,
+            PROCESS,
+        ),
+        "read" => entry("read", ReadOnly, External, Safe, Never, Cooperative, READ),
         "subagent" | "spawn" => entry(
             if name == "subagent" {
                 "subagent"
@@ -275,8 +313,40 @@ pub fn metadata(name: &str) -> Option<ToolMetadata> {
             KillSubprocess,
             PROCESS,
         ),
+        "process" => entry(
+            "process",
+            // The approval loop refines this by action: status/logs bypass the
+            // gate while start/stop/restart retain this fail-closed default.
+            Destructive,
+            External,
+            Sequential,
+            Inherit,
+            KillSubprocess,
+            PROCESS,
+        ),
+        "snapshot_edit" | "ast_edit" | "lsp" | "debug" => entry(
+            static_name_ide(name)?,
+            // lsp spawns a host language-server process — treat as Destructive
+            // so it is not auto-approved under default Destructive mode
+            // (CORE_REVIEW C4). Command is also allowlisted in ide.rs.
+            ToolKind::Destructive,
+            if name == "lsp" || name == "debug" {
+                External
+            } else {
+                Write
+            },
+            Sequential,
+            Inherit,
+            KillSubprocess,
+            if name == "lsp" || name == "debug" {
+                PROCESS
+            } else {
+                WRITE
+            },
+        ),
         "write_file" | "edit" | "patch" | "delete" | "rename" | "mkdir" | "bulk_write"
-        | "bulk_edit" | "todo_write" | "git_add" | "git_commit" | "bulk" => entry(
+        | "bulk_edit" | "todo_write" | "git_add" | "git_commit" | "git_push" | "git_pull"
+        | "git_branch" | "bulk" => entry(
             static_name(name)?,
             Destructive,
             Write,
@@ -320,7 +390,19 @@ fn static_name(name: &str) -> Option<&'static str> {
         "todo_write" => "todo_write",
         "git_add" => "git_add",
         "git_commit" => "git_commit",
+        "git_push" => "git_push",
+        "git_pull" => "git_pull",
+        "git_branch" => "git_branch",
         "bulk" => "bulk",
+        _ => return None,
+    })
+}
+fn static_name_ide(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "snapshot_edit" => "snapshot_edit",
+        "ast_edit" => "ast_edit",
+        "lsp" => "lsp",
+        "debug" => "debug",
         _ => return None,
     })
 }

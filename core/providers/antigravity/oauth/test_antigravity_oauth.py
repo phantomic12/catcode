@@ -394,8 +394,9 @@ class AntigravityOAuthTest(unittest.TestCase):
 
         self.assertEqual(out["access_token"], "new-access")
         # expires_at is integer-seconds; the script may have sampled time
-        # either just before or just after our t0/t1 captures.
-        self.assertIn(out["expires_at"], (t0 + 3600, t1 + 3600))
+        # anywhere in the [t0, t1] window, so accept the full inclusive range.
+        self.assertGreaterEqual(out["expires_at"], t0 + 3600)
+        self.assertLessEqual(out["expires_at"], t1 + 3600)
         self.assertEqual(
             out["headers"],
             [["x-code-assist-project", "preserved-project"]],

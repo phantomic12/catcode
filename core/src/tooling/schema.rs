@@ -26,6 +26,11 @@ pub fn is_core_tool(name: &str) -> bool {
             | "load_tools"
             | "subagent"
             | "patch"
+            // Read-only git is always-on so the agent does not bash `git status|diff|log|show`.
+            | "git_status"
+            | "git_diff"
+            | "git_log"
+            | "git_show"
     )
 }
 
@@ -45,14 +50,22 @@ pub fn deferred_tool_names() -> &'static [&'static str] {
         "diagnostics",
         "fetch",
         "web_search",
-        "git_status",
-        "git_diff",
-        "git_log",
         "workspace_activity",
         "git_add",
         "git_commit",
+        "git_push",
+        "git_pull",
+        "git_branch",
         "spawn",
         "test_env",
+        "eval",
+        "read",
+        "lsp",
+        "snapshot_edit",
+        "ast_edit",
+        "debug",
+        "mcp",
+        "process",
         "browser_create",
         "browser_close",
         "browser_list_sessions",
@@ -125,7 +138,7 @@ fn definitions_uncached() -> Vec<Value> {
                         "model": { "type": "string", "description": "override model for this run" },
                         "tasks": { "type": "array", "description": "parallel tasks: each {agent, task, model?, count?}" },
                         "chain": { "type": "array", "description": "sequential steps: {agent, task, as?, parallel?, concurrency?}" },
-                        "concurrency": { "type": "integer", "description": "parallel concurrency (default from config)" },
+                        "concurrency": { "type": "integer", "description": "parallel concurrency (default from config; explicit higher values are allowed)" },
                         "worktree": { "type": "boolean", "description": "isolate each parallel task in a git worktree under .catalyst-code/worktrees/ (requires a git repo; changes are promoted on success)" },
                         "context": { "type": "string", "enum": ["fresh","fork"], "description": "fresh = clean child; fork = branched from parent" },
                         "async": { "type": "boolean", "description": "background execution" },
@@ -175,7 +188,7 @@ fn definitions_uncached() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a file (workspace-relative). Large files auto-window; pass offset/limit to page. Prefer grep to locate first. line_numbers:true for citations only — never copy numbered lines into edit search.",
+                "description": "Read a file (workspace-relative). Large files auto-window; pass offset/limit to page. Replaces `sed -n 'A,Bp'`, `cat`, `head`, and `tail` for workspace files — do not bash those. Prefer grep to locate first. line_numbers:true for citations only — never copy numbered lines into edit search.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -192,7 +205,7 @@ fn definitions_uncached() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "edit",
-                "description": "Search/replace edits on a file. Read first; each search must match exactly and be unique (or set replace_all). Empty replace deletes. normalize_whitespace tolerates indent drift. All edits apply atomically.",
+                "description": "Search/replace exact text in a file. Prefer `ast_edit` for structural code changes when that tool is available for the language. Read first; each search must match exactly and be unique (or set replace_all). Empty replace deletes. normalize_whitespace tolerates indent drift. All edits apply atomically.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -277,7 +290,7 @@ fn definitions_uncached() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "list_dir",
-                "description": "List entries in a directory (relative path). Returns one entry per line, directories suffixed with /.",
+                "description": "List entries in a directory (relative path). Returns one entry per line, directories suffixed with `/`. Prefer this over bash `ls`/`ls -la` for workspace dirs.",
                 "parameters": {
                     "type": "object",
                     "properties": { "path": { "type": "string" } },
@@ -321,7 +334,7 @@ fn definitions_uncached() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "glob",
-                "description": "Find files by glob pattern (e.g. \"**/*.rs\") under the workspace. Returns relative paths, capped at 200.",
+                "description": "Find files by glob pattern (e.g. \"**/*.rs\") under the workspace. Returns relative paths, capped at 200. Prefer this over bash `find . -name` for in-workspace discovery.",
                 "parameters": {
                     "type": "object",
                     "properties": { "pattern": { "type": "string" } },
@@ -577,7 +590,7 @@ fn definitions_uncached() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "git_status",
-                "description": "Show the working-tree status (staged, unstaged, untracked) as `git status --short --branch`. Optional relative `path` limits the scope. Read-only.",
+                "description": "Show the working-tree status (staged, unstaged, untracked) as `git status --short --branch`. Optional relative `path` limits the scope. Prefer this over bash `git status`. Read-only; always available (core).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -590,7 +603,7 @@ fn definitions_uncached() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "git_diff",
-                "description": "Show unstaged changes (`git diff --no-color`) or staged changes with staged:true. Optional relative `path` scopes the diff. Read-only.",
+                "description": "Show unstaged changes (`git diff --no-color`) or staged changes with staged:true. Optional relative `path` scopes the diff. Prefer this over bash `git diff`. For a commit/object use `git_show`. Read-only; always available (core).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -604,13 +617,28 @@ fn definitions_uncached() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "git_log",
-                "description": "Show recent commit history as `git log --oneline -n <limit>`. Optional relative `path` limits to a file's history. Read-only.",
+                "description": "Show recent commit history as `git log --oneline -n <limit>`. Optional relative `path` limits to a file's history. Prefer this over bash `git log`. Read-only; always available (core).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "limit": { "type": "integer", "description": "max commits to show (default 20)" },
                         "path": { "type": "string", "description": "optional relative path to filter history" }
                     }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_show",
+                "description": "Show a commit, tree, or blob (`git show --no-color <object> [-- <path>]`). Prefer this over bash `git show`. For working-tree diffs use `git_diff`. Read-only; always available (core).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "object": { "type": "string", "description": "commit/tag/tree/blob-ish (e.g. HEAD, abc123, HEAD:path)" },
+                        "path": { "type": "string", "description": "optional relative path to scope the show" }
+                    },
+                    "required": ["object"]
                 }
             }
         }),
@@ -651,6 +679,52 @@ fn definitions_uncached() -> Vec<Value> {
                         "all": { "type": "boolean", "description": "if true, stage modified tracked files before committing (git commit --all)" }
                     },
                     "required": ["message"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_push",
+                "description": "Push commits to a remote (`git push [<remote>] [<refspec>]`). Defaults remote=origin. Optional set_upstream (-u) and tags. Destructive; load via `load_tools` group `git` (or name). Prefer over bash `git push`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "remote": { "type": "string", "description": "remote name (default origin)" },
+                        "refspec": { "type": "string", "description": "optional refspec (e.g. main, HEAD:refs/heads/main)" },
+                        "set_upstream": { "type": "boolean", "description": "if true, pass -u / --set-upstream" },
+                        "tags": { "type": "boolean", "description": "if true, push tags (--tags)" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_pull",
+                "description": "Fetch and integrate from a remote (`git pull [<remote>] [<refspec>]`). Defaults remote=origin. Optional rebase:true. Destructive; load via `load_tools` group `git`. Prefer over bash `git pull`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "remote": { "type": "string", "description": "remote name (default origin)" },
+                        "refspec": { "type": "string", "description": "optional refspec" },
+                        "rebase": { "type": "boolean", "description": "if true, pull --rebase" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git_branch",
+                "description": "List/create/delete/checkout branches. action=list (default, optional all:true for remotes), create, delete, or checkout (uses `git switch`). name required except for list. Destructive for create/delete/checkout; list is read-only at runtime but the tool is approval-gated with other mutators. Load via `load_tools` group `git`. Prefer over bash `git branch`/`git switch`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["list", "create", "delete", "checkout"], "description": "branch operation (default list)" },
+                        "name": { "type": "string", "description": "branch name (required for create/delete/checkout)" },
+                        "all": { "type": "boolean", "description": "for list: include remote branches (-a)" }
+                    }
                 }
             }
         }),
@@ -768,18 +842,19 @@ fn definitions_uncached() -> Vec<Value> {
                 }
             }
         }),
+        json!({"type":"function","function":{"name":"mcp","description":"Use a trusted user-configured MCP server by name. Actions: list or call. Transport command, environment, headers, and URL are config-only.","parameters":{"type":"object","additionalProperties":false,"properties":{"action":{"type":"string","enum":["list","call"]},"server":{"type":"string","minLength":1,"maxLength":128},"tool":{"type":"string","minLength":1,"maxLength":256},"arguments":{"type":"object"}},"required":["action","server"]}}}),
         json!({
             "type": "function",
             "function": {
                 "name": "load_tools",
-                "description": "Enable deferred tools for this session (schemas not sent until loaded). Pass tools:[...] or tool:\"name\". Groups: all, git, web, bulk, browser. Deferred: bulk*, git_*, fetch, web_search, diagnostics, spawn, workspace_activity, test_env, browser_*. (goal_write_plan is planning-phase only — not loadable.)",
+                "description": "Enable deferred tools for this session (schemas not sent until loaded). Groups: all, git, web, bulk, runtime, ide, debug, browser, mcp. MCP transport configuration remains user-owned.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "tools": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "tool names or groups (all|git|web|bulk|browser)"
+                            "description": "tool names or groups (all|git|web|bulk|runtime|ide|debug|browser|mcp)"
                         },
                         "tool": { "type": "string", "description": "single tool name or group" }
                     }
@@ -814,6 +889,72 @@ fn definitions_uncached() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "eval",
+                "description": "Evaluate a bounded Python or JavaScript snippet in a retained per-session runtime. Call load_tools with runtime first; successful snippets persist only in this session. No bash fallback; missing runtimes return an explicit error.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "language": { "type": "string", "enum": ["python", "javascript"] },
+                        "code": { "type": "string", "maxLength": 65536 },
+                        "reset": { "type": "boolean", "description": "clear retained state for this language before evaluating" }
+                    },
+                    "required": ["language", "code"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read a bounded workspace file, public HTTP(S) URL, ZIP entry (archive.zip!/path), skill://name, memory://id, or artifact://run_id. Deferred runtime tool; call load_tools with runtime first. URI stores enforce ownership and traversal limits.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "offset": { "type": "integer", "description": "workspace files only: 1-indexed start line" },
+                        "limit": { "type": "integer", "description": "workspace files only: max lines" },
+                        "line_numbers": { "type": "boolean", "description": "workspace files only: prefix line numbers" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({"type":"function","function":{"name":"lsp","description":"Run one bounded request against a real language-server subprocess; the server is killed after the request.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["diagnostics","definition","references","rename"]},"command":{"type":"string"},"path":{"type":"string"},"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0},"new_name":{"type":"string"}},"required":["action","path"]}}}),
+        json!({"type":"function","function":{"name":"snapshot_edit","description":"Apply line edits only when all edits match the current SHA-256 snapshot tag; stale tags are rejected atomically.","parameters":{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"tag":{"type":"string"},"replacement":{"type":"string"}},"required":["start_line","end_line","tag","replacement"]}}},"required":["path","edits"]}}}),
+        json!({"type":"function","function":{"name":"ast_edit","description":"Preferred structural rewrite for code when the file language is bundled (Rust, Go, JavaScript, TypeScript/TSX, Python, JSON, YAML, Markdown). Prefer over `edit` for renames, call/signature changes, and syntax-aware refactors. apply:false returns a staged diff; apply:true atomically updates one workspace file.","parameters":{"type":"object","additionalProperties":false,"properties":{"path":{"type":"string"},"pattern":{"type":"string","maxLength":65536},"rewrite":{"type":"string","maxLength":65536},"apply":{"type":"boolean"}},"required":["path","pattern","rewrite"]}}}),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "process",
+                "description": "Control a workspace-scoped named long-running process. start/restart execute argv directly (never a shell string); status/logs are read-only; stop terminates the process group. Mutating actions require approval. Prefer over bash nohup/pkill/ps for app servers you start.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "action": { "type": "string", "enum": ["start", "status", "logs", "stop", "restart"] },
+                        "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+                        "argv": { "type": "array", "minItems": 1, "maxItems": 128, "items": { "type": "string", "maxLength": 8192 } },
+                        "cwd": { "type": "string", "description": "workspace-relative existing directory; default ." },
+                        "env": { "type": "object", "additionalProperties": { "type": "string", "maxLength": 32768 }, "description": "explicit environment; secret-like variable names are rejected" },
+                        "ready": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "log_regex": { "type": "string", "maxLength": 4096 },
+                                "tcp_port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+                            }
+                        },
+                        "ready_timeout_ms": { "type": "integer", "minimum": 1, "maximum": 120000 },
+                        "log_capacity": { "type": "integer", "minimum": 1, "maximum": 1048576 }
+                    },
+                    "required": ["action", "name"]
+                }
+            }
+        }),
+        json!({"type":"function","function":{"name":"debug","description":"Drive the deferred Debug Adapter Protocol session. Launch, attach, and memory writes require approval. write_memory/evaluate also require confirm:true.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["initialize","launch","attach","set_breakpoints","continue","next","step_over","step_in","step_out","pause","threads","stack_trace","scopes","variables","evaluate","read_memory","write_memory","output","disconnect"]},"adapter":{"type":"object","properties":{"command":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"},"env":{"type":"object"}},"required":["command"]},"arguments":{"type":"object"},"confirm":{"type":"boolean","description":"Required true for write_memory and evaluate"}},"required":["action"]}}}),
     ];
     defs.extend(crate::browser::definitions());
     defs
@@ -838,5 +979,56 @@ mod metadata_invariant_tests {
             missing.is_empty(),
             "tools without policy metadata: {missing:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_schema_tests {
+    #[test]
+    fn runtime_tools_are_deferred_and_documented() {
+        assert!(super::is_deferred_tool("eval"));
+        assert!(super::is_deferred_tool("read"));
+        let defs = super::definitions();
+        for name in ["eval", "read"] {
+            assert!(defs.iter().any(|d| d["function"]["name"] == name));
+        }
+    }
+}
+
+#[cfg(test)]
+mod deferred_schema_tests {
+    use super::*;
+
+    #[test]
+    fn deferred_names_are_defined_and_excluded_from_core() {
+        let definitions = definitions();
+        for name in deferred_tool_names() {
+            assert!(
+                definitions.iter().any(|definition| {
+                    definition
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        == Some(*name)
+                }),
+                "missing definition for {name}"
+            );
+            assert!(
+                !is_core_tool(name),
+                "deferred tool leaked into core: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_tools_schema_requires_a_tool_selection() {
+        let definition = definitions()
+            .into_iter()
+            .find(|definition| definition["function"]["name"] == "load_tools")
+            .unwrap();
+        let required = definition["function"]["parameters"]
+            .get("required")
+            .and_then(Value::as_array);
+        assert!(required.is_none_or(|values| values.is_empty()));
     }
 }

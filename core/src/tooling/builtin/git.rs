@@ -275,6 +275,158 @@ pub(crate) fn git_commit(args: &Value, cfg: &Config) -> Outcome {
     git_exec(cfg, &refs)
 }
 
+/// Validate a git object / ref / remote / branch token: no whitespace or shell
+/// metacharacters. Empty is allowed only when `allow_empty`.
+fn git_token(label: &str, raw: &str, allow_empty: bool) -> Result<String, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return if allow_empty {
+            Ok(String::new())
+        } else {
+            Err(format!("{label} must be non-empty"))
+        };
+    }
+    if t.starts_with('-') {
+        return Err(format!("{label} must not look like a flag: {t:?}"));
+    }
+    if t.chars().any(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ';' | '|' | '&' | '`' | '$' | '(' | ')' | '<' | '>' | '\n' | '\r' | '\0'
+            )
+    }) {
+        return Err(format!("{label} contains illegal characters: {t:?}"));
+    }
+    Ok(t.to_string())
+}
+
+/// `git show <object> [-- <path>]` — commit/blob/tree contents. Prefer over bash
+/// `git show`. Read-only.
+pub(crate) fn git_show(args: &Value, cfg: &Config) -> Outcome {
+    let object = args.get("object").and_then(|v| v.as_str()).unwrap_or("");
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let object = match git_token("object", object, false) {
+        Ok(o) => o,
+        Err(e) => return Outcome::err(e),
+    };
+    match git_rel_path(path) {
+        Err(e) => Outcome::err(e),
+        Ok(p) => {
+            let mut cmd: Vec<String> = vec!["show".into(), "--no-color".into(), object];
+            if !p.is_empty() {
+                cmd.push("--".into());
+                cmd.push(p);
+            }
+            let refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+            git_exec(cfg, &refs)
+        }
+    }
+}
+
+/// `git push [<remote>] [<refspec>]` with optional `-u` / `--tags`.
+pub(crate) fn git_push(args: &Value, cfg: &Config) -> Outcome {
+    let remote = args
+        .get("remote")
+        .and_then(|v| v.as_str())
+        .unwrap_or("origin");
+    let refspec = args.get("refspec").and_then(|v| v.as_str()).unwrap_or("");
+    let set_upstream = args
+        .get("set_upstream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let tags = args.get("tags").and_then(|v| v.as_bool()).unwrap_or(false);
+    let remote = match git_token("remote", remote, false) {
+        Ok(r) => r,
+        Err(e) => return Outcome::err(e),
+    };
+    let refspec = match git_token("refspec", refspec, true) {
+        Ok(r) => r,
+        Err(e) => return Outcome::err(e),
+    };
+    let mut cmd: Vec<String> = vec!["push".into()];
+    if set_upstream {
+        cmd.push("-u".into());
+    }
+    if tags {
+        cmd.push("--tags".into());
+    }
+    cmd.push(remote);
+    if !refspec.is_empty() {
+        cmd.push(refspec);
+    }
+    let refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+    git_exec(cfg, &refs)
+}
+
+/// `git pull [<remote>] [<refspec>]` with optional `--rebase`.
+pub(crate) fn git_pull(args: &Value, cfg: &Config) -> Outcome {
+    let remote = args
+        .get("remote")
+        .and_then(|v| v.as_str())
+        .unwrap_or("origin");
+    let refspec = args.get("refspec").and_then(|v| v.as_str()).unwrap_or("");
+    let rebase = args
+        .get("rebase")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let remote = match git_token("remote", remote, false) {
+        Ok(r) => r,
+        Err(e) => return Outcome::err(e),
+    };
+    let refspec = match git_token("refspec", refspec, true) {
+        Ok(r) => r,
+        Err(e) => return Outcome::err(e),
+    };
+    let mut cmd: Vec<String> = vec!["pull".into()];
+    if rebase {
+        cmd.push("--rebase".into());
+    }
+    cmd.push(remote);
+    if !refspec.is_empty() {
+        cmd.push(refspec);
+    }
+    let refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+    git_exec(cfg, &refs)
+}
+
+/// Branch list / create / delete / checkout. Prefer over bash `git branch`.
+pub(crate) fn git_branch(args: &Value, cfg: &Config) -> Outcome {
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("list");
+    let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+    match action {
+        "list" => {
+            let mut cmd: Vec<String> = vec!["branch".into(), "--list".into(), "-v".into()];
+            if all {
+                cmd.push("-a".into());
+            }
+            let refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+            git_exec(cfg, &refs)
+        }
+        "create" | "delete" | "checkout" => {
+            let name = match git_token("name", name, false) {
+                Ok(n) => n,
+                Err(e) => return Outcome::err(e),
+            };
+            let cmd: Vec<String> = match action {
+                "create" => vec!["branch".into(), name],
+                "delete" => vec!["branch".into(), "-d".into(), name],
+                "checkout" => vec!["switch".into(), name],
+                _ => unreachable!(),
+            };
+            let refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+            git_exec(cfg, &refs)
+        }
+        other => Outcome::err(format!(
+            "git_branch action must be list|create|delete|checkout, got {other:?}"
+        )),
+    }
+}
+
 // ---- sandboxed (microVM) git path ----
 // When sandboxing is enabled, built-in git runs inside the microVM via the
 // shared execution backend (never directly on the host). The argv is built by
@@ -367,6 +519,120 @@ pub(crate) fn git_argv(name: &str, args: &Value) -> Result<Vec<String>, String> 
                 v.push("--all".into());
             }
             Ok(v)
+        }
+        "git_show" => {
+            let object = git_token(
+                "object",
+                args.get("object").and_then(|v| v.as_str()).unwrap_or(""),
+                false,
+            )?;
+            let p = git_rel_path(path)?;
+            let mut v = vec![
+                "git".to_string(),
+                "show".into(),
+                "--no-color".into(),
+                object,
+            ];
+            if !p.is_empty() {
+                v.push("--".into());
+                v.push(p);
+            }
+            Ok(v)
+        }
+        "git_push" => {
+            let remote = git_token(
+                "remote",
+                args.get("remote")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("origin"),
+                false,
+            )?;
+            let refspec = git_token(
+                "refspec",
+                args.get("refspec").and_then(|v| v.as_str()).unwrap_or(""),
+                true,
+            )?;
+            let set_upstream = args
+                .get("set_upstream")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let tags = args.get("tags").and_then(|v| v.as_bool()).unwrap_or(false);
+            let mut v = vec!["git".to_string(), "push".into()];
+            if set_upstream {
+                v.push("-u".into());
+            }
+            if tags {
+                v.push("--tags".into());
+            }
+            v.push(remote);
+            if !refspec.is_empty() {
+                v.push(refspec);
+            }
+            Ok(v)
+        }
+        "git_pull" => {
+            let remote = git_token(
+                "remote",
+                args.get("remote")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("origin"),
+                false,
+            )?;
+            let refspec = git_token(
+                "refspec",
+                args.get("refspec").and_then(|v| v.as_str()).unwrap_or(""),
+                true,
+            )?;
+            let rebase = args
+                .get("rebase")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut v = vec!["git".to_string(), "pull".into()];
+            if rebase {
+                v.push("--rebase".into());
+            }
+            v.push(remote);
+            if !refspec.is_empty() {
+                v.push(refspec);
+            }
+            Ok(v)
+        }
+        "git_branch" => {
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("list");
+            let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+            match action {
+                "list" => {
+                    let mut v = vec![
+                        "git".to_string(),
+                        "branch".into(),
+                        "--list".into(),
+                        "-v".into(),
+                    ];
+                    if all {
+                        v.push("-a".into());
+                    }
+                    Ok(v)
+                }
+                "create" | "delete" | "checkout" => {
+                    let name = git_token(
+                        "name",
+                        args.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                        false,
+                    )?;
+                    Ok(match action {
+                        "create" => vec!["git".into(), "branch".into(), name],
+                        "delete" => vec!["git".into(), "branch".into(), "-d".into(), name],
+                        "checkout" => vec!["git".into(), "switch".into(), name],
+                        _ => unreachable!(),
+                    })
+                }
+                other => Err(format!(
+                    "git_branch action must be list|create|delete|checkout, got {other:?}"
+                )),
+            }
         }
         other => Err(format!("unknown git tool: {other}")),
     }

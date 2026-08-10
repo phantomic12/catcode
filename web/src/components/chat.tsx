@@ -26,6 +26,7 @@ import { PluginsPanel } from "./plugins";
 import { SkillsMarketplace } from "./skills-marketplace";
 import { HelpModal } from "./help-modal";
 import { GoalModal, GoalPlanBanner, GoalProgressPanel } from "./goal-modal";
+import { PluginTrustPrompt } from "./plugin-trust";
 import { ControlCenterPanel } from "./control-center";
 import { ProviderLoginModal } from "./provider-login-modal";
 import { CustomProviderModal } from "./custom-provider-modal";
@@ -214,8 +215,8 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
       state.pendingApproval ||
       state.pendingAsk ||
       state.pendingSudo ||
+      state.pendingPluginTrust ||
       state.pendingIntercom ||
-      state.pendingOauth ||
       (state.goalMode &&
         state.goalMode.phase === "plan_ready" &&
         !state.goalMode.auto_deploy)
@@ -233,7 +234,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
     state.pendingAsk,
     state.pendingSudo,
     state.pendingIntercom,
-    state.pendingOauth,
+    state.pendingPluginTrust,
     state.goalMode,
   ]);
 
@@ -679,7 +680,7 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
     state.pendingAsk ||
     state.pendingSudo ||
     state.pendingIntercom ||
-    state.pendingOauth ||
+    state.pendingPluginTrust ||
     manualPlanReady
   );
   const empty = state.messages.length === 0;
@@ -828,6 +829,14 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
         {/* HITL first so empty-session OAuth/sudo/ask aren't below a full-height hero. */}
         {!switching && (
           <div ref={hitlGateRef} className="mx-auto w-full max-w-[60rem] shrink-0 px-3 sm:px-6">
+            {state.pendingPluginTrust && (
+              <div className="mb-2 mt-2">
+                <PluginTrustPrompt
+                  plugins={state.pendingPluginTrust}
+                  onDecide={agent.pluginTrustDecisions}
+                />
+              </div>
+            )}
             {state.pendingApproval && (
               <div className="mb-2 mt-2">
                 <Approval approval={state.pendingApproval} onApprove={agent.approve} />
@@ -982,8 +991,19 @@ export function ChatInner({ agent, docked }: { agent: AgentApi; docked?: boolean
       {modal === "subagents" && (
         <SubagentsPanel
           runs={state.subagentRuns}
+          jobs={state.jobTree}
+          processes={state.processes}
+          processLogs={state.processLogs}
+          sessionTree={state.sessionTree}
           agents={state.availableAgents}
           onRefreshAgents={() => void agent.listAgents()}
+          onRefreshJobs={() => void agent.send({ type: "job_list" })}
+          onJobStatus={(runId) => void agent.send({ type: "job_status", run_id: runId })}
+          onJobWait={(runId) => void agent.send({ type: "job_wait", run_id: runId })}
+          onJobCancel={(runId) => void agent.send({ type: "job_cancel", run_id: runId })}
+          onProcessLogs={(name) => void agent.prompt(`Use the process tool to show logs for the named process ${name}.`)}
+          onProcessStop={(name) => void agent.prompt(`Use the process tool to stop the named process ${name}.`)}
+          onBranch={(entryId) => void agent.send({ type: "session_branch", entry_id: entryId })}
           onClose={() => setModal(null)}
         />
       )}

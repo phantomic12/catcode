@@ -96,7 +96,7 @@ executed by name. Tools are classified as:
 - **Core tools** (always available): `read_file`, `edit`, `grep`, `glob`,
   `list_dir`, `bash`, `write_file`, `memory`, `subagent`, `finish`, `patch`,
   `todo_read`, `todo_write`, `load_tools`
-- **Deferred tools** (load via `load_tools`): `git_*`, `fetch`, `web_search`,
+- **Deferred tools** (load via `load_tools`): git mutators (`git_add`/`commit`/`push`/`pull`/`branch`), `fetch`, `web_search`,
   `bulk`, `diagnostics`, `spawn`, `workspace_activity`, `test_env`, `browser`
 - **Async dispatch** (sentinel errors, dispatched by main loop): `fetch`,
   `web_search`, `browser/*`, `spawn`, `subagent`, `contact_supervisor`,

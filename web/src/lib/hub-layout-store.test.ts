@@ -24,17 +24,22 @@ afterAll(() => {
   }
 });
 
-describe("hub layout store (chat hub v2)", () => {
+describe("hub layout store (chat hub v3)", () => {
   test("default state is empty", () => {
     const s = defaultHubState();
-    expect(s.version).toBe(2);
+    expect(s.version).toBe(3);
     expect(s.tabPaths).toEqual([]);
     expect(s.active).toBeNull();
     expect(s.sessions).toEqual({});
     expect(s.gitOpen).toBe(true);
+    expect(s.gitWidth).toBe(280);
+    expect(s.previewOpen).toBe(false);
+    expect(s.previewWidth).toBe(420);
+    expect(s.terminalOpen).toBe(false);
+    expect(s.terminalHeight).toBe(260);
   });
 
-  test("sanitize migrates v1 terminal layouts and clamps git width", () => {
+  test("sanitize migrates older layouts and clamps panel sizes", () => {
     const s = sanitizeHubState({
       version: 1,
       tabPaths: ["/tmp/proj"],
@@ -45,14 +50,22 @@ describe("hub layout store (chat hub v2)", () => {
       sessions: { "/tmp/proj": "/home/x/.config/catalyst-code/sessions/abc/chat.jsonl" },
       gitOpen: false,
       gitWidth: 9999,
+      previewOpen: true,
+      previewWidth: 50,
+      terminalOpen: true,
+      terminalHeight: 9999,
     });
-    expect(s.version).toBe(2);
+    expect(s.version).toBe(3);
     expect(s.tabPaths).toEqual(["/tmp/proj"]);
     expect(s.sessions["/tmp/proj"]).toContain("chat.jsonl");
     // Terminal pane fields are dropped.
     expect((s as { layouts?: unknown }).layouts).toBeUndefined();
-    expect(s.gitWidth).toBe(560); // clamped
+    expect(s.gitWidth).toBe(480); // clamped max
     expect(s.gitOpen).toBe(false);
+    expect(s.previewOpen).toBe(true);
+    expect(s.previewWidth).toBe(280); // clamped min
+    expect(s.terminalOpen).toBe(true);
+    expect(s.terminalHeight).toBe(560); // clamped max
   });
 
   test("sanitize drops non-jsonl session paths", () => {
@@ -70,7 +83,7 @@ describe("hub layout store (chat hub v2)", () => {
   test("save + load round-trips session paths (cross-device reattach key)", () => {
     expect(loadHubLayout()).toBeNull();
     const state = sanitizeHubState({
-      version: 2,
+      version: 3,
       tabPaths: ["/ws/a"],
       names: { "/ws/a": "a" },
       sessions: {
@@ -79,6 +92,10 @@ describe("hub layout store (chat hub v2)", () => {
       active: "/ws/a",
       gitOpen: true,
       gitWidth: 300,
+      previewOpen: true,
+      previewWidth: 500,
+      terminalOpen: true,
+      terminalHeight: 220,
     });
     const saved = saveHubLayout("user-1", state);
     expect(saved.userId).toBe("user-1");
@@ -90,12 +107,15 @@ describe("hub layout store (chat hub v2)", () => {
     expect(loaded!.state.sessions["/ws/a"]).toBe(
       "/home/u/.config/catalyst-code/sessions/deadbeef/2026-01-01.jsonl",
     );
-    expect(loaded!.state.version).toBe(2);
+    expect(loaded!.state.version).toBe(3);
+    expect(loaded!.state.previewWidth).toBe(500);
+    expect(loaded!.state.terminalHeight).toBe(220);
 
     const raw = JSON.parse(
       readFileSync(join(tmp, ".config", "catalyst-code", "hub-layout.json"), "utf8"),
     );
     expect(raw.userId).toBe("user-1");
     expect(raw.state.sessions["/ws/a"]).toContain("2026-01-01.jsonl");
+    expect(raw.state.previewWidth).toBe(500);
   });
 });

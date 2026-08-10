@@ -172,7 +172,7 @@ The advisor is an optional second-model reviewer. It is fail-open: provider
 errors, missing credentials, malformed advice, and malformed watchdog files do
 not stop the executor. Advisor output is bounded, secret-redacted, XML-escaped,
 deduplicated, and injected only as advisory context. Advisors never execute
-tools, approve actions, mutate files, or restart a stopped turn.
+tools, approve actions, or mutate files.
 
 ```json
 {
@@ -188,6 +188,53 @@ tools, approve actions, mutate files, or restart a stopped turn.
 `model` defaults to the executor model. Subagents use `subagentModel`, then
 `model`, then their executor model. `/advisor` configures enablement and these
 model choices through the TUI.
+
+### Evidence pack and structured notes
+
+On natural completion (no tool calls), each enabled watchdog receives a bounded
+**evidence pack**, not a raw chat dump:
+
+- user request (latest real user message)
+- rolling work state (goal, todos, recent files)
+- unified diffs from successful mutating tools this turn (redacted, capped)
+- recent assistant/user claims (tool result bodies omitted for secret safety)
+
+Accepted notes use a structured schema when the reviewer cooperates:
+
+```text
+SEVERITY: concern
+FINDING: rename drops partial failure
+WHERE: core/src/fsutil.rs
+ACTION: handle io::Error after rename
+EVIDENCE: diff removed the Err arm
+CHECK: cargo test fsutil --lib
+```
+
+Legacy free-form bodies after `SEVERITY:` still parse. Each accepted note is
+emitted as `advisor_note` (with optional `finding` / `where` / `action` /
+`check` fields) and injected as:
+
+```xml
+<advisory advisor="Architecture" severity="concern" scope="main"
+  where="core/src/fsutil.rs" check="cargo test fsutil --lib">
+rename drops partial failure
+ACTION: handle io::Error after rename
+</advisory>
+```
+
+### Soft-continue (main scope only)
+
+When at least one **concern** or **blocker** is accepted on the main agent, the
+harness injects a single `[advisor-continue]` user message and re-enters the
+turn loop **once** so the executor can act before `done`. Nits alone never
+force a continue. Subagent reviews still inject `<advisory>` messages into the
+child history but do not soft-continue (parent finalize stays terminal).
+
+Concern/blocker notes are also pinned as a transient **open advisory** on later
+model requests. A subsequent mutation of the note's `WHERE` path resolves the
+pin; a later review can reopen it if the issue remains. Exact repeats are
+suppressed, while a concern/blocker may supersede an earlier lower-severity
+note for the same reviewer/location (history capped at 4096 entries).
 
 ### WATCHDOG.md
 
@@ -209,6 +256,7 @@ advisors:
     enabled: true
     model: claude-sonnet-4-5
     tools: [read, grep, glob]
+    triggers: [core/src, protocol]
     instructions: Watch coupling and unintended API growth.
   - name: Security
     enabled: true
@@ -219,22 +267,12 @@ advisors:
 Named reviewers are independent side calls. An explicit `model` wins over the
 role model. Duplicate names are resolved by discovery order, with more-specific
 project files loaded after broad user/ancestor files. `enabled: false` pauses a
-reviewer. The `tools` field is retained as roster metadata but this harness
-currently keeps watchdog execution read-only with no tool access; this is
-intentional safety behavior rather than an accidental permission drop.
-
-Each accepted note is emitted as `advisor_note` and injected as:
-
-```xml
-<advisory advisor="Architecture" severity="concern" scope="main">
-specific guidance
-</advisory>
-```
-
-The same reviewer cannot emit normalized duplicate advice more than once per
-process (FIFO history capped at 4096 notes). `nit`, `concern`, and `blocker`
-are informational severities; this implementation preserves all accepted notes
-for the next executor step and never auto-resumes the executor.
+reviewer. `triggers` limits a specialist to matching touched paths/diffs. The
+harness may execute up to three requested `tools` from the strict
+`read`/`read_file`/`grep`/`glob` allowlist and append bounded, redacted results
+to the evidence pack; watchdog models still cannot call tools themselves.
+Eligible named reviewers run in parallel. Setting `advisor.nudge` enables one
+additional review checkpoint after the first successful mutation in a turn.
 
 ---
 
@@ -385,8 +423,8 @@ All config fields with their types and defaults.
 |-------|------|---------|-------------|
 | `subagents.max_depth` | number | `2` | Max nesting depth (0 blocks all subagents) |
 | `subagents.intercom_bridge_mode` | enum | `always` | `off` / `fork-only` / `always` |
-| `subagents.parallel_max_tasks` | number | `8` | Max tasks in a parallel run |
-| `subagents.parallel_concurrency` | number | `4` | Default concurrency for parallel runs |
+| `subagents.parallel_max_tasks` | number | `8` | Soft advisory max tasks in a parallel run (larger batches are allowed and queue under concurrency) |
+| `subagents.parallel_concurrency` | number | `4` | Default concurrency when omitted; explicit higher requests are honored |
 | `subagents.async_by_default` | bool | `false` | Top-level calls use background execution |
 | `subagents.disable_builtins` | bool | `false` | Hide builtin agents from discovery |
 

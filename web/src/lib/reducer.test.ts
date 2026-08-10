@@ -59,6 +59,26 @@ describe("synthetic events", () => {
   });
 });
 
+describe("plugin trust", () => {
+  test("prompt becomes a visible pending decision gate", () => {
+    const s = ev({
+      type: "plugin_trust_prompt",
+      plugins: [{ name: "workspace-hook", version: "1.0", decision: "" }],
+    });
+    expect(s.pendingPluginTrust?.[0]?.name).toBe("workspace-hook");
+    expect(s.toasts.at(-1)?.message).toContain("1 project plugin trust decision");
+  });
+
+  test("applied decision clears the pending gate", () => {
+    let s = ev({
+      type: "plugin_trust_prompt",
+      plugins: [{ name: "workspace-hook", decision: "" }],
+    });
+    s = reduce(s, { type: "plugin_trust_applied", trusted: ["workspace-hook"], denied: [], loaded: 1 });
+    expect(s.pendingPluginTrust).toBeNull();
+  });
+});
+
 describe("assistant message assembly", () => {
   test("delta lazily begins an assistant message", () => {
     const s = ev({ type: "delta", text: "Hi" });
@@ -365,6 +385,26 @@ describe("history replay", () => {
     expect(a.toolCalls).toHaveLength(1);
     expect(a.toolCalls[0].result?.output).toBe("a\nb\nc");
     expect(a.toolCalls[0].result?.unknown).toBe(true);
+  });
+
+  test("replays persisted advisor findings as transcript cards", () => {
+    const s = ev({
+      type: "history",
+      messages: [
+        {
+          role: "system",
+          content: '<advisory advisor="Correctness" severity="concern" scope="main">Missing focused regression coverage</advisory>',
+        },
+      ],
+    });
+    expect(s.messages).toHaveLength(1);
+    expect(s.messages[0]).toMatchObject({
+      role: "advisor",
+      advisor: "Correctness",
+      severity: "concern",
+      state: "finding",
+      text: "Missing focused regression coverage",
+    });
   });
 
   test("peels MiniMax <think> tags from assistant content on history load", () => {
@@ -1400,6 +1440,95 @@ describe("CEO / Control Center goal events", () => {
   });
 });
 
+describe("durable job and session tree events", () => {
+  test("job list captures parent-child state and cancellation", () => {
+    let state = ev({ type: "job_list", runs: [{ run_id: "child", parent_run_id: "parent", state: "completed", summary: "done" }] } as AgentEvent);
+    expect(state.jobTree.child).toEqual({ runId: "child", parentRunId: "parent", state: "completed", summary: "done" });
+    state = reduce(state, { type: "job_cancel_requested", run_id: "child" } as AgentEvent);
+    expect(state.jobTree.child.state).toBe("cancelling");
+  });
+
+  test("session tree is retained for branch navigation", () => {
+    const tree = { leaf: "entry-2", entries: [{ id: "entry-2" }] };
+    const state = ev({ type: "session_tree", tree } as AgentEvent);
+    expect(state.sessionTree).toEqual(tree);
+  });
+
+  test("session tree retains ancestry, siblings, and active leaf", () => {
+    const tree = { leaf: "leaf", ancestry: ["root"], siblings: ["peer"], entries: [{ id: "root" }, { id: "leaf" }, { id: "peer" }] };
+    const state = ev({ type: "session_tree", tree } as AgentEvent);
+    expect(state.sessionTree).toEqual(tree);
+  });
+
+  test("process tool results populate status and logs without dedicated events", () => {
+    const status = ev({ type: "tool_result", id: "p1", tool: "process", ok: true, output: JSON.stringify({ name: "web", pid: 42, argv: ["bun", "dev"], cwd: "/repo", started_at_ms: 100, state: "ready" }) } as AgentEvent);
+    expect(status.processes.web.state).toBe("ready");
+    const logs = reduce(status, { type: "tool_result", id: "p2", tool: "process", ok: true, output: JSON.stringify({ name: "web", text: "ready\n", truncated: false }) } as AgentEvent);
+    expect(logs.processLogs.web.text).toBe("ready\n");
+  });
+});
+
+
+describe("advisor status", () => {
+  test("updates one durable reviewer record across its lifecycle", () => {
+    let s = reduce(initialState, {
+      type: "advisor_status",
+      scope: "main",
+      advisor: "Correctness",
+      model: "reviewer",
+      state: "reviewing",
+    });
+    expect(s.messages).toHaveLength(1);
+    expect(s.messages[0]).toMatchObject({ role: "advisor", state: "reviewing" });
+    expect(s.toasts).toEqual([]);
+
+    s = reduce(s, {
+      type: "advisor_status",
+      scope: "main",
+      advisor: "Correctness",
+      model: "reviewer",
+      state: "clear",
+      elapsed_ms: 2500,
+    });
+    expect(s.messages).toHaveLength(1);
+    expect(s.messages[0]).toMatchObject({ role: "advisor", state: "clear", elapsedMs: 2500 });
+
+    s = reduce(s, {
+      type: "advisor_note",
+      scope: "main",
+      advisor: "Correctness",
+      model: "reviewer",
+      severity: "concern",
+      finding: "Missing focused regression coverage",
+    });
+    expect(s.messages).toHaveLength(1);
+    expect(s.messages[0]).toMatchObject({
+      role: "advisor",
+      state: "finding",
+      severity: "concern",
+      text: "Missing focused regression coverage",
+    });
+
+    s = reduce(s, {
+      type: "advisor_status",
+      scope: "main",
+      advisor: "Correctness",
+      model: "reviewer",
+      state: "reviewing",
+    });
+    s = reduce(s, {
+      type: "advisor_status",
+      scope: "main",
+      advisor: "Correctness",
+      model: "reviewer",
+      state: "clear",
+    });
+    expect(s.messages).toHaveLength(2);
+    expect(s.messages[0]).toMatchObject({ role: "advisor", state: "finding" });
+    expect(s.messages[1]).toMatchObject({ role: "advisor", state: "clear" });
+  });
+});
+
 describe("CORE_EVENT_TYPES coverage", () => {
   test("checked-in event fixtures match the web SDK catalog", async () => {
     const { CORE_EVENT_TYPES } = await import("@catalyst-code/coding-agent");
@@ -1433,18 +1562,24 @@ describe("CORE_EVENT_TYPES coverage", () => {
     const coreEvents = allCases.filter((c) => !c.startsWith("_"));
     // Bridge-generated events (not core wire events); correctly absent from CORE_EVENT_TYPES.
     const bridgeEvents = new Set(["projects", "workspace_changed", "session_status"]);
+    // Advisor state values are switch cases inside the advisor_status handler,
+    // not additional wire event types.
+    const advisorStates = new Set([
+      "reviewing", "clear", "no_key", "failed", "invalid_response",
+    ]);
     // Core wire events emitted by the new Microsandbox subsystem. The SDK
     // catalog (@catalyst-code/coding-agent CORE_EVENT_TYPES) lags the core
     // until the SDK is updated; documented here as a known gap so this coverage
     // gate stays green without weakening the exhaustive-switch invariant.
     const sandboxEvents = new Set([
-      "sandbox_status",
-      "sandbox_prepare_progress",
-      "sandbox_ready",
-      "sandbox_error",
+      "sandbox_status", "sandbox_prepare_progress", "sandbox_ready", "sandbox_error",
     ]);
     const extra = coreEvents.filter(
-      (c) => !sdkSet.has(c) && !bridgeEvents.has(c) && !sandboxEvents.has(c),
+      (c) =>
+        !sdkSet.has(c) &&
+        !bridgeEvents.has(c) &&
+        !sandboxEvents.has(c) &&
+        !advisorStates.has(c),
     );
     expect(extra).toEqual([]);
   });

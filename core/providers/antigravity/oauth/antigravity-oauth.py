@@ -233,18 +233,6 @@ def _code_assist_body(include_tier=False, tier_id=None):
 
 
 
-def load_code_assist(access_token):
-    """POST :loadCodeAssist, return ``cloudaicompanionProject`` id or ``None``."""
-    status, data = post_json(
-        LOAD_CODE_ASSIST_URL,
-        _code_assist_body(),
-        _code_assist_headers(access_token),
-    )
-    if status != 200:
-        return None
-    return extract_cloudaicompanion_project(data)
-
-
 def _pick_default_tier(payload):
     tiers = payload.get("allowedTiers")
     if isinstance(tiers, list):

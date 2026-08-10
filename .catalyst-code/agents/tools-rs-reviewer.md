@@ -1,5 +1,6 @@
 ---
 name: tools-rs-reviewer
+model: ck-grok-4.5
 description: Review core/src/tools.rs — tool definitions, classification, execution
 build-test-release: true
 allow:

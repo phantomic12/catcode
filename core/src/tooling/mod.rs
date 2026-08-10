@@ -2,6 +2,7 @@ pub(crate) mod approval;
 pub(crate) mod builtin;
 #[allow(dead_code)]
 pub(crate) mod execution;
+pub(crate) mod ide;
 mod metadata;
 pub(crate) mod policy;
 mod result;

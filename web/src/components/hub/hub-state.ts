@@ -3,33 +3,36 @@
 //
 // Chat sessions live server-side (one catcode-core per session file via the
 // HarnessBridge). The account layout only remembers which projects are open,
-// which session was last viewed per project, and git-sidebar chrome — so any
-// signed-in device reopens the same chats and reattaches the live feed.
+// which session was last viewed per project, and panel chrome (git left /
+// preview right / terminal bottom) — so any signed-in device reopens the same
+// chats and reattaches the live feed.
 // localStorage is only a same-device cache / one-shot migration source.
 
 /** Legacy same-device cache key (pre multi-device sync + pre chat-hub). */
 export const HUB_STORAGE_KEY = "catcode:hub:v1";
 
-/** Current account-layout schema version (chat hub, no terminal panes). */
-export const HUB_LAYOUT_VERSION = 2 as const;
+/** Current account-layout schema (chat, terminal and preview chrome). */
+export const HUB_LAYOUT_VERSION = 3 as const;
 
+export interface HubTerminalSession { id: string; title: string; cwd: string; alive: boolean; exitCode: number | null; }
 export interface HubPersistState {
   version: typeof HUB_LAYOUT_VERSION;
-  /** Open project tabs, in order (absolute workspace paths). */
   tabPaths: string[];
-  /** Display name per project path (basename at add time). */
   names: Record<string, string>;
-  /** Active tab path (must be in tabPaths, else null). */
   active: string | null;
-  /**
-   * Last-viewed chat session file per project path. Absolute .jsonl path.
-   * When a device opens a project, it reattaches this session's live core
-   * (or starts the most-recent session if missing).
-   */
   sessions: Record<string, string>;
-  /** Git sidebar visibility + width. */
+  /** Git sidebar on the LEFT. */
   gitOpen: boolean;
   gitWidth: number;
+  /** Terminal panel along the BOTTOM. */
+  terminalOpen: boolean;
+  terminalHeight: number;
+  /** Preview panel on the RIGHT. */
+  previewOpen: boolean;
+  previewWidth: number;
+  terminalSessions: Record<string, HubTerminalSession[]>;
+  activeTerminal: Record<string, string | null>;
+  previewUrls: Record<string, string>;
 }
 
 export function defaultHubState(): HubPersistState {
@@ -40,7 +43,14 @@ export function defaultHubState(): HubPersistState {
     active: null,
     sessions: {},
     gitOpen: true,
-    gitWidth: 320,
+    gitWidth: 280,
+    terminalOpen: false,
+    terminalHeight: 260,
+    previewOpen: false,
+    previewWidth: 420,
+    terminalSessions: {},
+    activeTerminal: {},
+    previewUrls: {},
   };
 }
 
@@ -49,7 +59,7 @@ export function pathBasename(abs: string): string {
   return abs.split(/[\\/]/).filter(Boolean).pop() ?? abs;
 }
 
-/** Sanitize untrusted layout JSON into a HubPersistState (v1 terminal → v2 chat). */
+/** Sanitize untrusted layout JSON into a HubPersistState (v1/v2 → v3). */
 export function sanitizeHubState(raw: unknown): HubPersistState {
   const base = defaultHubState();
   if (!raw || typeof raw !== "object") return base;
@@ -67,13 +77,16 @@ export function sanitizeHubState(raw: unknown): HubPersistState {
   for (const [k, v] of Object.entries(parsed.names ?? {})) {
     if (typeof k === "string" && typeof v === "string" && v) names[k] = v;
   }
-
   const sessions: Record<string, string> = {};
-  for (const [k, v] of Object.entries(parsed.sessions ?? {})) {
-    if (typeof k === "string" && typeof v === "string" && v.endsWith(".jsonl")) {
-      sessions[k] = v;
-    }
+  for (const [k, v] of Object.entries(parsed.sessions ?? {})) if (typeof v === "string" && v.endsWith(".jsonl")) sessions[k] = v;
+  const terminalSessions: Record<string, HubTerminalSession[]> = {};
+  for (const [workspace, value] of Object.entries(parsed.terminalSessions ?? {})) {
+    if (Array.isArray(value)) terminalSessions[workspace] = value.filter((s): s is HubTerminalSession => !!s && typeof s === "object" && typeof (s as HubTerminalSession).id === "string" && typeof (s as HubTerminalSession).title === "string" && typeof (s as HubTerminalSession).cwd === "string" && typeof (s as HubTerminalSession).alive === "boolean" && ((s as HubTerminalSession).exitCode === null || typeof (s as HubTerminalSession).exitCode === "number")).slice(0, 16);
   }
+  const activeTerminal: Record<string, string | null> = {};
+  for (const [k, v] of Object.entries(parsed.activeTerminal ?? {})) if (v === null || typeof v === "string") activeTerminal[k] = v;
+  const previewUrls: Record<string, string> = {};
+  for (const [k, v] of Object.entries(parsed.previewUrls ?? {})) if (typeof v === "string" && v.length <= 2048) previewUrls[k] = v;
 
   const active =
     typeof parsed.active === "string" && tabPaths.includes(parsed.active)
@@ -89,8 +102,21 @@ export function sanitizeHubState(raw: unknown): HubPersistState {
     gitOpen: typeof parsed.gitOpen === "boolean" ? parsed.gitOpen : true,
     gitWidth:
       typeof parsed.gitWidth === "number" && Number.isFinite(parsed.gitWidth)
-        ? Math.min(560, Math.max(240, parsed.gitWidth))
-        : 320,
+        ? Math.min(480, Math.max(200, parsed.gitWidth))
+        : 280,
+    terminalOpen: typeof parsed.terminalOpen === "boolean" ? parsed.terminalOpen : false,
+    terminalHeight:
+      typeof parsed.terminalHeight === "number" && Number.isFinite(parsed.terminalHeight)
+        ? Math.min(560, Math.max(140, parsed.terminalHeight))
+        : 260,
+    previewOpen: typeof parsed.previewOpen === "boolean" ? parsed.previewOpen : false,
+    previewWidth:
+      typeof parsed.previewWidth === "number" && Number.isFinite(parsed.previewWidth)
+        ? Math.min(900, Math.max(280, parsed.previewWidth))
+        : 420,
+    terminalSessions,
+    activeTerminal,
+    previewUrls,
   };
 }
 

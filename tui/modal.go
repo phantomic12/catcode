@@ -75,15 +75,15 @@ type goalDraft struct {
 	allowedModels      map[string]bool // model id → selected; empty map = unrestricted
 	allowedProviders   map[string]bool // provider name → selected; empty = unrestricted
 	reviewBeforeDeploy bool            // auto_deploy = !reviewBeforeDeploy
-	// Advanced section
-	advanced         bool
-	plannerModel     string // empty = default (orchestrator)
-	workerModel      string
-	reviewerModel    string
-	modelConcurrency map[string]int // model id → max concurrent (capped by concurrency)
-	field            int            // focused field id (goalField*)
-	listCursor       int            // cursor within models/providers/model-conc lists
-	editing          bool           // free-text capture for goal field
+	ceoMode            bool            // Control Center autonomous CEO loop
+	advanced           bool
+	plannerModel       string // empty = default (orchestrator)
+	workerModel        string
+	reviewerModel      string
+	modelConcurrency   map[string]int // model id → max concurrent (capped by concurrency)
+	field              int            // focused field id (goalField*)
+	listCursor         int            // cursor within models/providers/model-conc lists
+	editing            bool           // free-text capture for goal field
 }
 
 // customProviderDraft is the multi-field form state for modalCustomProvider.
@@ -609,6 +609,7 @@ func (s *session) advisorItems() []listItem {
 	}
 	return []listItem{
 		{label: "Advisor", desc: boolStr(s.settings.AdvisorEnabled) + " · enable second-model review"},
+		{label: "Checkpoint review", desc: boolStr(s.settings.AdvisorNudge) + " · review after first mutation"},
 		{label: "Main model", desc: model + " · blank uses executor model"},
 		{label: "Review subagents", desc: boolStr(s.settings.AdvisorSubagents) + " · review completed subagent work"},
 		{label: "Subagent model", desc: subModel + " · blank uses main advisor model"},
@@ -1272,6 +1273,8 @@ func (s *session) commandItems() []listItem {
 		{group: "Session", label: "/refresh", desc: "refresh model list (live fetch, bypass cache)"},
 		{group: "Session", label: "/context", desc: "token-usage breakdown (top consumers)"},
 		{group: "Session", label: "/usage", desc: "provider plan limits (5h · weekly · …)"},
+		{group: "Session", label: "/tree", desc: "show session ancestry, siblings, and active leaf"},
+		{group: "Session", label: "/branch", desc: "create a branch from an entry id"},
 		{group: "Session", label: "/abort", desc: "stop running turn (or Esc) · alias: /stop"},
 		{group: "Session", label: "/exit", desc: "quit the app (alias: /quit)"},
 		{group: "Session", label: "/steer", desc: "steer an in-flight turn (modal)"},
@@ -1295,6 +1298,10 @@ func (s *session) commandItems() []listItem {
 		{group: "Agent", label: "/cancel-goal", desc: "cancel active goal mode"},
 		{group: "Agent", label: "/subagents-doctor", desc: "subagent setup diagnostics"},
 		{group: "Agent", label: "/subagents-status", desc: "show active subagent runs"},
+		{group: "Agent", label: "/jobs", desc: "list durable subagent jobs"},
+		{group: "Agent", label: "/job", desc: "show durable job status"},
+		{group: "Agent", label: "/wait-job", desc: "wait for a durable job"},
+		{group: "Agent", label: "/cancel-job", desc: "cancel a durable job"},
 		{group: "Agent", label: "/remember", desc: "save a memory note (modal)"},
 		{group: "Agent", label: "/memory", desc: "list / forget saved memories (picker) · alias: /memories"},
 		{group: "Agent", label: "/skills", desc: "browse, install, update, and remove skills.sh skills"},
@@ -2201,6 +2208,7 @@ func (s *session) submitGoalModal() tea.Cmd {
 		"concurrency":      concurrency,
 		"max_tasks":        maxTasks,
 		"auto_deploy":      !d.reviewBeforeDeploy,
+		"ceo_mode":         d.ceoMode,
 		"model":            model,
 		"reasoning_effort": s.settings.ReasoningEffort,
 	}
@@ -2683,14 +2691,18 @@ func (s *session) switchAdvisorOption(abs int) {
 		_ = s.settings.save()
 		s.sendCore(map[string]any{"type": "set_config", "key": "advisor.enabled", "value": s.settings.AdvisorEnabled})
 	case 1:
-		s.openAdvisorModelPicker(editTargetAdvisorModel)
+		s.settings.AdvisorNudge = !s.settings.AdvisorNudge
+		_ = s.settings.save()
+		s.sendCore(map[string]any{"type": "set_config", "key": "advisor.nudge", "value": s.settings.AdvisorNudge})
 	case 2:
+		s.openAdvisorModelPicker(editTargetAdvisorModel)
+	case 3:
 		s.settings.AdvisorSubagents = !s.settings.AdvisorSubagents
 		_ = s.settings.save()
 		s.sendCore(map[string]any{"type": "set_config", "key": "advisor.subagents", "value": s.settings.AdvisorSubagents})
-	case 3:
-		s.openAdvisorModelPicker(editTargetAdvisorSubagentModel)
 	case 4:
+		s.openAdvisorModelPicker(editTargetAdvisorSubagentModel)
+	case 5:
 		s.logInfo("watchdogs are configured with WATCHDOG.md and WATCHDOG.yml")
 	}
 }
@@ -4599,15 +4611,14 @@ func wrapPlainReport(lines []string, width int) []string {
 	return out
 }
 
-// modalBox wraps a body in a rounded border with padding.
+// modalBox is the shared focus surface for every blocking workflow. A strong
+// top edge and quiet remaining rails distinguish focus without changing theme
+// colors or filling the terminal behind the dialog.
 func modalBox(w int, body string) string {
 	if w < 1 {
 		w = 1
 	}
-	contentW := w - 4
-	if contentW < 1 {
-		contentW = 1
-	}
+	contentW := max(1, w-4)
 	clip := lipgloss.NewStyle().MaxWidth(contentW)
 	lines := strings.Split(body, "\n")
 	for i := range lines {
@@ -4616,7 +4627,10 @@ func modalBox(w int, body string) string {
 	body = strings.Join(lines, "\n")
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(c.accent)).
+		BorderTopForeground(lipgloss.Color(c.accent)).
+		BorderLeftForeground(lipgloss.Color(c.railDim)).
+		BorderRightForeground(lipgloss.Color(c.railDim)).
+		BorderBottomForeground(lipgloss.Color(c.railDim)).
 		Padding(0, 1).
 		Width(w).
 		Render(body)

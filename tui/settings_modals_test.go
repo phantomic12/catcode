@@ -62,13 +62,55 @@ func TestAdvisorCommandOpensConfigurationModal(t *testing.T) {
 	if s.settings.AdvisorEnabled == before {
 		t.Fatal("advisor toggle did not change state")
 	}
+	beforeNudge := s.settings.AdvisorNudge
 	s.executeListSelect(1)
+	if s.settings.AdvisorNudge == beforeNudge {
+		t.Fatal("advisor checkpoint toggle did not change state")
+	}
+	s.executeListSelect(2)
 	if s.modal.kind != modalAdvisorModels {
 		t.Fatalf("main model should open picker; got %v", s.modal.kind)
 	}
 	s.executeListSelect(2)
 	if s.settings.AdvisorModel != "reviewer" {
 		t.Fatalf("advisor model=%q, want reviewer", s.settings.AdvisorModel)
+	}
+}
+
+func TestAdvisorStatusIsVisibleInTranscript(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	raw, err := json.Marshal(map[string]any{
+		"type": "advisor_status", "scope": "main", "state": "reviewing",
+		"advisor": "Correctness", "model": "ck-grok-4.5",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.handleCoreEvent(&coreEvent{Type: "advisor_status", Raw: raw})
+	if s.toast != nil {
+		t.Fatal("advisor lifecycle status should be a transcript card, not a toast")
+	}
+	if len(s.blocks) != 1 || s.blocks[0].kind != blkAdvisor {
+		t.Fatalf("reviewing status must create advisor block, blocks=%+v", s.blocks)
+	}
+	if !strings.Contains(stripANSI(s.renderBlocks()), "reviewing") {
+		t.Fatal("reviewing status must be rendered in the transcript")
+	}
+
+	raw, err = json.Marshal(map[string]any{
+		"type": "advisor_status", "scope": "main", "state": "failed",
+		"advisor": "Correctness", "model": "ck-grok-4.5",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.handleCoreEvent(&coreEvent{Type: "advisor_status", Raw: raw})
+	if len(s.blocks) != 1 || s.blocks[0].advisorState != "failed" {
+		t.Fatalf("terminal status should update existing advisor block, blocks=%+v", s.blocks)
+	}
+	if !strings.Contains(stripANSI(s.renderBlocks()), "executor continued") {
+		t.Fatal("failed review must explain fail-open continuation")
 	}
 }
 
