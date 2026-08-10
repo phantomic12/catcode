@@ -581,7 +581,35 @@ fn close_session(rt: &mut Runtime, session_id: &str) -> Result<Value, BrowserErr
     }
 }
 
+fn navigation_url_allowed(url: &str) -> bool {
+    let scheme = url
+        .split_once(':')
+        .map(|(scheme, _)| scheme.to_ascii_lowercase());
+    matches!(scheme.as_deref(), Some("http") | Some("https"))
+        || url.eq_ignore_ascii_case("about:blank")
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::navigation_url_allowed;
+
+    #[test]
+    fn navigation_allows_only_web_and_blank() {
+        assert!(navigation_url_allowed("https://example.com"));
+        assert!(navigation_url_allowed("HTTP://example.com"));
+        assert!(navigation_url_allowed("about:blank"));
+        assert!(!navigation_url_allowed("file:///etc/passwd"));
+        assert!(!navigation_url_allowed("javascript:alert(1)"));
+        assert!(!navigation_url_allowed("data:text/html,secret"));
+    }
+}
 fn navigate(rt: &mut Runtime, session_id: &str, url: &str) -> Result<Value, BrowserError> {
+    if !navigation_url_allowed(url) {
+        return Err(BrowserError::new(
+            "NAVIGATE_BLOCKED",
+            "browser navigation permits only http, https, and about:blank URLs",
+        ));
+    }
     let s = session_mut(rt, session_id)?;
     s.tab
         .webview

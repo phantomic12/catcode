@@ -66,7 +66,7 @@ mod turn_terminal_tests {
             assert_eq!(encoded["type"], original["type"], "line {}", index + 1);
             count += 1;
         }
-        assert_eq!(count, 73, "fixture must cover every command variant");
+        assert_eq!(count, 79, "fixture must cover every command variant");
     }
 
     #[test]
@@ -96,6 +96,6 @@ mod turn_terminal_tests {
             );
             assert_eq!(event["protocol_version"], PROTOCOL_VERSION);
         }
-        assert_eq!(kinds.len(), 105, "fixture must cover every known event");
+        assert_eq!(kinds.len(), 114, "fixture must cover every known event");
     }
 }

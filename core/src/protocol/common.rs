@@ -8,21 +8,22 @@ pub struct ModelInfo {
     pub reasoning: bool,
     pub context_window: u32,
     pub max_tokens: u32,
-    /// Reasoning/thinking levels the model advertises (e.g. ["low","medium","high"]).
-    /// Populated from /models/info when the endpoint provides them; empty means the
-    /// model declares no specific levels and any effort string is passed through.
     #[serde(default)]
     pub thinking_levels: Vec<String>,
-    /// Whether the model accepts image (vision) inputs. Populated from
-    /// /models/info `capabilities.supports_vision` (true/false/"via-handoff";
-    /// only boolean true counts as native client-side vision); false otherwise.
-    /// Drives the vision-handoff (pre_turn plugin) routing.
     #[serde(default)]
     pub vision: bool,
-    /// The provider name that owns this model (e.g. "openai", "gemini",
-    /// "anthropic"). Populated by the aggregation layer so a turn can be routed
-    /// to the correct endpoint per-model when multiple providers are logged in.
-    /// Empty for legacy single-provider models (routes to the active provider).
+    /// Modalities accepted as model input, e.g. ["text", "image", "pdf"].
+    #[serde(default)]
+    pub input: Vec<String>,
+    /// Modalities emitted by the model, normally ["text"].
+    #[serde(default)]
+    pub output: Vec<String>,
+    /// Whether the model advertises tool/function calling support.
+    #[serde(default)]
+    pub tool_call: bool,
+    /// Whether the model advertises structured output support.
+    #[serde(default)]
+    pub structured_output: bool,
     #[serde(default)]
     pub provider: String,
 }

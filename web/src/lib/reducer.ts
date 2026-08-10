@@ -12,6 +12,7 @@ import type { CoreEventType } from "@catalyst-code/coding-agent";
 import type {
   AgentEvent,
   AgentState,
+  AdvisorMsg,
   AssistantMsg,
   BashMsg,
   GoalMsg,
@@ -26,6 +27,8 @@ import type {
   SandboxRuntimeStatus,
   SubagentChatItem,
   SubagentRunView,
+  ProcessLogsView,
+  ProcessStatusView,
   Toast,
   UIMessage,
   UIToolCall,
@@ -82,10 +85,15 @@ export const initialState: AgentState = {
   marketplaceInstalled: [],
   marketplaceResults: [],
   availableAgents: [],
+  pendingPluginTrust: null,
   pendingIntercom: null,
   pendingOauth: null,
   intercomLog: [],
   subagentRuns: {},
+  jobTree: {},
+  sessionTree: null,
+  processes: {},
+  processLogs: {},
   visionConfig: null,
   contextBreakdown: null,
   usageSnapshot: null,
@@ -496,6 +504,50 @@ function onToolCall(
   return finalizeCurrentAssistant(withCall);
 }
 
+function processSnapshot(output: string): { status?: ProcessStatusView; logs?: ProcessLogsView } {
+  try {
+    const value: unknown = JSON.parse(output);
+    if (!value || typeof value !== "object") return {};
+    const record = value as Record<string, unknown>;
+    if (typeof record.name !== "string") return {};
+    if (typeof record.text === "string") return { logs: { name: record.name, text: record.text, truncated: record.truncated === true } };
+    if (typeof record.pid === "number" && Array.isArray(record.argv) && typeof record.cwd === "string" && typeof record.started_at_ms === "number" && typeof record.state === "string") {
+      return { status: { name: record.name, pid: record.pid, argv: record.argv.filter((value): value is string => typeof value === "string"), cwd: record.cwd, started_at_ms: record.started_at_ms, state: record.state } };
+    }
+  } catch { /* Ordinary tool output is not JSON. */ }
+  return {};
+}
+
+function advisorKey(scope: string, advisor: string, model: string): string {
+  return `${scope}:${advisor}:${model}`;
+}
+
+function upsertAdvisor(
+  state: AgentState,
+  update: Omit<AdvisorMsg, "id" | "role" | "ts">,
+): AgentState {
+  const key = advisorKey(update.scope, update.advisor, update.model);
+  if (update.state !== "reviewing") {
+    const index = state.messages.findLastIndex(
+      (message) =>
+        message.role === "advisor" &&
+        advisorKey(message.scope, message.advisor, message.model) === key,
+    );
+    if (index >= 0) {
+      const messages = [...state.messages];
+      messages[index] = { ...messages[index], ...update } as AdvisorMsg;
+      return { ...state, messages };
+    }
+  }
+  return {
+    ...state,
+    messages: [
+      ...state.messages,
+      { id: newId("advisor"), role: "advisor", ts: Date.now(), ...update },
+    ],
+  };
+}
+
 function onToolResult(
   state: AgentState,
   ev: { id: string; ok: boolean; output: string; diff?: string; tool?: string },
@@ -503,27 +555,16 @@ function onToolResult(
   const result = { ok: ev.ok !== false, output: ev.output ?? "", diff: ev.diff };
   let matched = false;
   const messages = state.messages.map((m) => {
-    if (m.role !== "assistant") return m;
-    if (!m.toolCalls.some((t) => t.id === ev.id)) return m;
+    if (m.role !== "assistant" || !m.toolCalls.some((t) => t.id === ev.id)) return m;
     matched = true;
-    return {
-      ...m,
-      toolCalls: m.toolCalls.map((t) => (t.id === ev.id ? { ...t, result } : t)),
-    };
+    return { ...m, toolCalls: m.toolCalls.map((t) => t.id === ev.id ? { ...t, result } : t) };
   });
-  if (matched) return { ...state, messages };
-  // Fallback: no matching tool call (shouldn't happen) — render a standalone card.
-  const fallback: UIMessage = {
-    id: newId("tool"),
-    role: "tool",
-    toolCallId: ev.id,
-    toolName: ev.tool ?? "",
-    output: ev.output ?? "",
-    ok: ev.ok !== false,
-    diff: ev.diff,
-    ts: Date.now(),
-  };
-  return { ...state, messages: [...state.messages, fallback] };
+  const base = matched ? { ...state, messages } : state;
+  if (ev.tool !== "process") return base;
+  const snapshot = processSnapshot(result.output);
+  if (snapshot.status) return { ...base, processes: { ...base.processes, [snapshot.status.name]: snapshot.status } };
+  if (snapshot.logs) return { ...base, processLogs: { ...base.processLogs, [snapshot.logs.name]: snapshot.logs } };
+  return base;
 }
 
 function peelThinkTags(raw: string): { thinking: string; text: string } | null {
@@ -597,6 +638,18 @@ function asImages(content: unknown): string[] {
 
 /** Convert an OpenAI-style history array (from the core's `history` event) into
  *  the UI message model. Tool results attach to their tool call when possible. */
+function parseHistoricalAdvisory(raw: string): { advisor: string; severity: string; text: string } | null {
+  const match = raw.trim().match(/^<advisory\s+([^>]*)>\s*([\s\S]*?)\s*<\/advisory>$/);
+  if (!match) return null;
+  const attr = (name: string) => {
+    const value = match[1].match(new RegExp(`${name}="([^"]*)"`));
+    return value?.[1] ?? "";
+  };
+  const advisor = attr("advisor");
+  const text = match[2].trim();
+  return advisor && text ? { advisor, severity: attr("severity"), text } : null;
+}
+
 function historyToMessages(raw: unknown[]): UIMessage[] {
   const list = Array.isArray(raw) ? raw : [];
   const out: UIMessage[] = [];
@@ -626,6 +679,21 @@ function historyToMessages(raw: unknown[]): UIMessage[] {
         streaming: false,
         ts,
       });
+    } else if (role === "system") {
+      const advisory = parseHistoricalAdvisory(asText(m.content));
+      if (advisory) {
+        out.push({
+          id: newId("advisor"),
+          role: "advisor",
+          scope: "main",
+          advisor: advisory.advisor,
+          model: "",
+          state: "finding",
+          severity: advisory.severity,
+          text: advisory.text,
+          ts,
+        });
+      }
     } else if (role === "tool") {
       const tcId = m.tool_call_id ?? "";
       const content = asText(m.content);
@@ -1279,6 +1347,45 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
         toasts: needsDecision ? pushToast(state.toasts, "info", `Subagent asks: ${msg}`) : state.toasts,
       };
     }
+    case "job_list": {
+      const runs = Array.isArray(ev.runs) ? ev.runs : [];
+      const jobTree = { ...state.jobTree };
+      for (const raw of runs) {
+        const run = raw as { run_id?: string; parent_run_id?: string | null; state?: string; summary?: string | null };
+        if (run.run_id) jobTree[run.run_id] = { runId: run.run_id, parentRunId: run.parent_run_id, state: String(run.state ?? "unknown"), summary: run.summary };
+      }
+      return { ...state, jobTree };
+    }
+    case "job_status":
+    case "job_wait_result":
+    case "job_cancel_requested": {
+      const runId = String(ev.run_id ?? "");
+      if (!runId) return state;
+      return { ...state, jobTree: { ...state.jobTree, [runId]: { runId, parentRunId: ev.parent_run_id ?? null, state: String(ev.state ?? (ev.type === "job_cancel_requested" ? "cancelling" : "unknown")), summary: ev.summary ?? null } } };
+    }
+    case "job_cancel_result":
+      return {
+        ...state,
+        jobTree: {
+          ...state.jobTree,
+          [String(ev.run_id ?? "")]: {
+            runId: String(ev.run_id ?? ""),
+            state: "cancelled",
+            summary: ev.artifact ? "Cancellation recorded" : null,
+          },
+        },
+      };
+    case "subagent_delivery":
+      return upsertRun(state, String(ev.run_id ?? ""), (run) => ({
+        ...run,
+        state: String(ev.state ?? run.state),
+      }));
+    case "job_wait_timeout":
+      return { ...state, toasts: pushToast(state.toasts, "info", `Job ${String(ev.run_id ?? "")} is still running`) };
+    case "session_tree":
+      return { ...state, sessionTree: ev.tree ?? null };
+    case "session_branch":
+      return { ...state, toasts: pushToast(state.toasts, "success", `Switched to branch ${String(ev.entry_id ?? "")}`) };
     case "subagent_progress": {
       // Live phase/tokens/tool counters, keyed by run_id. Also keep a log line
       // (the old reducer read `message`, which the core never emits for progress).
@@ -1430,6 +1537,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
     case "plugin_trust_prompt":
       return {
         ...state,
+        pendingPluginTrust: Array.isArray(ev.plugins) ? ev.plugins : [],
         toasts: pushToast(
           state.toasts,
           "info",
@@ -1439,6 +1547,7 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
     case "plugin_trust_applied":
       return {
         ...state,
+        pendingPluginTrust: null,
         toasts: pushToast(
           state.toasts,
           "success",
@@ -2215,23 +2324,31 @@ export function reduce(state: AgentState, ev: AgentEvent): AgentState {
       };
     }
     case "advisor_note": {
-      // Watchdog advisor recommendation. Surface concerns/blockers as warnings;
-      // nits stay informational (matches TUI handlers).
-      const severity = typeof ev.severity === "string" ? ev.severity : "";
-      const message = typeof ev.message === "string" ? ev.message : "";
-      if (!message) return state;
-      const kind =
-        severity === "concern" || severity === "blocker" ? "warning" : "info";
-      const prefix = severity ? `Advisor (${severity})` : "Advisor";
-      return {
-        ...state,
-        toasts: pushToast(state.toasts, kind, `${prefix}: ${message}`),
-      };
+      const advisor = typeof ev.advisor === "string" && ev.advisor ? ev.advisor : "default";
+      const model = typeof ev.model === "string" ? ev.model : "";
+      const text = typeof ev.finding === "string" && ev.finding ? ev.finding : ev.message ?? "";
+      if (!text) return state;
+      return upsertAdvisor(state, {
+        scope: typeof ev.scope === "string" ? ev.scope : "main",
+        advisor,
+        model,
+        state: "finding",
+        severity: typeof ev.severity === "string" ? ev.severity : "",
+        text,
+      });
     }
-    case "advisor_status":
-      // Reviewing/no-key state is available to protocol clients; keep the UI
-      // quiet during normal reviews and surface only actionable notes.
-      return state;
+    case "advisor_status": {
+      const stateName = typeof ev.state === "string" ? ev.state : "";
+      if (!stateName || stateName === "duplicate") return state;
+      return upsertAdvisor(state, {
+        scope: typeof ev.scope === "string" ? ev.scope : "main",
+        advisor: typeof ev.advisor === "string" && ev.advisor ? ev.advisor : "default",
+        model: typeof ev.model === "string" ? ev.model : "",
+        state: stateName,
+        text: typeof ev.reason === "string" ? ev.reason : undefined,
+        elapsedMs: typeof ev.elapsed_ms === "number" ? ev.elapsed_ms : undefined,
+      });
+    }
 
     default:
       return state;

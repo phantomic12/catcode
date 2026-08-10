@@ -32,6 +32,19 @@ rand = "0.8"
 libc = "0.2"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 bytes = "1"
+# Embedded structural rewrite engine. Keep the parser set narrow so releases do
+# not require a separately installed ast-grep executable or all grammars.
+ast-grep-core = { version = "=0.44.0", default-features = false, features = ["tree-sitter"] }
+ast-grep-language = { version = "=0.44.0", default-features = false, features = [
+    "tree-sitter-go",
+    "tree-sitter-javascript",
+    "tree-sitter-json",
+    "tree-sitter-md",
+    "tree-sitter-python",
+    "tree-sitter-rust",
+    "tree-sitter-typescript",
+    "tree-sitter-yaml",
+] }
 # Sandbox: official Microsandbox Rust SDK (embeddable microVM). Gated behind
 # the `microsandbox` feature (default on) so the SDK's heavy dep tree is only
 # pulled when sandboxing is compiled in. ALL SDK types live behind CatCode-owned
@@ -48,6 +61,9 @@ gtk = { version = "0.18", optional = true }
 glib = { version = "0.18", optional = true }
 gio = { version = "0.18", optional = true }
 
+# Chromium DevTools Protocol transport. Kept optional so `--no-default-features`
+# remains free of browser and native GUI dependencies.
+tokio-tungstenite = { version = "0.24", optional = true }
 # Corporate/WSL MITM CAs in /etc/ssl/certs (or the Windows cert store), plus
 # HTTP(S)_PROXY / platform system-proxy. Not enabled for macOS — see note above.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
@@ -55,6 +71,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 
 [features]
 default = ["microsandbox"]
+chromium-cdp = ["dep:tokio-tungstenite"]
 native-browser = ["dep:wry", "dep:tao", "dep:webkit2gtk", "dep:cairo", "dep:gio", "dep:gtk", "dep:glib"]
 # Microsandbox microVM sandboxing (Linux/KVM, Apple Silicon macOS, Windows/WHP).
 # The SDK downloads its own runtime (msb + libkrunfw) on first use; no external

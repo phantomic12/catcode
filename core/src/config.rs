@@ -305,6 +305,8 @@ pub struct Config {
     /// to config.json `search_keys`. Searched by `web_search` before the
     /// `EXA_API_KEY` / `TAVILY_API_KEY` env vars (so slash-command keys win).
     pub search_keys: std::collections::HashMap<String, String>,
+    /// MCP servers from user-owned config only; project settings cannot define transports.
+    pub mcp_servers: Vec<crate::mcp::McpConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -325,7 +327,10 @@ pub struct WatchdogAdvisor {
     pub name: String,
     pub enabled: bool,
     pub model: Option<String>,
+    /// Read-only evidence tools requested by this specialist.
     pub tools: Vec<String>,
+    /// Optional path triggers; empty means always eligible.
+    pub triggers: Vec<String>,
     pub instructions: Option<String>,
 }
 
@@ -570,6 +575,14 @@ pub struct ModelOverride {
     /// Force the advertised reasoning effort levels (e.g. ["low","medium","high"]).
     /// An empty vec clears the levels (model declares none); `None` leaves them.
     pub thinking_levels: Option<Vec<String>>,
+    /// Force accepted input modalities (e.g. ["text", "image"]).
+    pub input: Option<Vec<String>>,
+    /// Force emitted output modalities (e.g. ["text"]).
+    pub output: Option<Vec<String>>,
+    /// Force tool/function calling support.
+    pub tool_call: Option<bool>,
+    /// Force structured-output support.
+    pub structured_output: Option<bool>,
 }
 
 /// A configured provider as it appears in the config file/env (no resolved
@@ -893,6 +906,18 @@ fn model_override_to_json(m: &ModelOverride) -> Value {
     if let Some(levels) = &m.thinking_levels {
         o.insert("thinking_levels".into(), json!(levels));
     }
+    if let Some(input) = &m.input {
+        o.insert("input".into(), json!(input));
+    }
+    if let Some(output) = &m.output {
+        o.insert("output".into(), json!(output));
+    }
+    if let Some(v) = m.tool_call {
+        o.insert("tool_call".into(), json!(v));
+    }
+    if let Some(v) = m.structured_output {
+        o.insert("structured_output".into(), json!(v));
+    }
     Value::Object(o)
 }
 
@@ -1120,6 +1145,7 @@ impl Default for Config {
             active_provider: None,
             persisted_keys: std::collections::HashMap::new(),
             search_keys: std::collections::HashMap::new(),
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -1697,6 +1723,7 @@ fn strip_untrusted_keys(v: &mut Value, path: &std::path::Path) {
         "api_key",
         "search_keys",
         "plugins",
+        "mcp_servers",
     ];
     if let Some(obj) = v.as_object_mut() {
         let removed: Vec<&str> = STRIPPED
@@ -1981,6 +2008,17 @@ fn apply_json(c: &mut Config, v: &Value) {
             }
         }
     }
+    // MCP transports are security-sensitive and are accepted only from trusted
+    // user/managed/explicit config layers (project files are stripped above).
+    if let Some(arr) = v.get("mcp_servers").and_then(|x| x.as_array()) {
+        for server in arr {
+            if let Ok(parsed) = serde_json::from_value::<crate::mcp::McpConfig>(server.clone()) {
+                if !parsed.name.trim().is_empty() {
+                    c.mcp_servers.push(parsed);
+                }
+            }
+        }
+    }
     // Search-tool API keys (Exa / Tavily) set via `/search-key`. Mirrors
     // provider_keys: read from user-owned config so they survive a restart.
     if let Some(obj) = v.get("search_keys").and_then(|x| x.as_object()) {
@@ -2194,19 +2232,35 @@ fn parse_one_model_override(v: Option<&Value>, id: String) -> Option<ModelOverri
         .and_then(|x| x.as_u64())
         .map(|n| n.min(u32::MAX as u64) as u32);
     let reasoning = v.get("reasoning").and_then(|x| x.as_bool());
-    let thinking_levels = v
-        .get("thinking_levels")
-        .or_else(|| v.get("thinkingLevels"))
-        .and_then(|x| x.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|s| s.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        });
+    let string_list = |snake: &str, camel: &str| {
+        v.get(snake)
+            .or_else(|| v.get(camel))
+            .and_then(|x| x.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+    };
+    let thinking_levels = string_list("thinking_levels", "thinkingLevels");
+    let input = string_list("input", "inputModalities");
+    let output = string_list("output", "outputModalities");
+    let tool_call = v
+        .get("tool_call")
+        .or_else(|| v.get("toolCall"))
+        .and_then(|x| x.as_bool());
+    let structured_output = v
+        .get("structured_output")
+        .or_else(|| v.get("structuredOutput"))
+        .and_then(|x| x.as_bool());
     if context_window.is_none()
         && max_tokens.is_none()
         && reasoning.is_none()
         && thinking_levels.is_none()
+        && input.is_none()
+        && output.is_none()
+        && tool_call.is_none()
+        && structured_output.is_none()
     {
         return None;
     }
@@ -2216,6 +2270,10 @@ fn parse_one_model_override(v: Option<&Value>, id: String) -> Option<ModelOverri
         max_tokens,
         reasoning,
         thinking_levels,
+        input,
+        output,
+        tool_call,
+        structured_output,
     })
 }
 
@@ -2899,6 +2957,26 @@ mod tests {
         let deepseek = find_preset("deepseek").unwrap();
         assert_eq!(deepseek.base_url, "https://api.deepseek.com");
         assert_eq!(deepseek.api_key_env, "DEEPSEEK_API_KEY");
+    }
+
+    #[test]
+    fn project_config_cannot_define_mcp_transports() {
+        let mut value = json!({
+            "mcp_servers": [{"name":"evil","transport":"http","url":"https://evil.invalid"}]
+        });
+        strip_untrusted_keys(&mut value, std::path::Path::new("settings.json"));
+        let mut config = Config::default();
+        apply_json(&mut config, &value);
+        assert!(config.mcp_servers.is_empty());
+
+        apply_json(
+            &mut config,
+            &json!({
+                "mcp_servers": [{"name":"trusted","transport":"http","url":"http://127.0.0.1:9"}]
+            }),
+        );
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert_eq!(config.mcp_servers[0].name, "trusted");
     }
 
     #[test]

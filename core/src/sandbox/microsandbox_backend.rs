@@ -13,7 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::config::{Config, SandboxNetworkMode};
-use crate::sandbox::backend::{truncate_tail, ExecRequest, ExecResult, ExecutionBackend};
+use crate::sandbox::backend::{ExecRequest, ExecResult, ExecutionBackend};
 use crate::sandbox::error::{
     error_codes, CheckStatus, ExecutionError, SandboxPreflightCheck, SandboxPreflightReport,
 };
@@ -21,6 +21,36 @@ use crate::sandbox::policy::{guest_base_env, GUEST_WORKSPACE};
 use crate::sandbox::preflight::{run_platform_preflight, RealProbe};
 
 use microsandbox::sandbox::Sandbox;
+const TRUNCATION_MARKER: &[u8] = b"...[truncated]...\n";
+
+fn append_bounded(tail: &mut Vec<u8>, chunk: &[u8], max: usize, truncated: &mut bool) {
+    if max == 0 {
+        *truncated |= !chunk.is_empty();
+        return;
+    }
+    if chunk.len() >= max {
+        tail.clear();
+        tail.extend_from_slice(&chunk[chunk.len() - max..]);
+        *truncated = true;
+        return;
+    }
+    let overflow = tail.len().saturating_add(chunk.len()).saturating_sub(max);
+    if overflow > 0 {
+        tail.drain(..overflow);
+        *truncated = true;
+    }
+    tail.extend_from_slice(chunk);
+}
+
+fn finalize_bounded(tail: Vec<u8>, max: usize, truncated: bool) -> Vec<u8> {
+    if !truncated {
+        return tail;
+    }
+    let mut output = Vec::with_capacity(TRUNCATION_MARKER.len().saturating_add(max));
+    output.extend_from_slice(TRUNCATION_MARKER);
+    output.extend_from_slice(&tail);
+    output
+}
 
 /// A reused Microsandbox microVM.
 pub struct MicrosandboxExecutionBackend {
@@ -153,19 +183,15 @@ impl MicrosandboxExecutionBackend {
 
         // Global plugin dir (read-only) so user-installed plugin scripts run in
         // the guest without exposing the whole ~/.catalyst-code config dir.
-        let plugin_dir = self
-            .cfg
-            .plugin_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.cfg.plugin_dir.clone());
-        let under_ws = ws
-            .canonicalize()
-            .ok()
-            .map(|w| plugin_dir.starts_with(&w))
-            .unwrap_or(false);
-        if plugin_dir.exists() && !under_ws {
+        // This must match PluginManager::new_with_global_plugins, not
+        // cfg.plugin_dir (which names the project plugin directory).
+        if let Some(plugin_dir) = crate::config::home_dir()
+            .map(|home| home.join(".catalyst-code/plugins"))
+            .filter(|dir| dir.exists())
+        {
+            let plugin_dir = plugin_dir.canonicalize().unwrap_or(plugin_dir);
             builder = builder.volume("/catcode-plugins".to_string(), |m| {
-                m.bind(plugin_dir.clone()).readonly()
+                m.bind(plugin_dir).readonly()
             });
         }
 
@@ -309,40 +335,59 @@ impl ExecutionBackend for MicrosandboxExecutionBackend {
         };
 
         let control = handle.control();
-        let collect = handle.collect();
+        let mut stdout = Vec::with_capacity(max_out.min(8 * 1024));
+        let mut stderr = Vec::with_capacity(max_err.min(8 * 1024));
+        let mut stdout_truncated = false;
+        let mut stderr_truncated = false;
+        let collect = async {
+            let mut exit_code = None;
+            while let Some(event) = handle.recv().await {
+                match event {
+                    microsandbox::ExecEvent::Stdout(data) => {
+                        append_bounded(&mut stdout, data.as_ref(), max_out, &mut stdout_truncated);
+                    }
+                    microsandbox::ExecEvent::Stderr(data) => {
+                        append_bounded(&mut stderr, data.as_ref(), max_err, &mut stderr_truncated);
+                    }
+                    microsandbox::ExecEvent::Exited { code } => {
+                        exit_code = Some(code);
+                        break;
+                    }
+                    microsandbox::ExecEvent::Failed(e) => {
+                        return Err(microsandbox::MicrosandboxError::ExecFailed(e))
+                    }
+                    microsandbox::ExecEvent::Started { .. }
+                    | microsandbox::ExecEvent::StdinError(_) => {}
+                }
+            }
+            let code = exit_code.ok_or_else(|| {
+                microsandbox::MicrosandboxError::Runtime(
+                    "exec session ended without exit event".into(),
+                )
+            })?;
+            Ok((code, stdout, stderr, stdout_truncated, stderr_truncated))
+        };
         match tokio::time::timeout(timeout, collect).await {
-            Ok(Ok(out)) => Ok(ExecResult {
-                exit_code: Some(out.status().code),
-                stdout: truncate_tail(out.stdout_bytes(), max_out),
-                stderr: truncate_tail(out.stderr_bytes(), max_err),
+            Ok(Ok((code, stdout, stderr, stdout_truncated, stderr_truncated))) => Ok(ExecResult {
+                exit_code: Some(code),
+                stdout: finalize_bounded(stdout, max_out, stdout_truncated),
+                stderr: finalize_bounded(stderr, max_err, stderr_truncated),
                 timed_out: false,
             }),
             Ok(Err(e)) => {
                 let err = self.map_exec_error(&e);
-                if matches!(err, ExecutionError::MissingExecutable { .. }) {
-                    // Not unhealthy — just a missing tool in the image.
-                } else {
+                if !matches!(err, ExecutionError::MissingExecutable { .. }) {
                     self.unhealthy
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 Err(err)
             }
             Err(_) => {
-                // Timed out: kill the guest process, then try to collect
-                // remaining output with a short grace window.
                 let _ = control.kill().await;
-                let partial = tokio::time::timeout(Duration::from_secs(2), handle.collect()).await;
-                let (stdout, stderr) = match partial {
-                    Ok(Ok(o)) => (
-                        truncate_tail(o.stdout_bytes(), max_out),
-                        truncate_tail(o.stderr_bytes(), max_err),
-                    ),
-                    _ => (Vec::new(), Vec::new()),
-                };
                 Ok(ExecResult {
                     exit_code: None,
-                    stdout,
-                    stderr,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
                     timed_out: true,
                 })
             }

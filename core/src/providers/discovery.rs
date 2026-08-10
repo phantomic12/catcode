@@ -290,13 +290,7 @@ pub(crate) fn apply_context_window_override(provider: &ResolvedProvider, models:
     }
 }
 
-/// Apply a provider's optional per-model `models_override` list. Each override
-/// matches a discovered model by id and refines only the fields it sets
-/// (context_window / max_tokens / reasoning / thinking_levels). Applied AFTER
-/// discovery + models.dev enrichment + the per-provider `context_window`
-/// override, so an explicit per-model value wins over everything else. Models
-/// with no matching override keep their discovered/curated/default caps
-/// (the 200k / 8k flat default when nothing else applies).
+/// Apply explicit per-model metadata after discovery and registry enrichment.
 pub(crate) fn apply_models_override(provider: &ResolvedProvider, models: &mut [ModelInfo]) {
     for ov in &provider.models_override {
         let Some(m) = models.iter_mut().find(|m| m.id == ov.id) else {
@@ -308,21 +302,26 @@ pub(crate) fn apply_models_override(provider: &ResolvedProvider, models: &mut [M
         if let Some(max) = ov.max_tokens.filter(|&c| c > 0) {
             m.max_tokens = max;
         }
-        // Always repair inversion / zero after overrides so a partial override
-        // (context-only) or a stale max cannot leave max_tokens:0 / max >= ctx.
         sanitize_model_caps(m);
         if let Some(r) = ov.reasoning {
             m.reasoning = r;
         }
         if let Some(levels) = &ov.thinking_levels {
             m.thinking_levels = levels.clone();
-            // Advertise reasoning iff there are effort levels; an empty vec
-            // clears both (model declares no thinking).
-            if levels.is_empty() {
-                m.reasoning = false;
-            } else {
-                m.reasoning = true;
-            }
+            m.reasoning = !levels.is_empty();
+        }
+        if let Some(input) = &ov.input {
+            m.input = input.clone();
+            m.vision = input.iter().any(|v| v.eq_ignore_ascii_case("image"));
+        }
+        if let Some(output) = &ov.output {
+            m.output = output.clone();
+        }
+        if let Some(tool_call) = ov.tool_call {
+            m.tool_call = tool_call;
+        }
+        if let Some(structured_output) = ov.structured_output {
+            m.structured_output = structured_output;
         }
     }
 }
@@ -809,8 +808,8 @@ pub(crate) fn apply_live_model_fields(m: &Value, info: &mut ModelInfo) {
     {
         info.thinking_levels = levels
             .iter()
-            .filter_map(|level| level.as_str().map(str::to_string))
-            .filter(|level| !level.is_empty())
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .filter(|v| !v.is_empty())
             .collect();
     }
     if let Some(ctx) = m
@@ -820,7 +819,7 @@ pub(crate) fn apply_live_model_fields(m: &Value, info: &mut ModelInfo) {
         .or_else(|| m.get("max_model_len"))
         .or_else(|| m.get("max_input_tokens"))
         .and_then(|v| v.as_u64())
-        .filter(|&c| c > 0)
+        .filter(|&v| v > 0)
     {
         info.context_window = ctx.min(u32::MAX as u64) as u32;
     }
@@ -829,43 +828,68 @@ pub(crate) fn apply_live_model_fields(m: &Value, info: &mut ModelInfo) {
         .or_else(|| m.get("max_output_tokens"))
         .or_else(|| m.get("max_completion_tokens"))
         .and_then(|v| v.as_u64())
-        .filter(|&c| c > 0)
+        .filter(|&v| v > 0)
     {
         info.max_tokens = max.min(u32::MAX as u64) as u32;
     }
-    // Zero / inverted pairs must never stick from live fields. max_tokens:0 is
-    // filtered above (treated as missing), but a curated 0 or max >= context
-    // still needs repair after both overlays.
+    let modalities = |primary: &str, nested: &str| {
+        m.get(primary)
+            .or_else(|| m.get("modalities").and_then(|v| v.get(nested)))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+    };
+    if let Some(input) = modalities("input_modalities", "input") {
+        info.vision = input.iter().any(|v| v.eq_ignore_ascii_case("image"));
+        info.input = input;
+    }
+    if let Some(output) = modalities("output_modalities", "output") {
+        info.output = output;
+    }
+    if let Some(v) = m
+        .get("tool_call")
+        .or_else(|| m.get("supports_tools"))
+        .and_then(|v| v.as_bool())
+    {
+        info.tool_call = v;
+    }
+    if let Some(v) = m
+        .get("structured_output")
+        .or_else(|| m.get("supports_structured_output"))
+        .and_then(|v| v.as_bool())
+    {
+        info.structured_output = v;
+    }
     sanitize_model_caps(info);
-    // Image input pricing / modality hints (xAI, some gateways).
     if m.get("prompt_image_token_price")
         .and_then(|v| v.as_u64())
         .unwrap_or(0)
         > 0
     {
         info.vision = true;
-    }
-    if let Some(mods) = m.get("input_modalities").and_then(|v| v.as_array()) {
-        if mods.iter().any(|x| x.as_str() == Some("image")) {
-            info.vision = true;
+        if !info.input.iter().any(|v| v == "image") {
+            info.input.push("image".into());
         }
     }
 }
-
+/// Apply rich fields from a `/models` list after registry enrichment, preserving
+/// endpoint metadata over the public registry when both provide a value.
 pub(crate) fn apply_live_model_list_fields(data: &Value, models: &mut [ModelInfo]) {
-    let Some(entries) = data.get("data").and_then(|value| value.as_array()) else {
+    let Some(entries) = data.get("data").and_then(Value::as_array) else {
         return;
     };
     for info in models {
-        if let Some(entry) = entries.iter().find(|entry| {
-            entry.get("id").and_then(|value| value.as_str()) == Some(info.id.as_str())
-        }) {
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(info.id.as_str()))
+        {
             apply_live_model_fields(entry, info);
         }
     }
 }
-
-/// Parse xAI `GET /v1/models` into chat ModelInfos, using live `context_length`
 /// and filtering out image/video/TTS media models that cannot run the agent loop.
 pub(crate) fn parse_xai_models_list(data: &Value) -> Vec<ModelInfo> {
     let Some(arr) = data.get("data").and_then(|d| d.as_array()) else {
@@ -1360,6 +1384,17 @@ fn endpoint_host(base_url: &str) -> String {
         .next()
         .unwrap_or("")
         .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn endpoint_authority(base_url: &str) -> String {
+    base_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(base_url)
+        .split(['/', '?'])
         .next()
         .unwrap_or("")
         .to_ascii_lowercase()
@@ -1936,15 +1971,46 @@ fn deepseek_fallback_models() -> Vec<ModelInfo> {
         .collect()
 }
 
+/// Curated catalogs for local engines whose model-list endpoints are commonly
+/// unavailable during startup. These entries are intentionally limited to
+/// recognizable local-engine endpoints; an arbitrary dead OpenAI-compatible
+/// URL still returns no models rather than pretending to serve Umans models.
+pub(crate) fn local_engine_fallback_models(base_url: &str) -> Vec<ModelInfo> {
+    let authority = endpoint_authority(base_url);
+    let (ids, ctx, max): (&[&str], u32, u32) =
+        if authority == "localhost:11434" || authority == "127.0.0.1:11434" {
+            (&["llama3.1", "qwen2.5-coder", "gemma3"], 32_768, 8_192)
+        } else if authority == "localhost:1234" || authority == "127.0.0.1:1234" {
+            (&["local-model"], 32_768, 8_192)
+        } else if authority == "localhost:8080" || authority == "127.0.0.1:8080" {
+            (&["local-model"], 16_384, 4_096)
+        } else {
+            return Vec::new();
+        };
+    ids.iter()
+        .map(|id| ModelInfo {
+            id: (*id).to_string(),
+            name: (*id).to_string(),
+            reasoning: false,
+            context_window: ctx,
+            max_tokens: max,
+            input: vec!["text".into()],
+            output: vec!["text".into()],
+            tool_call: true,
+            provider: "local".into(),
+            ..Default::default()
+        })
+        .collect()
+}
+
 /// Curated fallback models for an OpenAI-compatible endpoint that served no
-/// list at all. Gemini host → Gemini models; xAI host → Grok models; otherwise
-/// the Umans default list.
+/// list at all. Gemini host → Gemini models; xAI host → Grok models; known
+/// local engines → their explicit local catalog. Unknown endpoints return no
+/// models: discovery failure must not produce a misleading Umans fallback.
 fn openai_fallback_models(base_url: &str) -> Vec<ModelInfo> {
     if is_codex_endpoint(base_url) {
         return codex_fallback_models();
     }
-    // Code Assist endpoint (OAuth Gemini) and the standard Gemini endpoint both
-    // serve the same models — use the Gemini fallback list for both.
     if is_gemini_endpoint(base_url) || is_code_assist_endpoint(base_url) {
         return gemini_fallback_models();
     }
@@ -1957,13 +2023,10 @@ fn openai_fallback_models(base_url: &str) -> Vec<ModelInfo> {
     if is_deepseek(base_url) {
         return deepseek_fallback_models();
     }
-    // Umans-only curated catalog. Do NOT return this for arbitrary custom
-    // OpenAI-compatible URLs — a failed discover on localhost/LM Studio/etc.
-    // would otherwise show umans-coder and lock the user into a fake list.
     if crate::provider::is_umans(base_url) {
         return fallback_models();
     }
-    Vec::new()
+    local_engine_fallback_models(base_url)
 }
 
 fn codex_fallback_models() -> Vec<ModelInfo> {
@@ -2179,10 +2242,24 @@ mod tests {
     }
 
     #[test]
+    fn local_engine_fallbacks_are_curated_and_unknowns_are_empty() {
+        let ollama = openai_fallback_models("http://localhost:11434/v1");
+        assert_eq!(
+            ollama.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["llama3.1", "qwen2.5-coder", "gemma3"]
+        );
+        assert!(ollama
+            .iter()
+            .all(|m| m.provider == "local" && m.context_window > m.max_tokens));
+        assert!(openai_fallback_models("http://localhost:9999/v1").is_empty());
+        assert!(openai_fallback_models("https://example.invalid/v1").is_empty());
+    }
+
+    #[test]
     fn openai_fallback_unknown_custom_endpoint_is_empty() {
-        // A dead custom URL must NOT inherit the Umans curated catalog — that
-        // used to make add-custom-provider look "successful" with umans-coder.
-        assert!(openai_fallback_models("http://localhost:11434/v1").is_empty());
+        // A dead arbitrary URL must NOT inherit the Umans curated catalog.
+        assert!(!openai_fallback_models("http://localhost:11434/v1").is_empty());
+        assert!(openai_fallback_models("http://localhost:9999/v1").is_empty());
         assert!(openai_fallback_models("https://api.example.com/v1").is_empty());
         // Known vendors still get their curated lists.
         assert!(!openai_fallback_models("https://api.code.umans.ai/v1").is_empty());
@@ -2326,6 +2403,7 @@ mod tests {
                 max_tokens: Some(0), // must be ignored (filter > 0)
                 reasoning: None,
                 thinking_levels: None,
+                ..Default::default()
             }],
             models_endpoint: None,
         };

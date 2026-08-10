@@ -92,28 +92,22 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Rewrite memory frontmatter status (and optional last_verified_at) in place.
-/// Uses a cross-process lock on the memory file; mirrors `write_memory_file`.
+/// Rewrite lifecycle metadata against the latest on-disk snapshot. This avoids
+/// a stale scan undoing an append or another metadata update.
 fn rewrite_status(
-    _workspace: &Path,
+    workspace: &Path,
     entry: &MemoryEntry,
     status: MemoryStatus,
     last_verified_at: Option<u64>,
 ) -> Result<(), String> {
-    let path = &entry.path;
-    if !path.exists() {
-        return Err(format!("memory file missing: {}", path.display()));
-    }
-    let _lock = crate::fsutil::FileLock::acquire(&path.with_extension("lock"));
-    let mut updated = entry.clone();
-    updated.status = status;
-    updated.schema_version = updated.schema_version.max(2);
-    if let Some(ts) = last_verified_at {
-        updated.last_verified_at = Some(ts);
-    }
-    // Clearing deprecated flag is intentional only when verifying — leave as-is.
-    write_memory_file_public(path, &updated)?;
-    Ok(())
+    memory::update_memory_scoped(workspace, entry.scope, &entry.name, |updated| {
+        updated.status = status;
+        updated.schema_version = updated.schema_version.max(2);
+        if let Some(ts) = last_verified_at {
+            updated.last_verified_at = Some(ts);
+        }
+    })
+    .map(|_| ())
 }
 
 /// Local mirror of memory::write_memory_file (private there).

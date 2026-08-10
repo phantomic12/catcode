@@ -168,16 +168,29 @@ pub(crate) fn spawn_goal_deploy(st: Arc<State>, client: reqwest::Client) {
         emit(&Event::new("info").with("message", json!("Goal deploy: snapshotting workspace…")));
         let tok = resource.cancellation().clone();
         *st.goal_deploy_cancel.lock().await = Some(tok.clone());
-        // Snapshot inside the task so ApproveGoalPlan / auto-deploy return fast.
-        {
+        let checkpoint_result = {
             let cfg = st.cfg.read().await;
-            let _ = checkpoint::create(
+            checkpoint::create(
                 &cfg.workspace,
                 cfg.session_file.as_deref(),
                 "auto-before-goal-deploy",
                 &[],
                 true,
+            )
+        };
+        if let Err(error) = checkpoint_result {
+            let mut g = st.goal.lock().await;
+            goal::fail_goal(
+                &mut g,
+                format!("goal deploy blocked: checkpoint failed: {error}"),
             );
+            emit(&Event::new("error").with(
+                "message",
+                json!(format!(
+                    "Goal deploy blocked: automatic checkpoint failed: {error}"
+                )),
+            ));
+            return;
         }
         let need_followup = goal::deploy_goal(st.clone(), client.clone(), tok.clone()).await;
         // Clear cancel slot only if we still own it. A newer spawn cancels
@@ -316,13 +329,14 @@ pub(crate) fn spawn_goal_review(st: Arc<State>, client: reqwest::Client) {
 
 /// Start the CEO post-deploy verify parent turn.
 pub(crate) async fn spawn_goal_verify(st: Arc<State>, client: reqwest::Client) {
+    let workspace = st.cfg.read().await.workspace.clone();
     let wrap = {
         let g = st.goal.lock().await;
         if g.phase != goal::GoalPhase::Verifying {
             return;
         }
         (
-            goal::build_verify_prompt(&g),
+            crate::goal_ceo::verify_prompt_with_workspace(&g, Some(&workspace)),
             g.parent_model.clone(),
             g.reasoning_effort.clone(),
             g.id.clone(),
@@ -546,12 +560,27 @@ pub(crate) async fn maybe_finish_goal_verifying(
             .map(|t| t.to_string())
             .unwrap_or_default()
     };
+    let workspace = st.cfg.read().await.workspace.clone();
     let (outcome, prompt, model, effort) = {
         let mut g = st.goal.lock().await;
         if g.phase != goal::GoalPhase::Verifying {
             return;
         }
-        let outcome = goal::finish_verifying(&mut g, cancelled, &assistant);
+        let upper = assistant.to_ascii_uppercase();
+        let claims_pass = upper.contains("VERDICT: PASS")
+            || upper.contains("VERDICT: CERTIFY")
+            || upper.contains("VERDICT: CERTIFIED");
+        let candidate = if g.ceo_mode && claims_pass {
+            match crate::goal_ceo::validate_certification_evidence(&workspace, &g) {
+                Ok(_) => assistant.clone(),
+                Err(error) => {
+                    format!("VERDICT: FAIL\nGAPS:\n- evidence validation failed: {error}")
+                }
+            }
+        } else {
+            assistant.clone()
+        };
+        let outcome = goal::finish_verifying(&mut g, cancelled, &candidate);
         let next = match outcome {
             goal::VerifyOutcome::Replan => (
                 outcome,

@@ -1,4 +1,5 @@
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
@@ -327,6 +328,64 @@ fn midstream_drop_then_success_provider() -> (String, Arc<AtomicBool>, thread::J
             let payload = format!(
                 "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
                 serde_json::json!({"choices":[{"delta":{"content":"FULL_OK"}}]}),
+                serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1}})
+            );
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n");
+            let _ = write_sse_chunk(&mut stream, &payload);
+            let _ = stream.write_all(b"0\r\n\r\n");
+        }
+    });
+    (format!("http://{address}/v1"), stop, handle)
+}
+
+/// First chat POST emits partial assistant text then stalls past the SSE idle
+/// timeout; second POST completes. Exercises mid-stream idle-timeout retry
+/// with discard_partial (same recovery path as body-drop).
+fn midstream_idle_then_success_provider() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let handle = thread::spawn(move || {
+        // Idle floor is 10s for OpenAI; allow room for hang + backoff + retry.
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let mut posts = 0_u32;
+        while Instant::now() < deadline && !thread_stop.load(Ordering::Relaxed) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            let request = read_http_request(&mut stream);
+            if request.starts_with("GET ") {
+                write_json_response(
+                    &mut stream,
+                    r#"{"mock-model":{"display_name":"Mock","capabilities":{"context_window":8192,"recommended_max_tokens":1024}}}"#,
+                );
+                continue;
+            }
+            posts += 1;
+            if posts == 1 {
+                let partial = format!(
+                    "data: {}\n\n",
+                    serde_json::json!({"choices":[{"delta":{"content":"IDLE_PARTIAL "}}]})
+                );
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: keep-alive\r\n\r\n",
+                );
+                let _ = write_sse_chunk(&mut stream, &partial);
+                // Hold the connection open past the client's idle timeout so
+                // stream_turn surfaces "stream idle timeout (...)".
+                let hold_deadline = Instant::now() + Duration::from_secs(14);
+                while Instant::now() < hold_deadline && !thread_stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                drop(stream);
+                continue;
+            }
+            let payload = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({"choices":[{"delta":{"content":"IDLE_OK"}}]}),
                 serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1}})
             );
             let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n");
@@ -703,25 +762,47 @@ impl CoreHarness {
     }
 
     fn start_with_approval(workspace: &std::path::Path, base_url: &str, approval: &str) -> Self {
+        Self::start_with_options(workspace, base_url, approval, None)
+    }
+
+    fn start_with_idle_timeout(
+        workspace: &std::path::Path,
+        base_url: &str,
+        idle_timeout_secs: u64,
+    ) -> Self {
+        Self::start_with_options(workspace, base_url, "never", Some(idle_timeout_secs))
+    }
+
+    fn start_with_options(
+        workspace: &std::path::Path,
+        base_url: &str,
+        approval: &str,
+        idle_timeout_secs: Option<u64>,
+    ) -> Self {
         let session = workspace.join("session.jsonl");
         let config = workspace.join("config.json");
         std::fs::write(&config, "{}\n").unwrap();
         let inherited_path = std::env::var("PATH").unwrap_or_default();
         let harness_path = format!("{}:{inherited_path}", workspace.join("bin").display());
+        let mut args = vec![
+            "--workspace".to_string(),
+            workspace.to_str().unwrap().to_string(),
+            "--session".to_string(),
+            session.to_str().unwrap().to_string(),
+            "--config".to_string(),
+            config.to_str().unwrap().to_string(),
+            "--base-url".to_string(),
+            base_url.to_string(),
+            "--approval".to_string(),
+            approval.to_string(),
+            "--trust-project-plugins".to_string(),
+        ];
+        if let Some(secs) = idle_timeout_secs {
+            args.push("--idle-timeout".to_string());
+            args.push(secs.to_string());
+        }
         let mut child = Command::new(env!("CARGO_BIN_EXE_core"))
-            .args([
-                "--workspace",
-                workspace.to_str().unwrap(),
-                "--session",
-                session.to_str().unwrap(),
-                "--config",
-                config.to_str().unwrap(),
-                "--base-url",
-                base_url,
-                "--approval",
-                approval,
-                "--trust-project-plugins",
-            ])
+            .args(&args)
             // Self-contained provider: core's first-run init stages a default
             // config (with a default provider) into ~/.config/catalyst-code
             // when that dir is absent — as in CI's clean HOME — and that staged
@@ -779,8 +860,17 @@ impl CoreHarness {
     }
 
     fn until_where(&self, description: &str, predicate: impl Fn(&Value) -> bool) -> Vec<Value> {
+        self.until_where_within(description, Duration::from_secs(10), predicate)
+    }
+
+    fn until_where_within(
+        &self,
+        description: &str,
+        timeout: Duration,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Vec<Value> {
         let mut events = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let event = self.events.recv_timeout(remaining).unwrap_or_else(|error| {
@@ -1250,6 +1340,55 @@ fn provider_midstream_body_drop_retries_after_partial_and_succeeds() {
         .expect("FULL_OK delta from successful retry");
     assert!(partial_index < retry_index && retry_index < full_index);
     // No terminal error — the turn recovered.
+    assert!(!events.iter().any(|event| event["type"] == "error"));
+
+    drop(core);
+    stop_server.store(true, Ordering::Relaxed);
+    let _ = server.join();
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn provider_midstream_idle_timeout_retries_after_partial_and_succeeds() {
+    let (base_url, stop_server, server) = midstream_idle_then_success_provider();
+    let workspace = temp_workspace();
+    // OpenAI path floors idle at 10s regardless of lower config values.
+    let mut core = CoreHarness::start_with_idle_timeout(&workspace, &base_url, 10);
+    core.send(serde_json::json!({"type":"init","protocol_version":2}));
+    core.until("protocol_hello");
+    core.send(serde_json::json!({"type":"send","prompt":"idle-midstream","model":"mock-model"}));
+    // 10s idle hang + ~500ms backoff + second stream must finish within this.
+    let events =
+        core.until_where_within("done after idle retry", Duration::from_secs(30), |event| {
+            event["type"] == "done"
+        });
+
+    let partial_index = events
+        .iter()
+        .position(|event| event["type"] == "delta" && event["text"] == "IDLE_PARTIAL ")
+        .expect("partial delta before idle timeout");
+    let retry = events
+        .iter()
+        .find(|event| event["type"] == "http_retry")
+        .expect("http_retry after stream idle timeout");
+    assert_eq!(retry["discard_partial"], true);
+    assert_eq!(
+        retry["reason"],
+        "retryable stream error after partial output"
+    );
+    let reason = retry["reason"].as_str().unwrap_or_default();
+    // The retry event reason is the user-facing class; the underlying error
+    // string is not re-emitted, but the path must have classified idle timeout.
+    assert!(reason.contains("partial"));
+    let retry_index = events
+        .iter()
+        .position(|event| event["type"] == "http_retry")
+        .unwrap();
+    let full_index = events
+        .iter()
+        .position(|event| event["type"] == "delta" && event["text"] == "IDLE_OK")
+        .expect("IDLE_OK delta from successful retry");
+    assert!(partial_index < retry_index && retry_index < full_index);
     assert!(!events.iter().any(|event| event["type"] == "error"));
 
     drop(core);
@@ -1740,6 +1879,59 @@ fn basic_text_turns_can_be_compacted_with_ordered_events() {
     assert_eq!(events[compacted]["summary_chars"], 0);
     assert!(events[compacted]["after_tokens"].as_u64().is_some());
 
+    drop(core);
+    stop_server.store(true, Ordering::Relaxed);
+    let _ = server.join();
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn automatic_threshold_compaction_runs_through_turn_and_persists_entry() {
+    let (base_url, stop_server, server) = repeat_text_provider();
+    let workspace = temp_workspace();
+    let session = workspace.join("session.jsonl");
+    let large = "x".repeat(4_000);
+    let mut journal = String::from("{\"_session_version\":2}\n");
+    for _ in 0..12 {
+        journal.push_str(&serde_json::json!({"role":"user","content":large}).to_string());
+        journal.push('\n');
+    }
+    std::fs::write(&session, journal).unwrap();
+    let artifacts = workspace.join("artifacts");
+    std::fs::create_dir_all(&artifacts).unwrap();
+    let artifact_path = |run_id: &str| {
+        let digest = Sha256::digest(run_id.as_bytes());
+        let hash = digest[..12]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        artifacts.join(format!("job-{hash}.json"))
+    };
+    let keep_path = artifact_path("job-keep");
+    let drop_path = artifact_path("job-drop");
+    std::fs::write(&keep_path, r#"{"run_id":"job-keep"}"#).unwrap();
+    std::fs::write(&drop_path, r#"{"run_id":"job-drop"}"#).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&session)
+        .unwrap()
+        .write_all(b"{\"role\":\"assistant\",\"content\":\"artifact://job-keep.json\"}\n")
+        .unwrap();
+    let mut core = CoreHarness::start(&workspace, &base_url);
+    core.send(serde_json::json!({"type":"init","protocol_version":2}));
+    core.until("protocol_hello");
+    core.send(serde_json::json!({"type":"send","prompt":"trigger automatic compaction","model":"mock-model"}));
+    let events = core.until("done");
+    assert!(events.iter().any(|event| event["type"] == "compacting"));
+    assert!(events.iter().any(|event| event["type"] == "compacted"));
+    assert!(std::fs::read_to_string(&session)
+        .unwrap()
+        .contains("\"_compaction\""));
+    assert!(
+        keep_path.exists(),
+        "referenced artifact must survive automatic compaction"
+    );
+    assert!(!drop_path.exists(), "unreferenced artifact must be shaken");
     drop(core);
     stop_server.store(true, Ordering::Relaxed);
     let _ = server.join();

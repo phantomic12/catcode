@@ -179,6 +179,7 @@ pub(crate) async fn run() {
         last_turn_metrics: Mutex::new(None),
 
         work_state: Mutex::new(WorkState::default()),
+        open_advisories: Mutex::new(Vec::new()),
         goal: Mutex::new(goal::GoalMode::default()),
         goal_deploy_cancel: Mutex::new(None),
         goal_wrapup_active: std::sync::atomic::AtomicBool::new(false),
@@ -189,11 +190,16 @@ pub(crate) async fn run() {
         last_concurrency_note: Mutex::new(None),
         tool_output_cache: Mutex::new(tool_cache::ToolOutputCache::new()),
         enabled_deferred_tools: Mutex::new(std::collections::HashSet::new()),
+        eval_history: Mutex::new(std::collections::HashMap::new()),
         undo_count: std::sync::atomic::AtomicU64::new(0),
         auto_checkpoint_taken: std::sync::atomic::AtomicBool::new(false),
         skill_read_count: std::sync::atomic::AtomicU64::new(0),
         compaction_count: std::sync::atomic::AtomicU64::new(init_stats.compactions),
     });
+    if let Some(path) = state.cfg.read().await.session_file.clone() {
+        state.intercom.configure_journal(&path);
+        state.intercom.replay_undelivered();
+    }
     protocol::install_runtime(&state.runtime);
 
     // Seed runtime API keys from the TUI-persisted `provider_keys`/`api_key`
@@ -1397,6 +1403,12 @@ pub(crate) async fn run() {
                             out_val = json!(b);
                         }
                     }
+                    "advisor.nudge" => {
+                        if let Some(b) = as_bool(&value) {
+                            cfg.advisor.nudge = b;
+                            out_val = json!(b);
+                        }
+                    }
                     "advisor.model" => {
                         if let Some(s) = value.as_str() {
                             cfg.advisor.model = (!s.trim().is_empty()).then(|| s.to_string());
@@ -1482,6 +1494,7 @@ pub(crate) async fn run() {
                 state.conversation.lock().await.clear();
                 state.pending_bash.lock().await.clear();
                 state.enabled_deferred_tools.lock().await.clear();
+                state.eval_history.lock().await.clear();
                 state.tool_output_cache.lock().await.invalidate_all();
                 let cfg = state.cfg.read().await;
                 if let Some(p) = cfg.session_file.as_ref() {
@@ -1498,6 +1511,7 @@ pub(crate) async fn run() {
                 state.conversation.lock().await.clear();
                 state.pending_bash.lock().await.clear();
                 state.enabled_deferred_tools.lock().await.clear();
+                state.eval_history.lock().await.clear();
                 state.tool_output_cache.lock().await.invalidate_all();
                 state.invalidate_real_token_baseline().await;
                 clear_work_state(&state).await;
@@ -1710,7 +1724,21 @@ pub(crate) async fn run() {
                     // Manual compaction rewrote history; drop the stale baseline.
                     state.invalidate_real_token_baseline().await;
                     if let Some(p) = state.cfg.read().await.session_file.as_ref() {
-                        session::rewrite(p, &messages);
+                        let retained = session::artifact_run_ids_referenced_by_messages(&messages);
+                        let artifacts: Vec<String> = retained
+                            .iter()
+                            .map(|id| format!("artifact://{id}.json"))
+                            .collect();
+                        if let Err(error) = session::append_compaction(
+                            p,
+                            &messages,
+                            "manual compaction",
+                            &artifacts,
+                        ) {
+                            emit(&Event::new("error").with("message", json!(error)));
+                        } else if let Err(error) = session::shake_artifacts(p, &retained) {
+                            emit(&Event::new("error").with("message", json!(error)));
+                        }
                     }
                     emit(
                         &Event::new("compacted")
@@ -1838,6 +1866,7 @@ pub(crate) async fn run() {
                 *state.conversation.lock().await = loaded.clone();
                 state.pending_bash.lock().await.clear();
                 state.enabled_deferred_tools.lock().await.clear();
+                state.eval_history.lock().await.clear();
                 state.tool_output_cache.lock().await.invalidate_all();
                 // Restore the loaded session's cumulative stats so `/stats` shows
                 // its real totals, not the prior session's.
@@ -2002,6 +2031,7 @@ pub(crate) async fn run() {
                 *state.conversation.lock().await = Vec::new();
                 state.pending_bash.lock().await.clear();
                 state.enabled_deferred_tools.lock().await.clear();
+                state.eval_history.lock().await.clear();
                 state.tool_output_cache.lock().await.invalidate_all();
                 state.invalidate_real_token_baseline().await;
                 clear_work_state(&state).await;
@@ -3349,6 +3379,193 @@ pub(crate) async fn run() {
                         "message",
                         json!(format!("no pending intercom ask for id {request_id}")),
                     ));
+                }
+            }
+            Command::JobList => {
+                let mut runs: std::collections::BTreeMap<String, Value> = state
+                    .subagent_runs
+                    .lock()
+                    .await
+                    .values()
+                    .map(|run| {
+                        (
+                            run.id.clone(),
+                            json!({
+                                "run_id": run.id,
+                                "parent_run_id": run.parent_run_id,
+                                "state": run.state,
+                                "started_at": run.started_at,
+                                "ended_at": run.ended_at,
+                                "summary": run.summary,
+                            }),
+                        )
+                    })
+                    .collect();
+                if let Some(path) = state.cfg.read().await.session_file.clone() {
+                    if let Ok(report) = session::load_report(&path) {
+                        for delivery in report.parent_deliveries {
+                            if let Some(artifact) =
+                                session::read_job_artifact(&path, &delivery.run_id)
+                            {
+                                runs.entry(delivery.run_id.clone()).or_insert(artifact);
+                            }
+                        }
+                    }
+                    if let Ok(entries) = std::fs::read_dir(
+                        path.parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .join("artifacts"),
+                    ) {
+                        for entry in entries.flatten() {
+                            if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+                                continue;
+                            }
+                            if let Ok(raw) = std::fs::read_to_string(entry.path()) {
+                                if let Ok(artifact) = serde_json::from_str::<Value>(&raw) {
+                                    if let Some(id) = artifact.get("run_id").and_then(Value::as_str)
+                                    {
+                                        runs.entry(id.to_string()).or_insert(artifact);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                emit(
+                    &Event::new("job_list")
+                        .with("runs", json!(runs.into_values().collect::<Vec<_>>())),
+                );
+            }
+            Command::JobStatus { run_id } => {
+                let run = state.subagent_runs.lock().await.get(&run_id).cloned();
+                if let Some(run) = run {
+                    emit(
+                        &Event::new("job_status")
+                            .with("run_id", json!(run.id))
+                            .with("parent_run_id", json!(run.parent_run_id))
+                            .with("state", json!(run.state))
+                            .with("started_at", json!(run.started_at))
+                            .with("ended_at", json!(run.ended_at))
+                            .with("summary", json!(run.summary)),
+                    );
+                } else if let Some(path) = state.cfg.read().await.session_file.clone() {
+                    if let Some(artifact) = session::read_job_artifact(&path, &run_id) {
+                        emit(
+                            &Event::new("job_status")
+                                .with("run_id", json!(run_id))
+                                .with("artifact", artifact),
+                        );
+                    } else {
+                        emit(
+                            &Event::new("error")
+                                .with("message", json!(format!("unknown job {run_id}"))),
+                        );
+                    }
+                } else {
+                    emit(
+                        &Event::new("error")
+                            .with("message", json!(format!("unknown job {run_id}"))),
+                    );
+                }
+            }
+            Command::JobCancel { run_id } => {
+                let cancel = state
+                    .subagent_runs
+                    .lock()
+                    .await
+                    .get(&run_id)
+                    .and_then(|run| run.cancel.clone());
+                if let Some(cancel) = cancel {
+                    cancel.cancel();
+                    emit(&Event::new("job_cancel_requested").with("run_id", json!(run_id)));
+                } else if let Some(path) = state.cfg.read().await.session_file.clone() {
+                    if let Some(artifact) = session::read_job_artifact(&path, &run_id) {
+                        emit(
+                            &Event::new("job_cancel_result")
+                                .with("run_id", json!(run_id))
+                                .with("artifact", artifact),
+                        );
+                    } else {
+                        emit(
+                            &Event::new("error")
+                                .with("message", json!(format!("job {run_id} is not live"))),
+                        );
+                    }
+                } else {
+                    emit(
+                        &Event::new("error")
+                            .with("message", json!(format!("job {run_id} is not live"))),
+                    );
+                }
+            }
+            Command::JobWait { run_id, timeout_ms } => {
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000).min(30_000));
+                loop {
+                    let run = state.subagent_runs.lock().await.get(&run_id).cloned();
+                    if let Some(run) = run {
+                        if run.state != "running" && run.state != "paused" {
+                            emit(
+                                &Event::new("job_wait_result")
+                                    .with("run_id", json!(run.id))
+                                    .with("state", json!(run.state))
+                                    .with("summary", json!(run.summary)),
+                            );
+                            break;
+                        }
+                    } else if let Some(path) = state.cfg.read().await.session_file.clone() {
+                        if let Some(artifact) = session::read_job_artifact(&path, &run_id) {
+                            emit(
+                                &Event::new("job_wait_result")
+                                    .with("run_id", json!(run_id))
+                                    .with("artifact", artifact),
+                            );
+                            break;
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        emit(&Event::new("job_wait_timeout").with("run_id", json!(run_id)));
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            }
+            Command::SessionTree => {
+                if let Some(path) = state.cfg.read().await.session_file.clone() {
+                    emit(&Event::new("session_tree").with("tree", session::session_tree(&path)));
+                } else {
+                    emit(&Event::new("error").with("message", json!("no active session")));
+                }
+            }
+            Command::SessionBranch { entry_id } => {
+                if let Some(path) = state.cfg.read().await.session_file.clone() {
+                    match session::create_branch(&path, &entry_id) {
+                        Ok(branch_id) => {
+                            let loaded = session::load(&path).unwrap_or_default();
+                            *state.conversation.lock().await = loaded.clone();
+                            let est = estimate_messages_tokens(&loaded);
+                            *state.estimated_tokens.lock().await = est;
+                            state.invalidate_real_token_baseline().await;
+                            let visible: Vec<Value> = loaded
+                                .iter()
+                                .filter(|m| !m.is_system())
+                                .map(Value::from)
+                                .collect();
+                            emit(
+                                &Event::new("history")
+                                    .with("messages", json!(visible))
+                                    .with("tokens_in", json!(est)),
+                            );
+                            emit(
+                                &Event::new("session_branch")
+                                    .with("entry_id", json!(branch_id))
+                                    .with("parent_id", json!(entry_id)),
+                            );
+                        }
+                        Err(error) => emit(&Event::new("error").with("message", json!(error))),
+                    }
+                } else {
+                    emit(&Event::new("error").with("message", json!("no active session")));
                 }
             }
             Command::AskReply {

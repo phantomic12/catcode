@@ -1,18 +1,22 @@
 //! Browser backend dispatch.
 //!
-//! With `native-browser`: WRY/tao runtime on a dedicated thread.
-//! Without: structured BROWSER_UNAVAILABLE (schemas still loadable).
+//! Chromium/CDP is preferred when enabled; WRY/tao remains an explicit fallback.
+//! Without either feature, tools return structured `BROWSER_UNAVAILABLE`.
 
 use super::{ok_envelope, BrowserError};
 use crate::config::Config;
 use serde_json::{json, Value};
 
 pub async fn dispatch(name: &str, args: &Value, cfg: &Config) -> Result<Value, BrowserError> {
-    #[cfg(feature = "native-browser")]
+    #[cfg(feature = "chromium-cdp")]
+    {
+        return crate::browser::chromium_cdp::dispatch(name, args, cfg).await;
+    }
+    #[cfg(all(not(feature = "chromium-cdp"), feature = "native-browser"))]
     {
         return crate::browser::wry_backend::dispatch(name, args, cfg).await;
     }
-    #[cfg(not(feature = "native-browser"))]
+    #[cfg(all(not(feature = "chromium-cdp"), not(feature = "native-browser")))]
     {
         let _ = (args, cfg);
         if name == "browser_list_sessions" {
@@ -20,8 +24,7 @@ pub async fn dispatch(name: &str, args: &Value, cfg: &Config) -> Result<Value, B
         }
         Err(BrowserError::new(
             "BROWSER_UNAVAILABLE",
-            "Native browser support is not compiled into this core binary. \
-Rebuild with `--features native-browser` (needs WebKitGTK on Linux, WebView2 on Windows, WKWebView on macOS).",
+            "Browser support is not compiled into this core binary. Rebuild with `--features chromium-cdp` (preferred) or `--features native-browser` (WRY fallback).",
         ))
     }
 }

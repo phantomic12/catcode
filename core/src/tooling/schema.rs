@@ -53,6 +53,14 @@ pub fn deferred_tool_names() -> &'static [&'static str] {
         "git_commit",
         "spawn",
         "test_env",
+        "eval",
+        "read",
+        "lsp",
+        "snapshot_edit",
+        "ast_edit",
+        "debug",
+        "mcp",
+        "process",
         "browser_create",
         "browser_close",
         "browser_list_sessions",
@@ -192,7 +200,7 @@ fn definitions_uncached() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "edit",
-                "description": "Search/replace edits on a file. Read first; each search must match exactly and be unique (or set replace_all). Empty replace deletes. normalize_whitespace tolerates indent drift. All edits apply atomically.",
+                "description": "Search/replace exact text in a file. Prefer `ast_edit` for structural code changes when that tool is available for the language. Read first; each search must match exactly and be unique (or set replace_all). Empty replace deletes. normalize_whitespace tolerates indent drift. All edits apply atomically.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -768,18 +776,19 @@ fn definitions_uncached() -> Vec<Value> {
                 }
             }
         }),
+        json!({"type":"function","function":{"name":"mcp","description":"Use a trusted user-configured MCP server by name. Actions: list or call. Transport command, environment, headers, and URL are config-only.","parameters":{"type":"object","additionalProperties":false,"properties":{"action":{"type":"string","enum":["list","call"]},"server":{"type":"string","minLength":1,"maxLength":128},"tool":{"type":"string","minLength":1,"maxLength":256},"arguments":{"type":"object"}},"required":["action","server"]}}}),
         json!({
             "type": "function",
             "function": {
                 "name": "load_tools",
-                "description": "Enable deferred tools for this session (schemas not sent until loaded). Pass tools:[...] or tool:\"name\". Groups: all, git, web, bulk, browser. Deferred: bulk*, git_*, fetch, web_search, diagnostics, spawn, workspace_activity, test_env, browser_*. (goal_write_plan is planning-phase only — not loadable.)",
+                "description": "Enable deferred tools for this session (schemas not sent until loaded). Groups: all, git, web, bulk, runtime, ide, debug, browser, mcp. MCP transport configuration remains user-owned.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "tools": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "tool names or groups (all|git|web|bulk|browser)"
+                            "description": "tool names or groups (all|git|web|bulk|runtime|ide|debug|browser|mcp)"
                         },
                         "tool": { "type": "string", "description": "single tool name or group" }
                     }
@@ -814,6 +823,72 @@ fn definitions_uncached() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "eval",
+                "description": "Evaluate a bounded Python or JavaScript snippet in a retained per-session runtime. Call load_tools with runtime first; successful snippets persist only in this session. No bash fallback; missing runtimes return an explicit error.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "language": { "type": "string", "enum": ["python", "javascript"] },
+                        "code": { "type": "string", "maxLength": 65536 },
+                        "reset": { "type": "boolean", "description": "clear retained state for this language before evaluating" }
+                    },
+                    "required": ["language", "code"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read a bounded workspace file, public HTTP(S) URL, ZIP entry (archive.zip!/path), skill://name, memory://id, or artifact://run_id. Deferred runtime tool; call load_tools with runtime first. URI stores enforce ownership and traversal limits.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "offset": { "type": "integer", "description": "workspace files only: 1-indexed start line" },
+                        "limit": { "type": "integer", "description": "workspace files only: max lines" },
+                        "line_numbers": { "type": "boolean", "description": "workspace files only: prefix line numbers" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({"type":"function","function":{"name":"lsp","description":"Run one bounded request against a real language-server subprocess; the server is killed after the request.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["diagnostics","definition","references","rename"]},"command":{"type":"string"},"path":{"type":"string"},"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0},"new_name":{"type":"string"}},"required":["action","path"]}}}),
+        json!({"type":"function","function":{"name":"snapshot_edit","description":"Apply line edits only when all edits match the current SHA-256 snapshot tag; stale tags are rejected atomically.","parameters":{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"tag":{"type":"string"},"replacement":{"type":"string"}},"required":["start_line","end_line","tag","replacement"]}}},"required":["path","edits"]}}}),
+        json!({"type":"function","function":{"name":"ast_edit","description":"Preferred structural rewrite for code when the file language is bundled (Rust, Go, JavaScript, TypeScript/TSX, Python, JSON, YAML, Markdown). Prefer over `edit` for renames, call/signature changes, and syntax-aware refactors. apply:false returns a staged diff; apply:true atomically updates one workspace file.","parameters":{"type":"object","additionalProperties":false,"properties":{"path":{"type":"string"},"pattern":{"type":"string","maxLength":65536},"rewrite":{"type":"string","maxLength":65536},"apply":{"type":"boolean"}},"required":["path","pattern","rewrite"]}}}),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "process",
+                "description": "Control a workspace-scoped named long-running process. start/restart execute argv directly (never a shell string); status/logs are read-only; stop terminates the process group. Mutating actions require approval.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "action": { "type": "string", "enum": ["start", "status", "logs", "stop", "restart"] },
+                        "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+                        "argv": { "type": "array", "minItems": 1, "maxItems": 128, "items": { "type": "string", "maxLength": 8192 } },
+                        "cwd": { "type": "string", "description": "workspace-relative existing directory; default ." },
+                        "env": { "type": "object", "additionalProperties": { "type": "string", "maxLength": 32768 }, "description": "explicit environment; secret-like variable names are rejected" },
+                        "ready": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "log_regex": { "type": "string", "maxLength": 4096 },
+                                "tcp_port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+                            }
+                        },
+                        "ready_timeout_ms": { "type": "integer", "minimum": 1, "maximum": 120000 },
+                        "log_capacity": { "type": "integer", "minimum": 1, "maximum": 1048576 }
+                    },
+                    "required": ["action", "name"]
+                }
+            }
+        }),
+        json!({"type":"function","function":{"name":"debug","description":"Drive the deferred Debug Adapter Protocol session. Launch, attach, and memory writes require approval.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["initialize","launch","attach","set_breakpoints","continue","next","step_over","step_in","step_out","pause","threads","stack_trace","scopes","variables","evaluate","read_memory","write_memory","output","disconnect"]},"adapter":{"type":"string"},"arguments":{"type":"object"}},"required":["action"]}}}),
     ];
     defs.extend(crate::browser::definitions());
     defs
@@ -838,5 +913,56 @@ mod metadata_invariant_tests {
             missing.is_empty(),
             "tools without policy metadata: {missing:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_schema_tests {
+    #[test]
+    fn runtime_tools_are_deferred_and_documented() {
+        assert!(super::is_deferred_tool("eval"));
+        assert!(super::is_deferred_tool("read"));
+        let defs = super::definitions();
+        for name in ["eval", "read"] {
+            assert!(defs.iter().any(|d| d["function"]["name"] == name));
+        }
+    }
+}
+
+#[cfg(test)]
+mod deferred_schema_tests {
+    use super::*;
+
+    #[test]
+    fn deferred_names_are_defined_and_excluded_from_core() {
+        let definitions = definitions();
+        for name in deferred_tool_names() {
+            assert!(
+                definitions.iter().any(|definition| {
+                    definition
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        == Some(*name)
+                }),
+                "missing definition for {name}"
+            );
+            assert!(
+                !is_core_tool(name),
+                "deferred tool leaked into core: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_tools_schema_requires_a_tool_selection() {
+        let definition = definitions()
+            .into_iter()
+            .find(|definition| definition["function"]["name"] == "load_tools")
+            .unwrap();
+        let required = definition["function"]["parameters"]
+            .get("required")
+            .and_then(Value::as_array);
+        assert!(required.is_none_or(|values| values.is_empty()));
     }
 }

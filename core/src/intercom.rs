@@ -59,7 +59,7 @@ fn next_id(prefix: &str) -> String {
     format!("{prefix}-{n:x}-{}", now_ms())
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct IntercomMessage {
     pub id: String,
     pub from: String,
@@ -107,10 +107,18 @@ impl Mailbox {
 pub struct IntercomBus {
     pub mailboxes: Mutex<HashMap<String, Arc<Mailbox>>>,
     pub pending_asks: Mutex<HashMap<String, Arc<PendingAsk>>>,
+    /// Optional session-owned journal for undelivered peer messages.
+    pub journal_path: Mutex<Option<std::path::PathBuf>>,
     /// The orchestrator (parent session) target name. Defaults to "orchestrator".
     pub orchestrator_target: Mutex<String>,
     /// All known target names (for the `targets` action + doctor diagnostics).
     pub known_targets: Mutex<Vec<String>>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct JournalRecord {
+    delivered: bool,
+    message: IntercomMessage,
 }
 
 impl IntercomBus {
@@ -126,6 +134,106 @@ impl IntercomBus {
         s
     }
 
+    /// Bind durable peer messaging to this process's active session. The
+    /// journal is local-session storage, not a distributed mailbox.
+    pub fn configure_journal(&self, session_path: &std::path::Path) {
+        *self.journal_path.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(session_path.with_extension("intercom.jsonl"));
+    }
+
+    fn journal_records(&self) -> Vec<JournalRecord> {
+        let path = self
+            .journal_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(path) = path else { return Vec::new() };
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        raw.lines()
+            .filter_map(|line| serde_json::from_str::<JournalRecord>(line).ok())
+            .collect()
+    }
+
+    fn append_journal(&self, record: &JournalRecord) -> Result<(), String> {
+        use std::io::Write;
+        let path = self
+            .journal_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(path) = path else { return Ok(()) };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create intercom journal: {e}"))?;
+        }
+        let _lock = crate::fsutil::FileLock::acquire(&path.with_extension("lock"))
+            .map_err(|e| format!("lock intercom journal: {e}"))?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("open intercom journal: {e}"))?;
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(record).map_err(|e| e.to_string())?
+        )
+        .map_err(|e| format!("append intercom journal: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("sync intercom journal: {e}"))
+    }
+
+    fn undelivered_for(&self, target: &str) -> Vec<IntercomMessage> {
+        let mut state: HashMap<String, JournalRecord> = HashMap::new();
+        for record in self.journal_records() {
+            state.insert(record.message.id.clone(), record);
+        }
+        let mut messages: Vec<_> = state
+            .into_values()
+            .filter(|record| !record.delivered && record.message.to == target)
+            .map(|record| record.message)
+            .collect();
+        messages.sort_unstable_by_key(|message| message.ts);
+        messages
+    }
+
+    fn mark_delivered(&self, message: &IntercomMessage) {
+        let _ = self.append_journal(&JournalRecord {
+            delivered: true,
+            message: message.clone(),
+        });
+    }
+
+    pub fn replay_undelivered(&self) {
+        let targets: Vec<String> = self
+            .mailboxes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        for target in targets {
+            let Some(mailbox) = self
+                .mailboxes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&target)
+                .cloned()
+            else {
+                continue;
+            };
+            let mut queue = mailbox.messages.lock().unwrap_or_else(|e| e.into_inner());
+            for message in self.undelivered_for(&target) {
+                if queue.len() >= MAX_MAILBOX_MESSAGES || queue.iter().any(|m| m.id == message.id) {
+                    continue;
+                }
+                queue.push_back(message);
+            }
+            mailbox.notify.notify_waiters();
+        }
+    }
+
     /// The orchestrator target the parent session answers as.
     pub fn orchestrator_target(&self) -> String {
         self.orchestrator_target
@@ -139,11 +247,24 @@ impl IntercomBus {
         if target.is_empty() {
             return;
         }
-        let mut mb = self.mailboxes.lock().unwrap_or_else(|e| e.into_inner());
-        if !mb.contains_key(target) {
-            mb.insert(target.to_string(), Arc::new(Mailbox::new(target)));
+        let mailbox = {
+            let mut mailboxes = self.mailboxes.lock().unwrap_or_else(|e| e.into_inner());
+            mailboxes
+                .entry(target.to_string())
+                .or_insert_with(|| Arc::new(Mailbox::new(target)))
+                .clone()
+        };
+        {
+            let mut messages = mailbox.messages.lock().unwrap_or_else(|e| e.into_inner());
+            for message in self.undelivered_for(target) {
+                if messages.len() >= MAX_MAILBOX_MESSAGES {
+                    break;
+                }
+                if !messages.iter().any(|queued| queued.id == message.id) {
+                    messages.push_back(message);
+                }
+            }
         }
-        drop(mb);
         let mut kt = self.known_targets.lock().unwrap_or_else(|e| e.into_inner());
         if !kt.iter().any(|t| t == target) {
             kt.push(target.to_string());
@@ -226,7 +347,11 @@ impl IntercomBus {
                     "intercom mailbox '{target}' is full ({MAX_MAILBOX_MESSAGES} messages)"
                 ));
             }
-            messages.push_back(msg.clone());
+            self.append_journal(&JournalRecord {
+                delivered: false,
+                message: msg.clone(),
+            })?;
+            messages.push_back(msg);
             drop(messages);
             mb.notify.notify_one();
         }
@@ -244,6 +369,9 @@ impl IntercomBus {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .pop_front();
+        if let Some(message) = msg.as_ref() {
+            self.mark_delivered(message);
+        }
         msg
     }
 
@@ -258,7 +386,12 @@ impl IntercomBus {
         }?;
         let mut queue = mb.messages.lock().unwrap_or_else(|e| e.into_inner());
         let pos = queue.iter().position(|m| m.from == from)?;
-        queue.remove(pos)
+        let message = queue.remove(pos);
+        drop(queue);
+        if let Some(message) = message.as_ref() {
+            self.mark_delivered(message);
+        }
+        message
     }
 
     /// Register a blocking ask and return its handle. The caller awaits the
@@ -321,6 +454,28 @@ impl IntercomBus {
             true
         } else {
             false
+        }
+    }
+
+    /// Resolve only when the caller is the ask's intended recipient.
+    pub fn resolve_ask_from(&self, id: &str, recipient: &str, reply: &str) -> Result<(), String> {
+        let ask = self
+            .pending_asks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("no pending ask with id '{id}'"))?;
+        if ask.to != recipient {
+            return Err(format!(
+                "ask '{id}' is addressed to '{}', not '{recipient}'",
+                ask.to
+            ));
+        }
+        if self.resolve_ask(id, reply) {
+            Ok(())
+        } else {
+            Err(format!("no pending ask with id '{id}'"))
         }
     }
 
@@ -662,12 +817,9 @@ pub async fn execute_intercom(
             if id.is_empty() {
                 return Outcome::err("intercom reply requires 'id' (the ask id) and 'reply'");
             }
-            if bus.resolve_ask(id, reply) {
-                Outcome::ok(format!("replied to ask {id}"))
-            } else {
-                Outcome::err(format!(
-                    "no pending ask with id '{id}' (it may have timed out or been answered)"
-                ))
+            match bus.resolve_ask_from(id, from, reply) {
+                Ok(()) => Outcome::ok(format!("replied to ask {id}")),
+                Err(error) => Outcome::err(error),
             }
         }
         other => Outcome::err(format!(
@@ -792,5 +944,59 @@ mod tests {
         );
         // second resolve fails (already removed)
         assert!(!bus.resolve_ask("a1", "again"));
+    }
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    #[test]
+    fn journal_replays_once_after_restart() {
+        let dir = std::env::temp_dir().join(format!("catalyst_intercom_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = dir.join("session.jsonl");
+        let first = IntercomBus::new();
+        first.configure_journal(&session);
+        first.register_target("worker");
+        first
+            .post(IntercomMessage {
+                id: "m1".into(),
+                from: "parent".into(),
+                to: "worker".into(),
+                message: "continue".into(),
+                reason: "steer".into(),
+                ts: 1,
+                ask_id: String::new(),
+            })
+            .unwrap();
+        let restarted = IntercomBus::new();
+        restarted.configure_journal(&session);
+        restarted.register_target("worker");
+        assert_eq!(restarted.receive("worker").unwrap().id, "m1");
+        restarted.register_target("worker");
+        assert!(restarted.receive("worker").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reply_rejects_wrong_recipient() {
+        let bus = IntercomBus::new();
+        bus.register_target("worker");
+        bus.register_target("other");
+        bus.create_ask(PendingAsk {
+            id: "a1".into(),
+            from: "worker".into(),
+            to: "other".into(),
+            message: "?".into(),
+            reason: String::new(),
+            ts: 1,
+            reply: Mutex::new(None),
+            notify: Arc::new(Notify::new()),
+        })
+        .unwrap();
+        assert!(bus.resolve_ask_from("a1", "worker", "no").is_err());
+        assert_eq!(bus.pending_count(), 1);
     }
 }

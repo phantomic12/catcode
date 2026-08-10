@@ -42,12 +42,16 @@ const KINDS: { id: CustomProviderDraft["kind"]; label: string; hint: string }[] 
   { id: "anthropic", label: "Anthropic", hint: "/v1/messages · x-api-key" },
 ];
 
-/** Editable per-model caps (prefilled from discovery; user refines). */
+/** Editable per-model capability metadata. */
 interface ModelCaps {
   context_window: string;
   max_tokens: string;
   reasoning: boolean;
   thinking_levels: string;
+  input: string;
+  output: string;
+  tool_call: boolean;
+  structured_output: boolean;
 }
 
 function parseHeaders(text: string): Record<string, string> {
@@ -102,10 +106,11 @@ export function CustomProviderModal({
       const next: Record<string, ModelCaps> = {};
       for (const m of previewModels) {
         next[m.id] = {
-          context_window: String(m.context_window),
-          max_tokens: String(m.max_tokens),
-          reasoning: m.reasoning,
-          thinking_levels: (m.thinking_levels ?? []).join(", "),
+          context_window: String(m.context_window), max_tokens: String(m.max_tokens),
+          reasoning: m.reasoning, thinking_levels: (m.thinking_levels ?? []).join(", "),
+          input: (m.input ?? (m.vision ? ["text", "image"] : ["text"])).join(", "),
+          output: (m.output ?? ["text"]).join(", "),
+          tool_call: m.tool_call ?? false, structured_output: m.structured_output ?? false,
         };
       }
       setCaps(next);
@@ -156,21 +161,15 @@ export function CustomProviderModal({
     for (const id of ids) {
       // Flat defaults for unknown ids (200k / 8k) — same as core discovery.
       const m: ModelInfo = {
-        id,
-        name: id,
-        context_window: 200_000,
-        max_tokens: 8_192,
-        reasoning: false,
-        thinking_levels: [],
-        vision: false,
+        id, name: id, context_window: 200_000, max_tokens: 8_192,
+        reasoning: false, thinking_levels: [], vision: false,
+        input: ["text"], output: ["text"], tool_call: false, structured_output: false,
         provider: draft.name.trim() || "custom",
       };
       base.push(m);
       next[id] = {
-        context_window: "200000",
-        max_tokens: "8192",
-        reasoning: false,
-        thinking_levels: "",
+        context_window: "200000", max_tokens: "8192", reasoning: false, thinking_levels: "",
+        input: "text", output: "text", tool_call: false, structured_output: false,
       };
     }
     setBaselines(base);
@@ -182,34 +181,35 @@ export function CustomProviderModal({
   // changed a field from its discovered/manual baseline. Unchanged models fall
   // through to the discovered/curated/flat-default caps.
   const buildOverrides = (): ModelOverride[] => {
-    if (baselines.length === 0) return [];
     const out: ModelOverride[] = [];
     for (const m of baselines) {
       const c = caps[m.id];
       if (!c) continue;
       const ctx = parseInt(c.context_window.trim(), 10);
       const max = parseInt(c.max_tokens.trim(), 10);
-      const levels = c.thinking_levels
-        .split(/[,\s]+/)
-        .map((s) => s.trim())
-        .filter(Boolean);
+      const split = (value: string) => value.split(/[;,\s]+/).map((s) => s.trim()).filter(Boolean);
+      const levels = split(c.thinking_levels), input = split(c.input), output = split(c.output);
+      const baselineInput = m.input ?? (m.vision ? ["text", "image"] : ["text"]);
+      const baselineOutput = m.output ?? ["text"];
       const ctxChanged = Number.isFinite(ctx) && ctx !== m.context_window;
       const maxChanged = Number.isFinite(max) && max !== m.max_tokens;
       const reasonChanged = c.reasoning !== m.reasoning;
       const levelsChanged = levels.join(",") !== (m.thinking_levels ?? []).join(",");
-      // Manual entries always write an override so the id is known after add.
+      const inputChanged = input.join(",") !== baselineInput.join(",");
+      const outputChanged = output.join(",") !== baselineOutput.join(",");
+      const toolChanged = c.tool_call !== (m.tool_call ?? false);
+      const structuredChanged = c.structured_output !== (m.structured_output ?? false);
       const alwaysWrite = !(previewModels && previewModels.some((p) => p.id === m.id));
-      if (!alwaysWrite && !ctxChanged && !maxChanged && !reasonChanged && !levelsChanged) {
-        continue;
-      }
-      out.push({
-        id: m.id,
-        context_window:
-          (alwaysWrite || ctxChanged) && Number.isFinite(ctx) ? ctx : undefined,
-        max_tokens:
-          (alwaysWrite || maxChanged) && Number.isFinite(max) ? max : undefined,
+      if (!alwaysWrite && !ctxChanged && !maxChanged && !reasonChanged && !levelsChanged && !inputChanged && !outputChanged && !toolChanged && !structuredChanged) continue;
+      out.push({ id: m.id,
+        context_window: (alwaysWrite || ctxChanged) && Number.isFinite(ctx) ? ctx : undefined,
+        max_tokens: (alwaysWrite || maxChanged) && Number.isFinite(max) ? max : undefined,
         reasoning: alwaysWrite || reasonChanged ? c.reasoning : undefined,
         thinking_levels: alwaysWrite || levelsChanged ? levels : undefined,
+        input: alwaysWrite || inputChanged ? input : undefined,
+        output: alwaysWrite || outputChanged ? output : undefined,
+        tool_call: alwaysWrite || toolChanged ? c.tool_call : undefined,
+        structured_output: alwaysWrite || structuredChanged ? c.structured_output : undefined,
       });
     }
     return out;
@@ -449,51 +449,15 @@ export function CustomProviderModal({
                       reasoning
                     </label>
                   </div>
-                  <div className="mt-2.5 grid grid-cols-3 gap-2">
-                    <div>
-                      <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
-                        Context
-                      </label>
-                      <input
-                        inputMode="numeric"
-                        value={c.context_window}
-                        onChange={(e) =>
-                          setCaps((s) => ({
-                            ...s,
-                            [m.id]: { ...c, context_window: e.target.value },
-                          }))
-                        }
-                        className={inputCls + " px-2 py-1.5 font-mono text-[12px]"}
-                      />
-                    </div>
-                    <div>
-                      <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
-                        Output
-                      </label>
-                      <input
-                        inputMode="numeric"
-                        value={c.max_tokens}
-                        onChange={(e) =>
-                          setCaps((s) => ({ ...s, [m.id]: { ...c, max_tokens: e.target.value } }))
-                        }
-                        className={inputCls + " px-2 py-1.5 font-mono text-[12px]"}
-                      />
-                    </div>
-                    <div>
-                      <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-ink-500">
-                        Effort levels
-                      </label>
-                      <input
-                        value={c.thinking_levels}
-                        onChange={(e) =>
-                          setCaps((s) => ({
-                            ...s,
-                            [m.id]: { ...c, thinking_levels: e.target.value },
-                          }))
-                        }
-                        placeholder="low, medium, high"
-                        className={inputCls + " px-2 py-1.5 font-mono text-[12px]"}
-                      />
+                  <div className="mt-2.5 grid grid-cols-2 gap-2">
+                    <div><label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-ink-500">Context</label><input inputMode="numeric" value={c.context_window} onChange={(e) => setCaps((s) => ({ ...s, [m.id]: { ...c, context_window: e.target.value } }))} className={inputCls + " px-2 py-1.5 font-mono text-[12px]"} /></div>
+                    <div><label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-ink-500">Output tokens</label><input inputMode="numeric" value={c.max_tokens} onChange={(e) => setCaps((s) => ({ ...s, [m.id]: { ...c, max_tokens: e.target.value } }))} className={inputCls + " px-2 py-1.5 font-mono text-[12px]"} /></div>
+                    <div><label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-ink-500">Input modalities</label><input value={c.input} onChange={(e) => setCaps((s) => ({ ...s, [m.id]: { ...c, input: e.target.value } }))} placeholder="text, image" className={inputCls + " px-2 py-1.5 font-mono text-[12px]"} /></div>
+                    <div><label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-ink-500">Output modalities</label><input value={c.output} onChange={(e) => setCaps((s) => ({ ...s, [m.id]: { ...c, output: e.target.value } }))} placeholder="text" className={inputCls + " px-2 py-1.5 font-mono text-[12px]"} /></div>
+                    <div><label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-ink-500">Reasoning levels</label><input value={c.thinking_levels} onChange={(e) => setCaps((s) => ({ ...s, [m.id]: { ...c, thinking_levels: e.target.value } }))} placeholder="low, medium, high" className={inputCls + " px-2 py-1.5 font-mono text-[12px]"} /></div>
+                    <div className="flex items-end gap-3 pb-1 text-[11px] text-ink-400">
+                      <label className="flex items-center gap-1.5"><input type="checkbox" checked={c.tool_call} onChange={(e) => setCaps((s) => ({ ...s, [m.id]: { ...c, tool_call: e.target.checked } }))} className="accent-accent" /> tool calls</label>
+                      <label className="flex items-center gap-1.5"><input type="checkbox" checked={c.structured_output} onChange={(e) => setCaps((s) => ({ ...s, [m.id]: { ...c, structured_output: e.target.checked } }))} className="accent-accent" /> JSON output</label>
                     </div>
                   </div>
                 </div>

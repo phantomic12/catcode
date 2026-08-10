@@ -19,6 +19,7 @@ mod commands;
 mod config;
 mod context_pack;
 mod coverage_ledger;
+mod dap;
 mod embed;
 mod episodes;
 mod failure_atlas;
@@ -34,6 +35,7 @@ mod learning_proposals;
 mod learning_retrieval;
 mod learning_store;
 mod logging;
+mod mcp;
 mod memory;
 #[cfg(test)]
 mod memory_eval;
@@ -53,9 +55,6 @@ mod protocol;
 mod provider;
 mod providers;
 mod rejected_approaches;
-/// Test-only reference implementation of the deep-research evidence-ledger
-/// contract (canonicalization, dedup, citation verification, stopping rules).
-#[cfg(test)]
 mod research_evidence;
 mod runtime;
 mod sandbox;
@@ -63,6 +62,7 @@ mod search_tool;
 mod session;
 mod skill_marketplace;
 mod skill_metrics;
+mod skills;
 mod staging;
 mod subagent;
 mod task_fingerprint;
@@ -115,7 +115,7 @@ You can read, edit, write, and list files, search with grep/glob, and run shell 
 
 Judgment (tool schemas own the mechanics):
 - Read/search before changing; prefer the smallest correct edit; verify with a command.
-- Prefer edit over write_file for targeted changes; prefer grep/glob (scoped) before full reads; page with offset/limit.
+- Prefer the smallest correct change: `ast_edit` for structural code rewrites when available, otherwise `edit` over `write_file` for targeted text; prefer grep/glob (scoped) before full reads; page with offset/limit.
 - Call tools directly — use `bulk` only for genuinely independent parallel calls. Keep shell commands short; write a script for complex logic.
 - Deferred tool schemas are opt-in — call `load_tools` with a group or name when needed.
 - Paths are workspace-relative; absolute paths and ".." are rejected.
@@ -147,6 +147,12 @@ Before non-trivial multi-agent work, apply `/skill:pi-subagents` for the full pl
 /// supported task in any workspace, even without the opt-in skills present.
 /// Full schemas/edge cases live in the `add-key-provider` and `plugin-authoring`
 /// skills; this is the actionable minimum.
+/// Guidance for choosing structural edits over textual edits. Kept concise so
+/// every turn gets the preference without embedding the full IDE manual.
+const STRUCTURED_EDIT_GUIDE: &str = r#"## Editing preference
+
+When `ast_edit` is available for the file's language, prefer it over `edit` for structural code changes: renames, call/signature changes, syntax-aware refactors, and repeated AST-pattern rewrites. Use `edit` for exact text replacements, prose/config edits, or languages without a bundled AST parser. `ast_edit` is deferred, so call `load_tools` with `ide` first when needed; use `apply:false` to inspect its diff before applying."#;
+
 const PROVIDER_GUIDE: &str = r#"## Adding model providers
 
 "Add/connect provider X" → two no-recompile paths, pick by auth type:
@@ -162,14 +168,7 @@ Rule: plain API key → config; login flow → plugin."#;
 /// group (e.g. browser), list it here AND in handle_load_tools / load_tools schema.
 const DEFERRED_TOOLS_GUIDE: &str = r#"## Deferred tools
 
-Secondary tools are not in the default schema. Call `load_tools` with a **group** or tool name when the task needs them:
-- `git` — status/diff/log/add/commit
-- `web` — fetch, web_search
-- `bulk` — bulk, bulk_read, bulk_write, bulk_edit
-- `browser` — native WRY browser (create/navigate/snapshot/click/…); requires core built with `native-browser`
-- by name — diagnostics, spawn, workspace_activity, test_env
-- `all` — every loadable deferred tool
-`goal_write_plan` is /goal planning-phase only (not loadable)."#;
+Call `load_tools` when needed: `git`, `web`, `bulk`, `runtime` (eval/read), `ide` (lsp/ast_edit/snapshot_edit), `debug`, `mcp`, `browser`, `process`, or `all`. Individual tools such as spawn, workspace_activity, and test_env are also loadable. `goal_write_plan` is available only during /goal planning."#;
 
 /// Cap standing skill-manifest size so a large skills/ tree does not bloat the
 /// prefix cache. Remaining skills stay discoverable via list_dir / `/skill:`.
@@ -240,6 +239,8 @@ pub fn build_system_prompt(
     prompt.push_str(PROVIDER_GUIDE);
     prompt.push_str("\n\n");
     prompt.push_str(DEFERRED_TOOLS_GUIDE);
+    prompt.push_str("\n\n");
+    prompt.push_str(STRUCTURED_EDIT_GUIDE);
     // Parent-only: stub + capped skill manifest. Subagents never receive these
     // (they'd wrongly think they are the orchestrator).
     if with_skill {
@@ -607,6 +608,9 @@ pub struct State {
     /// never persisted — so it never invalidates the cached conversation prefix.
     /// See the `WorkState` block comment for the full cache strategy.
     pub work_state: Mutex<WorkState>,
+    /// Concern/blocker recommendations persist as a compact transient tail on
+    /// subsequent requests until a later mutation touches their target path.
+    pub open_advisories: Mutex<Vec<crate::advisor::OpenAdvisory>>,
     /// First-class goal mode (plan → deploy subagents). See `goal.rs`.
     pub goal: Mutex<goal::GoalMode>,
     /// Cancel token for an in-flight goal deploy task (separate from the
@@ -639,9 +643,10 @@ pub struct State {
     /// re-executing (bash is never restored). Cleared on workspace mutations.
     pub tool_output_cache: Mutex<tool_cache::ToolOutputCache>,
     /// Deferred tool names enabled for this session via `load_tools`. Core tools
-    /// are always available; rare/heavy schemas (git_*, fetch, bulk_*, …) stay
-    /// out of every request until the model opts in (or goal mode needs them).
     pub enabled_deferred_tools: Mutex<std::collections::HashSet<String>>,
+    /// Successfully evaluated snippets retained per language for the deferred
+    /// session-scoped eval tool. Each invocation replays this history.
+    pub eval_history: Mutex<std::collections::HashMap<String, Vec<String>>>,
     /// Session-scoped `/undo` count for telemetry (`human_corrections`).
     pub undo_count: std::sync::atomic::AtomicU64,
     /// True after an auto filesystem checkpoint has been taken for the current
@@ -4036,6 +4041,18 @@ async fn handle_load_tools(st: &State, args: &Value, tool_defs: &mut Vec<Value>)
                     expanded.push(g.into());
                 }
             }
+            "runtime" => {
+                expanded.push("eval".into());
+                expanded.push("read".into());
+            }
+            "ide" => {
+                for g in ["lsp", "snapshot_edit", "ast_edit"] {
+                    expanded.push(g.into());
+                }
+            }
+            "process" => expanded.push("process".into()),
+            "debug" => expanded.push("debug".into()),
+            "mcp" => expanded.push("mcp".into()),
             "browser" => {
                 for g in crate::browser::MVP_TOOL_NAMES {
                     expanded.push((*g).to_string());
@@ -4048,7 +4065,7 @@ async fn handle_load_tools(st: &State, args: &Value, tool_defs: &mut Vec<Value>)
     expanded.dedup();
     if expanded.is_empty() {
         return tools::Outcome::ok(format!(
-            "No tools requested. Deferred tools: {}. Groups: all, git, web, bulk, browser. Core tools are already available.",
+            "No tools requested. Deferred tools: {}. Groups: all, git, web, bulk, runtime, ide, debug, browser, process, mcp. Core tools are already available.",
             tools::deferred_tool_names().join(", ")
         ));
     }
@@ -4483,7 +4500,8 @@ mod system_prompt_slim_tests {
             + PLUGIN_DOCS.len()
             + SUBAGENT_ORCHESTRATOR_STUB.len()
             + PROVIDER_GUIDE.len()
-            + DEFERRED_TOOLS_GUIDE.len();
+            + DEFERRED_TOOLS_GUIDE.len()
+            + STRUCTURED_EDIT_GUIDE.len();
         assert!(
             prompt.contains("## Deferred tools"),
             "deferred tools guide must be in the standing prompt"
@@ -4492,10 +4510,18 @@ mod system_prompt_slim_tests {
             prompt.contains("`git`"),
             "deferred git group must be named in the standing prompt"
         );
-        // 5500 (not 5000): the provider guide now names the built-in presets
-        // (incl. deepseek endpoint) — still a hard cap against runaway growth.
         assert!(
-            fixed < 5_500,
+            prompt.contains("`ide`"),
+            "deferred ide group must be named in the standing prompt"
+        );
+        assert!(
+            prompt.contains("prefer it over `edit` for structural code changes"),
+            "structured edit preference must be in the standing prompt"
+        );
+        // 6000: provider guide + deferred tools + structured edit preference
+        // stay lean while remaining self-sufficient for common tasks.
+        assert!(
+            fixed < 6_000,
             "fixed standing-prompt pieces unexpectedly large ({fixed} chars)"
         );
         let _ = std::fs::remove_dir_all(&ws);
@@ -5554,6 +5580,7 @@ mod provider_routing_tests {
             thinking_levels: Vec::new(),
             vision: false,
             provider: provider.into(),
+            ..Default::default()
         }
     }
 

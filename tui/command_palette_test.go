@@ -6,6 +6,28 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
+func TestSessionTreeIsDiscoverableAndDispatches(t *testing.T) {
+	s := initialSession()
+	s.ready = true
+	s.width, s.height = 80, 24
+	found := false
+	for _, item := range s.commandItems() {
+		if item.label == "/tree" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("/tree should appear in the command palette")
+	}
+	writer := &captureWriter{}
+	s.coreIn = writer
+	s.handleUserLine("/tree")
+	if len(writer.lines) != 1 || writer.lines[0] != `{"type":"session_tree"}` {
+		t.Fatalf("/tree should send session_tree, got %#v", writer.lines)
+	}
+}
+
 func TestSkillPaletteOpensTaskModal(t *testing.T) {
 	s := initialSession()
 	s.ready = true

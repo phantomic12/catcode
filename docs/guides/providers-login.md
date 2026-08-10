@@ -368,14 +368,23 @@ Every `ModelInfo` (/core/src/protocol.rs) entry carries:
 
 | Field | Description |
 |-------|-------------|
-| `id` | Model identifier (e.g., `"glm-5.2"`) |
+| `id` | Model identifier (e.g. `"glm-5.2"`) |
 | `name` | Human-readable name |
 | `reasoning` | Whether the model supports reasoning/thinking |
 | `context_window` | Context window size in tokens |
 | `max_tokens` | Maximum output tokens |
 | `thinking_levels` | Supported reasoning effort levels (`["low","medium","high"]`) |
 | `vision` | Whether the model accepts image inputs |
+| `input` | Accepted input modalities (`text`, `image`, `pdf`, etc.) |
+| `output` | Emitted output modalities (`text`, etc.) |
+| `tool_call` | Whether the model supports function/tool calls |
+| `structured_output` | Whether the model supports structured/JSON output |
 | `provider` | **Provider name** that owns this model — used for per-turn routing |
+
+The custom-provider editor exposes these fields for every discovered or manually
+entered model. Changes persist under the provider's `models_override` array in
+`~/.config/catalyst-code/config.json` and are applied after live discovery and
+models.dev enrichment, so explicit edits win over inferred metadata.
 
 ### Per-Turn Routing
 

@@ -11,6 +11,7 @@
 //! uses these helpers instead (and never prompts the user).
 
 use crate::goal::{mission_summary_rel_path, DeployPrompt, GoalMode, GoalPlan};
+use std::path::Path;
 
 /// System-prompt append injected for CEO phase turns (Planning / Reviewing /
 /// Verifying / Replanning). Not a deployable subagent persona.
@@ -152,6 +153,11 @@ pub fn self_review_prompt(mode: &GoalMode) -> String {
 /// [`mission_summary_rel_path`]) \u{2014} richer than wrap-up truncation.
 /// Wire aliases: `VERDICT: PASS` == CERTIFIED, `VERDICT: FAIL` == REMAINING_GAPS.
 pub fn verify_prompt(mode: &GoalMode) -> String {
+    verify_prompt_with_workspace(mode, None)
+}
+
+/// Build the CEO verify prompt with bounded records from existing project stores.
+pub fn verify_prompt_with_workspace(mode: &GoalMode, workspace: Option<&Path>) -> String {
     let summary_path = if mode.id.is_empty() {
         ".catalyst-code/goal-ux/artifacts/<goal_id>/SUMMARY.md".into()
     } else {
@@ -169,17 +175,53 @@ pub fn verify_prompt(mode: &GoalMode) -> String {
         .unwrap_or_else(|| "- (none recorded)".into());
     let steps_idx = format_deploy_index(mode);
     let iteration = format!("## Iteration\n{}/{}\n", mode.iteration, mode.max_iterations);
+    let learning = workspace
+        .map(|ws| format_learning_evidence(ws, &mode.goal))
+        .unwrap_or_default();
+    format!("{persona}\n\n# GOAL MODE \u{2014} CEO Verify (post-deploy)\n\nJudge whether the user's request is **fully** implemented. You certify completion or enumerate remaining gaps for a delta replan. Do not casually mark done.\n\n## Goal\n{goal}\n\n{iteration}\n## Plan summary\n{plan_summary}\n\n## Validation criteria\n{validation}\n\n## Evidence (read these \u{2014} do not rely on chat truncation)\n1. **Goal-scoped summary (required):** `{summary_path}`\n   - Use the `read_file` tool to load this file first. It aggregates full step outputs beyond wrap-up truncation.\n2. Per-step full artifacts listed in that summary (and below). Open any artifact whose summary is incomplete or contested.\n\n{learning}\n## Step index\n{steps_idx}\n\n## Required action\n1. Read `{summary_path}` (and additional step artifacts as needed).\n2. Check each validation criterion against evidence (prefer file:line citations and command/build output quoted from artifacts).\n3. Decide exactly one outcome:\n\n### CERTIFIED (pass)\nIf the goal is fully met, end with ONE of:\n`VERDICT: CERTIFIED`\n`VERDICT: PASS`\nAbove that line: a short evidence-backed summary (file:line / build output pointers).\n\n### REMAINING_GAPS (fail)\nIf anything material is unfinished or wrong, end with ONE of:\n`VERDICT: REMAINING_GAPS`\n`VERDICT: FAIL`\nThen a section `## Remaining gaps` or `remaining_gaps:` \u{2014} each gap must be concrete enough to become a delta plan step.\n\n## Rules\n- Never ask the user. Never call `ask`. Never call goal_write_plan this turn.\n- Do not implement code this turn. Certification is an evidence judgment only.", persona=ceo_persona_append(), goal=mode.goal, iteration=iteration, plan_summary=plan_summary, validation=validation, summary_path=summary_path, learning=learning, steps_idx=steps_idx)
+}
 
-    format!(
-        "{persona}\n\n# GOAL MODE \u{2014} CEO Verify (post-deploy)\n\nJudge whether the user's request is **fully** implemented. You certify completion or enumerate remaining gaps for a delta replan. Do not casually mark done.\n\n## Goal\n{goal}\n\n{iteration}\n## Plan summary\n{plan_summary}\n\n## Validation criteria\n{validation}\n\n## Evidence (read these \u{2014} do not rely on chat truncation)\n1. **Goal-scoped summary (required):** `{summary_path}`\n   - Use the `read_file` tool to load this file first. It aggregates full step outputs beyond wrap-up truncation.\n2. Per-step full artifacts listed in that summary (and below). Open any artifact whose summary is incomplete or contested.\n\n## Step index\n{steps_idx}\n\n## Required action\n1. Read `{summary_path}` (and additional step artifacts as needed).\n2. Check each validation criterion against evidence (prefer file:line citations and command/build output quoted from artifacts).\n3. Decide exactly one outcome:\n\n### CERTIFIED (pass)\nIf the goal is fully met, end with ONE of:\n`VERDICT: CERTIFIED`\n`VERDICT: PASS`\nAbove that line: a short evidence-backed summary (file:line / build output pointers).\n\n### REMAINING_GAPS (fail)\nIf anything material is unfinished or wrong, end with ONE of:\n`VERDICT: REMAINING_GAPS`\n`VERDICT: FAIL`\nThen a section `## Remaining gaps` or `remaining_gaps:` \u{2014} each gap must be concrete enough to become a delta plan step (what to fix, which files/area, how to validate). These feed revise_feedback / the next Planning turn.\n\n## Rules\n- Never ask the user. Never call `ask`. Never call goal_write_plan this turn.\n- Failed/skipped employee steps are strong signals but not automatic REMAINING_GAPS if the goal is still met another way \u{2014} verify against the **goal**, not mere step status.\n- Do not implement code this turn. Certification is an evidence judgment only.",
-        persona = ceo_persona_append(),
-        goal = mode.goal,
-        iteration = iteration,
-        plan_summary = plan_summary,
-        validation = validation,
-        summary_path = summary_path,
-        steps_idx = steps_idx,
-    )
+fn short(s: &str, n: usize) -> String {
+    s.chars().take(n).collect::<String>()
+}
+
+fn format_learning_evidence(workspace: &Path, goal: &str) -> String {
+    let pid = crate::project_identity::resolve_project_identity(workspace).id;
+    let mut out = String::from(
+        "## Bounded project evidence (advisory; verify against artifacts)\n### research_evidence\n",
+    );
+    for ep in crate::episodes::load_episodes(&pid).iter().rev().take(3) {
+        let tests = ep
+            .tests_run
+            .iter()
+            .take(3)
+            .map(|t| format!("{}={}", t.command, t.ok))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "- episode {}: {}; tests: {}\n",
+            ep.id,
+            short(&ep.approach_summary, 180),
+            short(&tests, 180)
+        ));
+    }
+    out.push_str("### failure_atlas\n");
+    for d in crate::failure_atlas::match_diagnostics(&pid, goal, 3) {
+        out.push_str(&format!(
+            "- [{}] x{} {}\n",
+            d.class,
+            d.count,
+            short(&d.signature, 160)
+        ));
+    }
+    out.push_str("### coverage_ledger\n");
+    for area in crate::coverage_ledger::poorly_covered(&pid, 5) {
+        out.push_str(&format!(
+            "- {}: confidence {:.2}, files {}, symbols {}\n",
+            area.area, area.confidence, area.indexed_files, area.indexed_symbols
+        ));
+    }
+    out
 }
 
 /// Dispatch helper: CEO planning vs classic single-pass planning.
@@ -292,6 +334,69 @@ fn format_deploy_line(mode: &GoalMode, p: &DeployPrompt) -> String {
         artifact = artifact,
     )
 }
+/// Machine-check the goal summary and every referenced artifact before a CEO
+/// verdict can certify. Evidence must be present, non-empty, current, and
+/// internally consistent with completed steps.
+pub fn validate_certification_evidence(
+    workspace: &std::path::Path,
+    mode: &GoalMode,
+) -> Result<Vec<String>, String> {
+    if mode.id.is_empty() {
+        return Err("missing goal id".into());
+    }
+    let rel = mission_summary_rel_path(&mode.id);
+    let summary_path = workspace.join(&rel);
+    let meta = std::fs::metadata(&summary_path)
+        .map_err(|e| format!("required summary {rel} unavailable: {e}"))?;
+    if meta.len() == 0 {
+        return Err(format!("required summary {rel} is empty"));
+    }
+    let summary = std::fs::read_to_string(&summary_path)
+        .map_err(|e| format!("read required summary {rel}: {e}"))?;
+    let summary_mtime = meta
+        .modified()
+        .map_err(|e| format!("summary timestamp: {e}"))?;
+    let mut referenced = Vec::new();
+    for line in summary.lines() {
+        if let Some(path) = line.trim().strip_prefix("path:") {
+            let path = path.trim();
+            if path.is_empty() || path.contains("..") {
+                return Err(format!("invalid evidence path {path:?}"));
+            }
+            let abs = crate::workspace::resolve(workspace, path)
+                .map_err(|e| format!("invalid evidence path {path:?}: {e}"))?;
+            let artifact = std::fs::metadata(&abs)
+                .map_err(|e| format!("referenced artifact {path} unavailable: {e}"))?;
+            if artifact.len() == 0 {
+                return Err(format!("referenced artifact {path} is empty"));
+            }
+            let changed = artifact
+                .modified()
+                .map_err(|e| format!("artifact timestamp: {e}"))?;
+            if changed > summary_mtime {
+                return Err(format!("summary {rel} is stale relative to {path}"));
+            }
+            let body = std::fs::read_to_string(&abs).unwrap_or_default();
+            if body.trim().is_empty() || body.contains("(no step output)") {
+                return Err(format!("referenced artifact {path} has no evidence"));
+            }
+            referenced.push(path.to_string());
+        }
+    }
+    if referenced.len() < mode.prompts.len() {
+        return Err("summary omits one or more step artifacts".into());
+    }
+    if summary
+        .to_ascii_lowercase()
+        .contains("contradiction: unresolved")
+        || summary
+            .to_ascii_lowercase()
+            .contains("evidence: contradictory")
+    {
+        return Err("summary contains unresolved contradictory evidence".into());
+    }
+    Ok(referenced)
+}
 
 #[allow(dead_code)]
 #[cfg(test)]
@@ -343,6 +448,31 @@ mod tests {
     }
 
     #[test]
+    fn certification_evidence_requires_current_nonempty_artifacts() {
+        let root = std::env::temp_dir().join(format!("ceo-evidence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mode = base_mode();
+        let summary = root.join(mission_summary_rel_path(&mode.id));
+        std::fs::create_dir_all(summary.parent().unwrap()).unwrap();
+        std::fs::write(
+            &summary,
+            "# Summary\npath: .catalyst-code/goal-ux/artifacts/g-ceo/s1.md\n",
+        )
+        .unwrap();
+        assert!(validate_certification_evidence(&root, &mode).is_err());
+        let artifact = root.join(".catalyst-code/goal-ux/artifacts/g-ceo/s1.md");
+        std::fs::write(&artifact, "verified test output").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::fs::write(
+            &summary,
+            "# Summary\npath: .catalyst-code/goal-ux/artifacts/g-ceo/s1.md\n",
+        )
+        .unwrap();
+        assert!(validate_certification_evidence(&root, &mode).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn ceo_planning_forbids_ask() {
         let p = ceo_planning_prompt(&base_mode());
         assert!(p.contains("Never call `ask`"));
@@ -373,6 +503,18 @@ mod tests {
         assert!(p.contains("VERDICT: REMAINING_GAPS"));
         assert!(p.contains("read_file"));
         assert!(p.contains("Never call `ask`"));
+    }
+
+    #[test]
+    fn workspace_verify_prompt_labels_all_bounded_project_evidence() {
+        let root = std::env::temp_dir().join(format!("ceo-learning-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let prompt = verify_prompt_with_workspace(&base_mode(), Some(&root));
+        assert!(prompt.contains("### research_evidence"));
+        assert!(prompt.contains("### failure_atlas"));
+        assert!(prompt.contains("### coverage_ledger"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

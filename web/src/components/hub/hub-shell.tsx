@@ -4,12 +4,15 @@
 //
 //   • PROJECT TABS across the top. Add projects by browsing the machine
 //     (ProjectSwitcher → /api/browse), or create/clone them.
+//   • GIT SIDEBAR on the LEFT (collapsible, resizable) — full GitPanel bound
+//     to the active project via an IdeContext shim.
 //   • CHAT CENTER — full multi-session agent chat (SSE live feed to a pool of
 //     catcode-core processes). Sessions keep running when you switch projects,
 //     close the tab, or open another device — reconnecting rehydrates from the
 //     server snapshot and resumes the live event stream.
-//   • GIT SIDEBAR (collapsible, resizable) — full GitPanel bound to the active
-//     project via an IdeContext shim.
+//   • PREVIEW on the RIGHT (collapsible, resizable) — iframe of a local/dev
+//     server URL with element-pick → attach-to-chat.
+//   • TERMINAL along the BOTTOM (collapsible, resizable) — multi-tab PTY panel.
 //
 // Account layout (GET/PUT /api/hub/layout) remembers open projects + the last
 // viewed session per project so multi-device clients reattach the same chats.
@@ -30,6 +33,8 @@ import {
   UserIcon,
   XIcon,
 } from "@/components/icons";
+import { TerminalIcon, EyeIcon } from "@/components/icons";
+import { TerminalPanel, type TerminalSession } from "@/components/ide/terminal";
 import { ProjectSwitcher } from "@/components/ide/project-switcher";
 import { ChatInner } from "@/components/chat";
 import { SettingsModal } from "@/components/settings";
@@ -48,6 +53,7 @@ import {
 import { useAgent } from "@/lib/use-agent";
 import type { ProjectEntry } from "@/lib/types";
 import { HubGitSidebar as GitSidebar } from "./git-sidebar";
+import { PreviewPanel } from "./preview-panel";
 import {
   defaultHubState,
   fetchHubLayout,
@@ -78,6 +84,8 @@ export function HubShell() {
   // screen never boots with chat covered; desktop keeps hub.gitOpen.
   const [mobileGitOpen, setMobileGitOpen] = useState(false);
   const gitResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  const previewResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  const terminalResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const isMobile = useIsMobile();
   const menuRef = useOutsideClose(() => setMenuOpen(false), menuOpen);
   const menuTrapRef = useFocusTrap<HTMLDivElement>(menuOpen);
@@ -259,6 +267,12 @@ export function HubShell() {
   }, [hydrated, hub.active]);
 
   const activePath = hub.active;
+  const activeTerminalSessions = (activePath ? hub.terminalSessions[activePath] : undefined) ?? [];
+  const activeTerminalId = activePath ? hub.activeTerminal[activePath] ?? null : null;
+  const setPanel = useCallback((panel: "terminalOpen" | "previewOpen") => setHub((p) => ({ ...p, [panel]: !p[panel] })), []);
+  const newTerminal = useCallback(() => { if (!activePath) return; const id = `term_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`; const session: TerminalSession = { id, title: "shell", cwd: "", alive: true, exitCode: null }; setHub((p) => ({ ...p, terminalOpen: true, terminalSessions: { ...p.terminalSessions, [activePath]: [...(p.terminalSessions[activePath] ?? []), session] }, activeTerminal: { ...p.activeTerminal, [activePath]: id } })); }, [activePath]);
+  const updateTerminal = useCallback((id: string, patch: Partial<TerminalSession>) => { if (!activePath) return; setHub((p) => ({ ...p, terminalSessions: { ...p.terminalSessions, [activePath]: (p.terminalSessions[activePath] ?? []).map((s) => s.id === id ? { ...s, ...patch } : s) } })); }, [activePath]);
+  const closeTerminal = useCallback((id: string) => { if (!activePath) return; setHub((p) => ({ ...p, terminalSessions: { ...p.terminalSessions, [activePath]: (p.terminalSessions[activePath] ?? []).filter((s) => s.id !== id) }, activeTerminal: { ...p.activeTerminal, [activePath]: null } })); }, [activePath]);
 
   // ── tab actions ───────────────────────────────────────────────────────────
   const openTab = useCallback(
@@ -365,7 +379,8 @@ export function HubShell() {
     setHub((prev) => (prev.active === path ? prev : { ...prev, active: path }));
   }, []);
 
-  // ── git resize ────────────────────────────────────────────────────────────
+  // ── panel resizes ─────────────────────────────────────────────────────────
+  // Git is a LEFT sidebar: dragging its right edge right grows width.
   const onGitResizeStart = useCallback(
     (e: React.PointerEvent) => {
       e.preventDefault();
@@ -373,8 +388,7 @@ export function HubShell() {
       const onMove = (ev: PointerEvent) => {
         const start = gitResizeRef.current;
         if (!start) return;
-        // Dragging the left edge of a right sidebar: moving left grows width.
-        const next = Math.min(560, Math.max(240, start.startWidth + (start.startX - ev.clientX)));
+        const next = Math.min(480, Math.max(200, start.startWidth + (ev.clientX - start.startX)));
         setHub((prev) => (prev.gitWidth === next ? prev : { ...prev, gitWidth: next }));
       };
       const onUp = () => {
@@ -386,6 +400,52 @@ export function HubShell() {
       window.addEventListener("pointerup", onUp);
     },
     [hub.gitWidth],
+  );
+
+  // Preview is a RIGHT sidebar: dragging its left edge left grows width.
+  const onPreviewResizeStart = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      previewResizeRef.current = { startX: e.clientX, startWidth: hub.previewWidth };
+      const onMove = (ev: PointerEvent) => {
+        const start = previewResizeRef.current;
+        if (!start) return;
+        const next = Math.min(900, Math.max(280, start.startWidth + (start.startX - ev.clientX)));
+        setHub((prev) => (prev.previewWidth === next ? prev : { ...prev, previewWidth: next }));
+      };
+      const onUp = () => {
+        previewResizeRef.current = null;
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+    },
+    [hub.previewWidth],
+  );
+
+  // Terminal is a BOTTOM panel: dragging its top edge up grows height.
+  const onTerminalResizeStart = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      terminalResizeRef.current = { startY: e.clientY, startHeight: hub.terminalHeight };
+      const onMove = (ev: PointerEvent) => {
+        const start = terminalResizeRef.current;
+        if (!start) return;
+        const next = Math.min(560, Math.max(140, start.startHeight + (start.startY - ev.clientY)));
+        setHub((prev) =>
+          prev.terminalHeight === next ? prev : { ...prev, terminalHeight: next },
+        );
+      };
+      const onUp = () => {
+        terminalResizeRef.current = null;
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+    },
+    [hub.terminalHeight],
   );
 
   // ── keyboard: Ctrl/Cmd+1..9 jump tabs ─────────────────────────────────────
@@ -542,65 +602,15 @@ export function HubShell() {
 
           {/* Right actions */}
           <div className="flex shrink-0 items-center gap-0.5">
-            <button
-              type="button"
-              onClick={() => {
-                if (isMobile) setMobileGitOpen((o) => !o);
-                else setHub((p) => ({ ...p, gitOpen: !p.gitOpen }));
-              }}
-              className={`flex h-8 items-center gap-1.5 rounded-sm border-l-2 px-2 text-[11px] font-mono uppercase tracking-wider transition-colors [@media(pointer:coarse)]:h-11 ${
-                gitOpenDesktop || showGitDrawer
-                  ? "border-accent bg-ink-850 text-ink-100"
-                  : "border-transparent text-ink-500 hover:bg-ink-850 hover:text-ink-200"
-              }`}
-              title="Source control"
-              aria-label="Toggle git panel"
-              aria-pressed={gitOpenDesktop || showGitDrawer}
-            >
-              <GitBranchIcon width={13} height={13} />
-              <span className="hidden sm:inline">Git</span>
-            </button>
-
+            <button type="button" onClick={() => { if (isMobile) setMobileGitOpen((o) => !o); else setHub((p) => ({ ...p, gitOpen: !p.gitOpen })); }} className={`flex h-8 items-center gap-1.5 rounded-sm border-l-2 px-2 text-[11px] font-mono uppercase tracking-wider transition-colors ${gitOpenDesktop || showGitDrawer ? "border-accent bg-ink-850 text-ink-100" : "border-transparent text-ink-500 hover:bg-ink-850 hover:text-ink-200"}`} title="Source control" aria-label="Toggle git panel" aria-pressed={gitOpenDesktop || showGitDrawer}><GitBranchIcon width={13} height={13} /><span className="hidden sm:inline">Git</span></button>
+            <button type="button" onClick={() => { if (!activeTerminalSessions.length) newTerminal(); else setPanel("terminalOpen"); }} aria-pressed={hub.terminalOpen} className={`flex h-8 items-center gap-1 border-l-2 px-2 font-mono text-[11px] ${hub.terminalOpen ? "border-accent bg-ink-850 text-ink-100" : "border-transparent text-ink-500 hover:bg-ink-850"}`}><TerminalIcon width={13} height={13} /><span className="hidden sm:inline">Terminal</span></button>
+            <button type="button" onClick={() => setPanel("previewOpen")} aria-pressed={hub.previewOpen} className={`flex h-8 items-center gap-1 border-l-2 px-2 font-mono text-[11px] ${hub.previewOpen ? "border-accent bg-ink-850 text-ink-100" : "border-transparent text-ink-500 hover:bg-ink-850"}`}><EyeIcon width={13} height={13} /><span className="hidden sm:inline">Preview</span></button>
             <div className="relative" ref={mergeRefs(menuRef, menuTrapRef)}>
-              <button
-                type="button"
-                onClick={() => setMenuOpen((o) => !o)}
-                className="focus-ring flex h-8 w-8 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-850 hover:text-ink-200 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11"
-                aria-label="Account menu"
-                aria-expanded={menuOpen}
-              >
-                <UserIcon width={14} height={14} />
-              </button>
-              {menuOpen && (
-                <div
-                  className="absolute right-0 top-full z-50 mt-1 min-w-[10rem] overflow-hidden rounded-sm border border-ink-700 bg-ink-900 py-1 shadow-elev-2"
-                  role="menu"
-                >
-                  <button
-                    type="button"
-                    role="menuitem"
-                    className="flex w-full items-center gap-2 border-l-2 border-transparent px-3 py-1.5 text-left text-[12px] text-ink-200 hover:border-accent hover:bg-ink-850"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      setSettingsOpen(true);
-                    }}
-                  >
-                    Settings
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    disabled={signingOut}
-                    className="flex w-full items-center gap-2 border-l-2 border-transparent px-3 py-1.5 text-left text-[12px] text-ink-200 hover:border-accent hover:bg-ink-850 disabled:opacity-50"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      void onSignOut();
-                    }}
-                  >
-                    {signingOut ? "Signing out…" : "Sign out"}
-                  </button>
-                </div>
-              )}
+              <button type="button" onClick={() => setMenuOpen((o) => !o)} className="focus-ring flex h-8 w-8 items-center justify-center rounded-sm text-ink-500 transition-colors hover:bg-ink-850 hover:text-ink-200 [@media(pointer:coarse)]:h-11 [@media(pointer:coarse)]:w-11" aria-label="Account menu" aria-expanded={menuOpen}><UserIcon width={14} height={14} /></button>
+              {menuOpen && <div className="absolute right-0 top-full z-50 mt-1 min-w-[10rem] overflow-hidden rounded-sm border border-ink-700 bg-ink-900 py-1 shadow-elev-2" role="menu">
+                <button type="button" role="menuitem" className="flex w-full px-3 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-850" onClick={() => { setMenuOpen(false); setSettingsOpen(true); }}>Settings</button>
+                <button type="button" role="menuitem" disabled={signingOut} className="flex w-full px-3 py-1.5 text-left text-[12px] text-ink-200 hover:bg-ink-850 disabled:opacity-50" onClick={() => { setMenuOpen(false); void onSignOut(); }}>{signingOut ? "Signing out…" : "Sign out"}</button>
+              </div>}
             </div>
           </div>
         </header>
@@ -611,40 +621,124 @@ export function HubShell() {
           </div>
         )}
 
-        {/* ── Body: chat + optional git ───────────────────────────────────── */}
+        {/* ── Body: git (left) + chat/terminal (center) + preview (right) ── */}
         <div className="relative flex min-h-0 flex-1">
-          <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-            {activePath ? (
-              <ErrorBoundary label="chat">
-                <ChatPane agent={agent} />
-              </ErrorBoundary>
-            ) : (
-              <EmptyHub onOpenProject={() => setSwitcherOpen(true)} />
-            )}
-          </main>
-
-          {/* Desktop git column */}
+          {/* Desktop git — LEFT sidebar */}
           {gitOpenDesktop && activePath && (
-            <>
+            <aside
+              className="relative flex min-h-0 shrink-0 flex-col border-r border-ink-800 bg-ink-925"
+              style={{ width: hub.gitWidth }}
+              aria-label="Git"
+            >
+              <ErrorBoundary label="git">
+                <GitSidebar workspace={activePath} />
+              </ErrorBoundary>
               <div
                 role="separator"
                 aria-orientation="vertical"
                 aria-label="Resize git panel"
                 onPointerDown={onGitResizeStart}
-                className="w-1.5 shrink-0 cursor-col-resize touch-none bg-transparent hover:bg-ink-800 active:bg-ink-750"
+                className="absolute inset-y-0 -right-1 z-10 w-2 cursor-col-resize touch-none hover:bg-accent/30"
               />
-              <aside
-                className="flex min-h-0 shrink-0 flex-col border-l border-ink-800 bg-ink-925"
-                style={{ width: hub.gitWidth }}
-              >
-                <ErrorBoundary label="git">
-                  <GitSidebar workspace={activePath} />
-                </ErrorBoundary>
-              </aside>
-            </>
+            </aside>
           )}
 
-          {/* Mobile git drawer */}
+          <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+            {activePath ? (
+              <>
+                <div className="relative flex min-h-0 flex-1 flex-col">
+                  <ErrorBoundary label="chat">
+                    <ChatPane agent={agent} />
+                  </ErrorBoundary>
+                </div>
+                {hub.terminalOpen && (
+                  <div
+                    className="relative flex min-h-0 shrink-0 flex-col border-t border-ink-800"
+                    style={{ height: hub.terminalHeight }}
+                  >
+                    <div
+                      role="separator"
+                      aria-orientation="horizontal"
+                      aria-label="Resize terminal panel"
+                      onPointerDown={onTerminalResizeStart}
+                      className="absolute inset-x-0 -top-1 z-10 h-2 cursor-row-resize touch-none hover:bg-accent/30"
+                    />
+                    <div className="min-h-0 flex-1">
+                      <TerminalPanel
+                        workspace={activePath}
+                        sessions={activeTerminalSessions}
+                        activeId={activeTerminalId}
+                        onNew={newTerminal}
+                        onSelect={(id) =>
+                          setHub((p) => ({
+                            ...p,
+                            activeTerminal: { ...p.activeTerminal, [activePath]: id },
+                          }))
+                        }
+                        onClose={closeTerminal}
+                        onExit={(id, code) => updateTerminal(id, { alive: false, exitCode: code })}
+                        onUnavailable={(id) => updateTerminal(id, { alive: false })}
+                        onRename={(id, title) => updateTerminal(id, { title })}
+                        onRestart={(id) => updateTerminal(id, { alive: true, exitCode: null })}
+                      />
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
+              <EmptyHub onOpenProject={() => setSwitcherOpen(true)} />
+            )}
+          </main>
+
+          {/* Desktop preview — RIGHT sidebar (resizable) */}
+          {hub.previewOpen && activePath && !isMobile && (
+            <aside
+              className="relative flex min-h-0 shrink-0 flex-col border-l border-ink-800 bg-ink-925"
+              style={{ width: hub.previewWidth }}
+              aria-label="Preview"
+            >
+              <div
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize preview panel"
+                onPointerDown={onPreviewResizeStart}
+                className="absolute inset-y-0 -left-1 z-10 w-2 cursor-col-resize touch-none hover:bg-accent/30"
+              />
+              <ErrorBoundary label="preview">
+                <PreviewPanel
+                  url={hub.previewUrls[activePath] ?? ""}
+                  onUrl={(url) =>
+                    setHub((p) => ({
+                      ...p,
+                      previewUrls: { ...p.previewUrls, [activePath]: url },
+                    }))
+                  }
+                />
+              </ErrorBoundary>
+            </aside>
+          )}
+
+          {/* Mobile preview — full-width overlay (small screens can't host a side column) */}
+          {hub.previewOpen && activePath && isMobile && (
+            <aside
+              className="absolute inset-0 z-30 flex min-h-0 flex-col bg-ink-925"
+              aria-label="Preview"
+            >
+              <ErrorBoundary label="preview-mobile">
+                <PreviewPanel
+                  url={hub.previewUrls[activePath] ?? ""}
+                  onUrl={(url) =>
+                    setHub((p) => ({
+                      ...p,
+                      previewUrls: { ...p.previewUrls, [activePath]: url },
+                    }))
+                  }
+                />
+              </ErrorBoundary>
+            </aside>
+          )}
+
+          {/* Mobile git drawer — LEFT overlay */}
           {showGitDrawer && activePath && (
             <>
               <div
@@ -654,7 +748,7 @@ export function HubShell() {
               />
               <aside
                 ref={mergeRefs(mobileGitCloseRef, mobileGitTrapRef)}
-                className="absolute inset-y-0 right-0 z-50 flex w-[min(100%,22rem)] flex-col border-l border-ink-800 bg-ink-900 shadow-elev-2"
+                className="absolute inset-y-0 left-0 z-50 flex w-[min(100%,22rem)] flex-col border-r border-ink-800 bg-ink-900 shadow-elev-2"
                 role="dialog"
                 aria-modal="true"
                 aria-label="Source control"

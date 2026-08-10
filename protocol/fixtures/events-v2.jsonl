@@ -103,3 +103,12 @@
 {"type":"skill_marketplace_results","protocol_version":2,"query":"react","skills":[{"id":"anthropics/skills/frontend-design","skillId":"frontend-design","name":"frontend-design","installs":1,"source":"anthropics/skills"}]}
 {"type":"skill_marketplace_changed","protocol_version":2,"action":"installed","name":"frontend-design","scope":"project"}
 {"type":"skill_marketplace_error","protocol_version":2,"message":"skill explorer disclaimer must be accepted"}
+{"type":"job_list","protocol_version":2,"runs":[]}
+{"type":"job_status","protocol_version":2,"run_id":"run-1","state":"running"}
+{"type":"job_wait_result","protocol_version":2,"run_id":"run-1","state":"completed"}
+{"type":"job_cancel_requested","protocol_version":2,"run_id":"run-1"}
+{"type":"job_cancel_result","protocol_version":2,"run_id":"run-1","artifact":{}}
+{"type":"subagent_delivery","protocol_version":2,"run_id":"run-1","parent_run_id":"parent-1","state":"completed"}
+{"type":"job_wait_timeout","protocol_version":2,"run_id":"run-1"}
+{"type":"session_tree","protocol_version":2,"tree":{}}
+{"type":"session_branch","protocol_version":2,"entry_id":"entry-1"}

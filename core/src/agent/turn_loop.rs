@@ -39,6 +39,302 @@ fn build_summary_required_nudge() -> String {
     )
 }
 
+const EVAL_MAX_SNIPPET_BYTES: usize = 65_536;
+const EVAL_MAX_HISTORY_BYTES: usize = 256 * 1024;
+
+fn build_eval_source(history: &[String], code: &str) -> Result<String, String> {
+    if code.len() > EVAL_MAX_SNIPPET_BYTES {
+        return Err(format!("eval code exceeds {EVAL_MAX_SNIPPET_BYTES} bytes"));
+    }
+    let reserve = code.len().saturating_add(1);
+    let mut retained = Vec::new();
+    let mut used = reserve;
+    for snippet in history.iter().rev() {
+        let required = snippet.len().saturating_add(1);
+        if used.saturating_add(required) > EVAL_MAX_HISTORY_BYTES {
+            break;
+        }
+        used = used.saturating_add(required);
+        retained.push(snippet.as_str());
+    }
+    retained.reverse();
+    let mut source = retained.join("\n");
+    if !source.is_empty() {
+        source.push('\n');
+    }
+    source.push_str(code);
+    Ok(source)
+}
+
+fn eval_gate_error(enabled: bool) -> Option<&'static str> {
+    (!enabled).then_some(
+        "tool 'eval' is deferred and not enabled this session. Call load_tools with tools:[\"eval\"] first.",
+    )
+}
+
+fn trim_eval_history(history: &mut Vec<String>) {
+    let mut used = 0usize;
+    let mut keep_from = history.len();
+    for (index, snippet) in history.iter().enumerate().rev() {
+        let required = snippet.len().saturating_add(1);
+        if used.saturating_add(required) > EVAL_MAX_HISTORY_BYTES {
+            break;
+        }
+        used = used.saturating_add(required);
+        keep_from = index;
+    }
+    history.drain(..keep_from);
+}
+
+async fn execute_eval(st: &Arc<State>, args: &Value, cfg: &Config) -> tools::Outcome {
+    let language = match args.get("language").and_then(Value::as_str) {
+        Some("python") => "python",
+        Some("javascript") => "javascript",
+        _ => return tools::Outcome::err("eval requires language 'python' or 'javascript'"),
+    };
+    let Some(code) = args.get("code").and_then(Value::as_str) else {
+        return tools::Outcome::err("eval requires string field 'code'");
+    };
+    if args.get("reset").and_then(Value::as_bool).unwrap_or(false) {
+        st.eval_history.lock().await.remove(language);
+    }
+    let prior = {
+        let history = st.eval_history.lock().await;
+        history.get(language).cloned().unwrap_or_default()
+    };
+    let source = match build_eval_source(&prior, code) {
+        Ok(source) => source,
+        Err(error) => return tools::Outcome::err(error),
+    };
+    let (program, program_args) = if language == "python" {
+        ("python3".to_string(), vec!["-".to_string()])
+    } else {
+        ("bun".to_string(), vec!["run".to_string(), "-".to_string()])
+    };
+    let proc_env =
+        crate::sandbox::policy::build_process_env(cfg, crate::sandbox::policy::ExecPurpose::Plugin);
+    let cwd =
+        crate::sandbox::policy::effective_cwd(cfg, "").unwrap_or_else(|_| cfg.workspace.clone());
+    let request = crate::sandbox::ExecRequest {
+        program: program.clone(),
+        args: program_args,
+        cwd,
+        env: proc_env.env,
+        inherit_parent_env: proc_env.inherit_parent,
+        stdin: Some(source.into_bytes()),
+        timeout: std::time::Duration::from_secs(30),
+        ..Default::default()
+    };
+    let result = match crate::sandbox::execution_backend().execute(request).await {
+        Ok(result) => result,
+        Err(error) => {
+            return tools::Outcome::err(format!(
+                "eval runtime unavailable ({program}): {}",
+                error.user_message()
+            ))
+        }
+    };
+    let mut output = String::from_utf8_lossy(&result.stdout).into_owned();
+    if !result.stderr.is_empty() {
+        if !output.is_empty() {
+            output.push_str("\n--- stderr ---\n");
+        }
+        output.push_str(&String::from_utf8_lossy(&result.stderr));
+    }
+    if output.is_empty() {
+        output.push_str("(no output)");
+    }
+    output = tools::smart_truncate(&output, 32_768);
+    if result.timed_out {
+        return tools::Outcome::err(format!("eval timed out after 30s (killed)\n{output}"));
+    }
+    if result.exit_code == Some(0) {
+        let mut history = st.eval_history.lock().await;
+        let snippets = history.entry(language.to_string()).or_default();
+        snippets.push(code.to_string());
+        trim_eval_history(snippets);
+        tools::Outcome::ok(output)
+    } else {
+        tools::Outcome::err(output)
+    }
+}
+
+fn persist_automatic_compaction(
+    path: &std::path::Path,
+    messages: &[Message],
+    summary: &str,
+) -> Result<(), String> {
+    let retained = session::artifact_run_ids_referenced_by_messages(messages);
+    let artifacts: Vec<String> = retained
+        .iter()
+        .map(|id| format!("artifact://{id}.json"))
+        .collect();
+    session::append_compaction(path, messages, summary, &artifacts)
+        .map_err(|error| format!("compaction persistence failed: {error}"))?;
+    session::shake_artifacts(path, &retained)
+        .map_err(|error| format!("compaction artifact retention cleanup failed: {error}"))?;
+    Ok(())
+}
+
+const PROCESS_MAX_LOG_CAPACITY: u64 = 1024 * 1024;
+
+fn execute_process(args: &Value, cfg: &Config) -> tools::Outcome {
+    use crate::runtime::{NamedProcessSupervisor, ProcessSpec, Readiness};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    let Some(action) = args.get("action").and_then(Value::as_str) else {
+        return tools::Outcome::err("process requires string field 'action'");
+    };
+    let Some(name) = args.get("name").and_then(Value::as_str) else {
+        return tools::Outcome::err("process requires string field 'name'");
+    };
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return tools::Outcome::err("process name must contain only ASCII letters, digits, '-' or '_', and be at most 64 bytes");
+    }
+    let supervisor = match NamedProcessSupervisor::new(&cfg.workspace) {
+        Ok(supervisor) => supervisor,
+        Err(error) => {
+            return tools::Outcome::err(format!("process supervisor unavailable: {error}"))
+        }
+    };
+    let result = match action {
+        "status" => supervisor
+            .status(name)
+            .map(|status| serde_json::json!(status)),
+        "logs" => supervisor.logs(name).map(|logs| {
+            serde_json::json!({
+                "name": name,
+                "text": logs.text,
+                "truncated": logs.truncated,
+            })
+        }),
+        "start" | "restart" => {
+            let Some(argv) = args.get("argv").and_then(Value::as_array) else {
+                return tools::Outcome::err(format!(
+                    "process {action} requires non-empty array field 'argv'"
+                ));
+            };
+            if argv.is_empty() || argv.len() > 128 {
+                return tools::Outcome::err("process argv must contain 1 to 128 strings");
+            }
+            let mut command = Vec::with_capacity(argv.len());
+            for value in argv {
+                let Some(value) = value.as_str() else {
+                    return tools::Outcome::err("process argv items must be strings");
+                };
+                if value.is_empty() || value.len() > 8192 || value.contains('\0') {
+                    return tools::Outcome::err(
+                        "process argv items must be non-empty strings up to 8192 bytes without NUL",
+                    );
+                }
+                command.push(value.to_owned());
+            }
+            let cwd = args.get("cwd").and_then(Value::as_str).unwrap_or(".");
+            if cwd.is_empty()
+                || std::path::Path::new(cwd).is_absolute()
+                || cwd.contains('\\')
+                || cwd.split('/').any(|part| part == "..")
+            {
+                return tools::Outcome::err(
+                    "process cwd must be a workspace-relative path without '..'",
+                );
+            }
+            let mut env = HashMap::new();
+            if let Some(values) = args.get("env") {
+                let Some(values) = values.as_object() else {
+                    return tools::Outcome::err("process env must be an object of string values");
+                };
+                for (key, value) in values {
+                    let Some(value) = value.as_str() else {
+                        return tools::Outcome::err("process env values must be strings");
+                    };
+                    if key.is_empty()
+                        || key.len() > 256
+                        || value.len() > 32768
+                        || crate::sandbox::policy::is_secret_var(key)
+                    {
+                        return tools::Outcome::err(
+                            "process env contains an invalid or secret-like variable name",
+                        );
+                    }
+                    env.insert(key.clone(), value.to_owned());
+                }
+            }
+            let ready = args.get("ready").and_then(Value::as_object);
+            let readiness = Readiness {
+                log_regex: ready
+                    .and_then(|r| r.get("log_regex"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                tcp_port: ready
+                    .and_then(|r| r.get("tcp_port"))
+                    .and_then(Value::as_u64)
+                    .and_then(|p| u16::try_from(p).ok())
+                    .filter(|p| *p != 0),
+            };
+            if ready.is_some_and(|r| {
+                r.get("log_regex").is_some_and(|v| !v.is_string())
+                    || r.get("tcp_port")
+                        .is_some_and(|_| readiness.tcp_port.is_none())
+            }) {
+                return tools::Outcome::err(
+                    "process ready must contain string log_regex and/or tcp_port 1..65535",
+                );
+            }
+            let ready_timeout = args
+                .get("ready_timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(30_000);
+            if !(1..=120_000).contains(&ready_timeout) {
+                return tools::Outcome::err(
+                    "process ready_timeout_ms must be between 1 and 120000",
+                );
+            }
+            let log_capacity = args
+                .get("log_capacity")
+                .and_then(Value::as_u64)
+                .unwrap_or(64 * 1024);
+            if !(1..=PROCESS_MAX_LOG_CAPACITY).contains(&log_capacity) {
+                return tools::Outcome::err("process log_capacity must be between 1 and 1048576");
+            }
+            let spec = ProcessSpec {
+                name: name.to_owned(),
+                argv: command,
+                env,
+                cwd: PathBuf::from(cwd),
+                readiness,
+                ready_timeout: Duration::from_millis(ready_timeout),
+                log_capacity: log_capacity as usize,
+            };
+            (if action == "start" {
+                supervisor.start(spec)
+            } else {
+                supervisor.restart(spec)
+            })
+            .map(|status| serde_json::json!(status))
+        }
+        "stop" => supervisor
+            .stop(name)
+            .map(|status| serde_json::json!(status)),
+        _ => {
+            return tools::Outcome::err(
+                "process action must be start, status, logs, stop, or restart",
+            )
+        }
+    };
+    match result {
+        Ok(value) => tools::Outcome::ok(value.to_string()),
+        Err(error) => tools::Outcome::err(format!("process {action} failed: {error}")),
+    }
+}
+
 pub(crate) async fn run_turn(
     st: &Arc<State>,
     client: &reqwest::Client,
@@ -114,6 +410,14 @@ pub(crate) async fn run_turn(
     // goal_write_plan flips the phase to plan_ready; checked after the
     // tool-call batch to finalize the turn instead of looping back.
     let mut goal_plan_just_written = false;
+    // Turn-local unified diffs from successful mutating tools — fed to the
+    // watchdog advisor evidence pack so reviews can cite real changes.
+    let mut turn_diffs: Vec<crate::advisor::TurnDiff> = Vec::new();
+    // Soft-continue at most once per turn when advisor emits concern/blocker.
+    let mut advisor_continued = false;
+    // At most one post-mutation checkpoint review per turn when advisor.nudge
+    // is enabled. Natural completion always gets its normal review.
+    let mut advisor_checkpointed = false;
 
     // Ensure system prompt is present; persist every finalized message to the session file.
     let mut init_est_add = 0u64;
@@ -507,7 +811,12 @@ pub(crate) async fn run_turn(
                 };
                 *st.conversation.lock().await = messages.clone();
                 if let Some(p) = cfg.session_file.as_ref() {
-                    session::rewrite(p, &messages);
+                    if let Err(err) =
+                        persist_automatic_compaction(p, &messages, "automatic compaction")
+                    {
+                        st.logger.log("turn_error", json!({ "error": err }));
+                        emit(&Event::new("error").with("message", json!(err)));
+                    }
                 }
                 let after_est = estimate_messages_tokens(&messages);
                 *st.estimated_tokens.lock().await = after_est;
@@ -702,7 +1011,11 @@ pub(crate) async fn run_turn(
             };
             *st.conversation.lock().await = messages.clone();
             if let Some(p) = cfg.session_file.as_ref() {
-                session::rewrite(p, &messages);
+                if let Err(err) = persist_automatic_compaction(p, &messages, "automatic compaction")
+                {
+                    st.logger.log("turn_error", json!({ "error": err }));
+                    emit(&Event::new("error").with("message", json!(err)));
+                }
             }
             let after_est = estimate_messages_tokens(&messages);
             *st.estimated_tokens.lock().await = after_est;
@@ -891,6 +1204,11 @@ pub(crate) async fn run_turn(
             messages.push(msg.clone());
             transient_tails += 1;
         }
+        if let Some(msg) = crate::advisor::open_advisories_message(&st.open_advisories.lock().await)
+        {
+            messages.push(msg);
+            transient_tails += 1;
+        }
         // P0-H1: pre_agent_start — dynamic system-prompt surgery as a transient
         // system message (not persisted). Fail-open on hook errors.
         if let Some(dyn_prompt) = run_pre_agent_start(st).await {
@@ -977,7 +1295,14 @@ pub(crate) async fn run_turn(
                     .hard_limit;
                     *st.conversation.lock().await = messages.clone();
                     if let Some(path) = cfg.session_file.as_ref() {
-                        session::rewrite(path, &messages);
+                        if let Err(err) = persist_automatic_compaction(
+                            path,
+                            &messages,
+                            "provider context compaction",
+                        ) {
+                            st.logger.log("turn_error", json!({ "error": err }));
+                            emit(&Event::new("error").with("message", json!(err)));
+                        }
                     }
                     *st.estimated_tokens.lock().await = after_est;
                     st.invalidate_real_token_baseline().await;
@@ -1142,25 +1467,17 @@ pub(crate) async fn run_turn(
                     // normalized signature so the detector can spot repetition.
                     stuck.record(&name, &args_str);
                     let args: Value = match serde_json::from_str(&args_str) {
-                        Ok(v) => v,
+                        Ok(value) => value,
                         Err(_) => {
-                            // Malformed JSON arguments: the model produced an argument
-                            // string that isn't valid JSON (common with long, quote-heavy
-                            // commands wrapped inside `bulk`'s nested JSON). Return an
-                            // actionable error so the model retries simply, and flag the
-                            // conversation for argument sanitization so the malformed
-                            // assistant message doesn't make the next API request fail
-                            // with "function.arguments must be valid JSON" — which would
-                            // repeat on every turn and brick the session.
                             let msg = format!(
-                                "tool call '{}' produced malformed JSON arguments (the argument string was not valid JSON). This usually happens with long, quote-heavy commands wrapped inside bulk's nested JSON. Re-issue it simply: call bash directly (not via bulk), and for complex logic write a script to a file with write_file then run `bash script.sh` instead of inlining one long command string.",
+                                "tool call '{}' produced malformed JSON arguments (the argument string was not valid JSON). Re-issue the call with valid JSON.",
                                 name
                             );
                             emit(
                                 &Event::new("tool_result")
                                     .with("id", json!(id))
                                     .with("ok", json!(false))
-                                    .with("output", json!(msg)),
+                                    .with("output", json!(msg.clone())),
                             );
                             let tool_result = Message::tool(id.clone(), msg);
                             let est = estimate_message_tokens(&tool_result);
@@ -1234,9 +1551,17 @@ pub(crate) async fn run_turn(
                         tool_context.note_stale_result();
                         return;
                     };
-                    let kind = match st.plugin_manager.tool_config(&name) {
-                        Some(tc) if tc.override_builtin || !tools::is_builtin(&name) => tc.kind,
-                        _ => tools::classify(&name),
+                    let kind = if name == "process"
+                        && matches!(
+                            args.get("action").and_then(Value::as_str),
+                            Some("status" | "logs")
+                        ) {
+                        tools::ToolKind::ReadOnly
+                    } else {
+                        match st.plugin_manager.tool_config(&name) {
+                            Some(tc) if tc.override_builtin || !tools::is_builtin(&name) => tc.kind,
+                            _ => tools::classify(&name),
+                        }
                     };
                     let kind_str: &'static str = match kind {
                         tools::ToolKind::ReadOnly => "readonly",
@@ -1611,8 +1936,6 @@ pub(crate) async fn run_turn(
                                     }
                                 }
                             } else {
-                                // NOPASSWD / cached — run with `sudo -n`
-                                // (non-interactive, never opens /dev/tty).
                                 tokio::select! {
                                     o = tools::execute_bash(cmd, &cfg, timeout_override, tools::SudoAuth::NonInteractive) => o,
                                     _ = cancel.cancelled() => tools::Outcome::err("bash aborted"),
@@ -1629,6 +1952,12 @@ pub(crate) async fn run_turn(
                             o = tools::execute_bulk(&exec_args, &cfg, &bulk_denied) => o,
                             _ = cancel.cancelled() => tools::Outcome::err("bulk aborted"),
                         }
+                    } else if name == "read" {
+                        let session_file = st.cfg.read().await.session_file.clone();
+                        tokio::select! {
+                            o = tools::execute_unified_read(&exec_args, &cfg, session_file.as_deref()) => o,
+                            _ = cancel.cancelled() => tools::Outcome::err("read aborted"),
+                        }
                     } else if name == "fetch" {
                         tokio::select! {
                             o = tools::execute_fetch(&exec_args, &cfg) => o,
@@ -1644,6 +1973,22 @@ pub(crate) async fn run_turn(
                             o = tools::execute_diagnostics(&exec_args, &cfg) => o,
                             _ = cancel.cancelled() => tools::Outcome::err("diagnostics aborted"),
                         }
+                    } else if name == "lsp" {
+                        tokio::select! { o = crate::tooling::ide::execute_lsp(&exec_args, &cfg) => o, _ = cancel.cancelled() => tools::Outcome::err("lsp aborted") }
+                    } else if name == "snapshot_edit" {
+                        tools::execute("snapshot_edit", &exec_args, &cfg)
+                    } else if name == "ast_edit" {
+                        tokio::select! { o = crate::tooling::ide::execute_ast_edit(&exec_args, &cfg) => o, _ = cancel.cancelled() => tools::Outcome::err("ast_edit aborted") }
+                    } else if name == "eval" {
+                        let enabled = st.enabled_deferred_tools.lock().await.contains("eval");
+                        if let Some(error) = eval_gate_error(enabled) {
+                            tools::Outcome::err(error)
+                        } else {
+                            tokio::select! {
+                                o = execute_eval(st, &exec_args, &cfg) => o,
+                                _ = cancel.cancelled() => tools::Outcome::err("eval aborted"),
+                            }
+                        }
                     } else if name == "test_env" {
                         tokio::select! {
                             o = tools::execute_test_env(&exec_args, &cfg) => o,
@@ -1653,6 +1998,20 @@ pub(crate) async fn run_turn(
                         tokio::select! {
                             o = browser::execute_browser(&name, &exec_args, &cfg) => o,
                             _ = cancel.cancelled() => tools::Outcome::err("browser tool aborted"),
+                        }
+                    } else if name == "debug" {
+                        tokio::select! {
+                            o = crate::dap::dispatch(&exec_args, &tool_context) => o,
+                            _ = cancel.cancelled() => tools::Outcome::err("debug aborted"),
+                        }
+                    } else if name == "process" {
+                        let a = exec_args.clone();
+                        let c = cfg.clone();
+                        match tokio::task::spawn_blocking(move || execute_process(&a, &c)).await {
+                            Ok(outcome) => outcome,
+                            Err(error) => {
+                                tools::Outcome::err(format!("process task failed: {error}"))
+                            }
                         }
                     } else if name == "spawn" || name == "subagent" {
                         // When goal mode is active, cap concurrency on parallel
@@ -1683,6 +2042,11 @@ pub(crate) async fn run_turn(
                         .await
                     } else if name == "goal_write_plan" {
                         goal::handle_goal_write_plan(st, &exec_args).await
+                    } else if name == "mcp" {
+                        match crate::mcp::execute(&cfg.mcp_servers, &exec_args, &cancel).await {
+                            Ok(value) => tools::Outcome::ok(value.to_string()),
+                            Err(error) => tools::Outcome::err(error.to_string()),
+                        }
                     } else if name == "load_tools" {
                         handle_load_tools(st, &exec_args, &mut tool_defs).await
                     } else if name == "ask" {
@@ -2086,6 +2450,27 @@ pub(crate) async fn run_turn(
                             if !d.is_empty() {
                                 let path =
                                     exec_args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                                // Capture for advisor evidence pack (capped later).
+                                if turn_diffs.len() < 8 {
+                                    turn_diffs.push(crate::advisor::TurnDiff {
+                                        path: if path.is_empty() {
+                                            name.clone()
+                                        } else {
+                                            path.to_string()
+                                        },
+                                        unified_diff: d.clone(),
+                                    });
+                                }
+                                // A mutation at a reviewed location resolves
+                                // its persistent pin; a later natural review
+                                // can re-open it if the problem remains.
+                                {
+                                    let mut open = st.open_advisories.lock().await;
+                                    crate::advisor::resolve_open_advisories_for_paths(
+                                        &mut open,
+                                        &[path.to_string()],
+                                    );
+                                }
                                 emit(
                                     &Event::new("file_change")
                                         .with("path", json!(path))
@@ -2120,6 +2505,34 @@ pub(crate) async fn run_turn(
                         session::append(p, conv.last().unwrap());
                     }
                     *st.estimated_tokens.lock().await += est;
+                }
+                // Optional mutation checkpoint review. It runs once per turn
+                // only when advisor.nudge is enabled.
+                if !advisor_checkpointed && !turn_diffs.is_empty() {
+                    advisor_checkpointed = st.cfg.read().await.advisor.nudge;
+                    if advisor_checkpointed {
+                        let checkpoint = crate::advisor::review(
+                            st,
+                            crate::advisor::Scope::Main,
+                            &model,
+                            &messages,
+                            &turn_diffs,
+                            &cancel,
+                        )
+                        .await;
+                        if !checkpoint.notes.is_empty() {
+                            let mut open = st.open_advisories.lock().await;
+                            crate::advisor::record_open_advisories(&mut open, &checkpoint.notes);
+                            drop(open);
+                            for note in checkpoint.system_messages(crate::advisor::Scope::Main) {
+                                let est = estimate_message_tokens(&note);
+                                messages.push(note.clone());
+                                let mut conv = st.conversation.lock().await;
+                                conv.push(note);
+                                *st.estimated_tokens.lock().await += est;
+                            }
+                        }
+                    }
                 }
                 // Re-sync after parallel wave / any path that touched conversation
                 // without going through the working buffer.
@@ -2171,15 +2584,19 @@ pub(crate) async fn run_turn(
                 // Loop back for the model to continue.
             }
             _ => {
-                for note in crate::advisor::review(
+                // Watchdog review on natural completion. Fail-open; notes are
+                // advisory. Concern/blocker can soft-continue the executor once
+                // so recommendations are acted on before the turn ends.
+                let review = crate::advisor::review(
                     st,
                     crate::advisor::Scope::Main,
                     &model,
                     &messages,
+                    &turn_diffs,
                     &cancel,
                 )
-                .await
-                {
+                .await;
+                for note in review.system_messages(crate::advisor::Scope::Main) {
                     let est = estimate_message_tokens(&note);
                     messages.push(note.clone());
                     let mut conv = st.conversation.lock().await;
@@ -2188,6 +2605,46 @@ pub(crate) async fn run_turn(
                         session::append(path, conv.last().unwrap());
                     }
                     *st.estimated_tokens.lock().await += est;
+                }
+                if !review.notes.is_empty() {
+                    let mut open = st.open_advisories.lock().await;
+                    crate::advisor::record_open_advisories(&mut open, &review.notes);
+                }
+                if !advisor_continued {
+                    if let Some(cont) = review.soft_continue_message() {
+                        advisor_continued = true;
+                        // Clear answer_delivered so a prior summary cannot
+                        // short-circuit the follow-up work the advisor requested.
+                        answer_delivered = false;
+                        let est = estimate_message_tokens(&cont);
+                        messages.push(cont.clone());
+                        {
+                            let mut conv = st.conversation.lock().await;
+                            conv.push(cont);
+                            if let Some(path) = st.cfg.read().await.session_file.as_ref() {
+                                session::append(path, conv.last().unwrap());
+                            }
+                        }
+                        *st.estimated_tokens.lock().await += est;
+                        emit(&Event::new("info").with(
+                            "message",
+                            json!("advisor soft-continue: address concern/blocker before finish"),
+                        ));
+                        st.logger.log(
+                            "advisor_soft_continue",
+                            json!({
+                                "notes": review.notes.len(),
+                                "severities": review
+                                    .notes
+                                    .iter()
+                                    .map(|n| n.severity.as_str())
+                                    .collect::<Vec<_>>(),
+                            }),
+                        );
+                        // Don't fall through to reflect/done — re-stream so the
+                        // executor can act on the advisory notes.
+                        continue;
+                    }
                 }
                 // Turn complete — or, on a non-trivial turn, inject a reflect
                 // continuation before the real completion (auto-reflect gate).
@@ -2338,5 +2795,170 @@ mod auto_reflect_answer_tests {
         assert!(nudge.contains("finish"));
         assert!(nudge.contains(&AUTO_REFLECT_ANSWER_MIN_CHARS.to_string()));
         assert!(nudge.contains("summary"));
+    }
+}
+
+#[cfg(test)]
+mod eval_contract_tests {
+    use super::*;
+
+    #[test]
+    fn eval_source_replays_successful_history_in_order() {
+        let history = vec!["x = 40".to_string(), "x += 1".to_string()];
+        let source = build_eval_source(&history, "print(x + 1)").unwrap();
+        assert_eq!(source, "x = 40\nx += 1\nprint(x + 1)");
+    }
+
+    #[test]
+    fn eval_source_rejects_oversized_snippet() {
+        let code = "x".repeat(EVAL_MAX_SNIPPET_BYTES + 1);
+        assert!(build_eval_source(&[], &code)
+            .unwrap_err()
+            .contains("exceeds"));
+    }
+    #[test]
+    fn eval_source_bounds_cumulative_replay() {
+        let history = vec!["x".repeat(EVAL_MAX_HISTORY_BYTES)];
+        let source = build_eval_source(&history, "print('new')").unwrap();
+        assert_eq!(source, "print('new')");
+    }
+
+    #[test]
+    fn eval_history_keeps_newest_entries_only() {
+        let mut history = vec![
+            "a".repeat(EVAL_MAX_HISTORY_BYTES / 2),
+            "b".repeat(EVAL_MAX_HISTORY_BYTES / 2),
+            "new".into(),
+        ];
+        trim_eval_history(&mut history);
+        assert_eq!(history.last().map(String::as_str), Some("new"));
+        assert!(history.iter().map(String::len).sum::<usize>() <= EVAL_MAX_HISTORY_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod eval_gate_tests {
+    use super::*;
+
+    #[test]
+    fn eval_is_denied_until_loaded() {
+        let error = eval_gate_error(false).expect("unloaded eval must be denied");
+        assert!(error.contains("load_tools"));
+        assert!(eval_gate_error(true).is_none());
+    }
+}
+
+#[cfg(test)]
+mod eval_command_tests {
+    use super::*;
+
+    #[test]
+    fn eval_source_preserves_literal_shell_metacharacters() {
+        let source = build_eval_source(&[], "console.log('$(touch /tmp/x)')").unwrap();
+        assert!(source.contains("$(touch /tmp/x)"));
+    }
+}
+
+#[cfg(test)]
+mod automatic_compaction_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_persistence_retains_referenced_artifacts() {
+        let dir = std::env::temp_dir().join(format!("turn_compact_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        session::write_job_artifact_record(
+            &path,
+            "job-keep",
+            None,
+            "tool",
+            "completed",
+            0,
+            1,
+            None,
+            "keep",
+        )
+        .unwrap();
+        session::write_job_artifact_record(
+            &path,
+            "job-drop",
+            None,
+            "tool",
+            "completed",
+            0,
+            1,
+            None,
+            "drop",
+        )
+        .unwrap();
+        let messages = vec![Message::assistant("artifact://job-keep.json")];
+        persist_automatic_compaction(&path, &messages, "automatic").unwrap();
+        let report = session::load_report(&path).unwrap();
+        assert_eq!(report.compactions.len(), 1);
+        assert_eq!(
+            report.messages.last().and_then(Message::content_text),
+            Some("artifact://job-keep.json")
+        );
+        assert!(session::read_job_artifact(&path, "job-keep").is_some());
+        assert!(session::read_job_artifact(&path, "job-drop").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod process_tool_tests {
+    use super::*;
+
+    fn config(workspace: &std::path::Path) -> Config {
+        let mut cfg = Config::default();
+        cfg.workspace = workspace.to_path_buf();
+        cfg
+    }
+
+    #[test]
+    fn process_dispatch_rejects_unsafe_cwd_and_secret_env() {
+        let workspace =
+            std::env::temp_dir().join(format!("catalyst-process-tool-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let cfg = config(&workspace);
+        let unsafe_cwd = execute_process(
+            &json!({"action":"start","name":"bad","argv":["true"],"cwd":"../outside"}),
+            &cfg,
+        );
+        assert!(!unsafe_cwd.ok);
+        assert!(unsafe_cwd.output.contains("workspace-relative"));
+        let secret = execute_process(
+            &json!({"action":"start","name":"bad","argv":["true"],"env":{"API_TOKEN":"secret"}}),
+            &cfg,
+        );
+        assert!(!secret.ok);
+        assert!(secret.output.contains("secret-like"));
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loaded_process_dispatch_controls_named_process() {
+        let workspace =
+            std::env::temp_dir().join(format!("catalyst-process-live-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let cfg = config(&workspace);
+        let started = execute_process(
+            &json!({"action":"start","name":"worker","argv":["sh","-c","echo ready; sleep 30"],"ready":{"log_regex":"ready"},"ready_timeout_ms":2000}),
+            &cfg,
+        );
+        assert!(started.ok, "{}", started.output);
+        let status = execute_process(&json!({"action":"status","name":"worker"}), &cfg);
+        assert!(status.ok, "{}", status.output);
+        assert!(status.output.contains("\"state\":\"ready\""));
+        let logs = execute_process(&json!({"action":"logs","name":"worker"}), &cfg);
+        assert!(logs.ok, "{}", logs.output);
+        assert!(logs.output.contains("ready"));
+        let stopped = execute_process(&json!({"action":"stop","name":"worker"}), &cfg);
+        assert!(stopped.ok, "{}", stopped.output);
+        assert!(stopped.output.contains("\"state\":\"exited\""));
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }

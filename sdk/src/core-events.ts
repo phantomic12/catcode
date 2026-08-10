@@ -116,6 +116,15 @@ export const CORE_EVENT_TYPES = [
   "skill_marketplace_results",
   "skill_marketplace_changed",
   "skill_marketplace_error",
+  "job_list",
+  "job_status",
+  "job_wait_result",
+  "job_cancel_requested",
+  "job_cancel_result",
+  "subagent_delivery",
+  "job_wait_timeout",
+  "session_tree",
+  "session_branch",
 ] as const;
 
 export type CoreEventType = (typeof CORE_EVENT_TYPES)[number];

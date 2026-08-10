@@ -350,6 +350,26 @@ pub enum Command {
     /// wakes and continues.
     #[serde(rename = "intercom_reply")]
     IntercomReply { request_id: String, reply: String },
+    /// List live subagent jobs for process-tree inspection.
+    #[serde(rename = "job_list")]
+    JobList,
+    /// Query a live subagent job or its durable artifact after completion.
+    #[serde(rename = "job_status")]
+    JobStatus { run_id: String },
+    /// Cancel a live subagent job. Cancellation is terminal and prevents
+    /// worktree promotion; terminal artifacts remain available for inspection.
+    #[serde(rename = "job_cancel")]
+    JobCancel { run_id: String },
+    #[serde(rename = "job_wait")]
+    JobWait {
+        run_id: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
+    #[serde(rename = "session_tree")]
+    SessionTree,
+    #[serde(rename = "session_branch")]
+    SessionBranch { entry_id: String },
     /// Reply to a pending `ask_request` (the `ask` tool). `answers` is either a
     /// JSON object mapping each question id → its answer string, or JSON null
     /// to indicate the user skipped the questions. The awaiting tool call

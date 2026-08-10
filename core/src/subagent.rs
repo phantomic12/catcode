@@ -877,6 +877,7 @@ pub struct SubagentRun {
 /// `Arc<CancellationToken>` (and its parent chain), so RSS crept up the longer
 /// the process stayed up.
 const MAX_TERMINAL_RUNS: usize = 64;
+const PARKED_AGENT_TTL_MS: u64 = 5 * 60 * 1000;
 
 /// Evict old terminal runs so `subagent_runs` stays bounded. Always keeps every
 /// still-running run; trims terminal runs to the most recent `MAX_TERMINAL_RUNS`
@@ -968,9 +969,26 @@ pub fn execute(
                 .await;
             }
         }
-
-        // Management / control actions.
+        // Management / control actions. A parked completed agent is revived as
+        // a fresh, steerable continuation from its durable transcript.
         if let Some(action) = args.get("action").and_then(|v| v.as_str()) {
+            if action == "resume" {
+                if let Some(outcome) = revive_parked_agent(
+                    &args,
+                    &workspace,
+                    &cfg,
+                    &st,
+                    &client,
+                    &provider,
+                    &parent_model,
+                    depth,
+                    &cancel,
+                )
+                .await
+                {
+                    return outcome;
+                }
+            }
             return handle_action(action, &args, &workspace, &cfg, &st, &cancel).await;
         }
 
@@ -1113,6 +1131,49 @@ pub fn execute(
     }))
 }
 
+async fn revive_parked_agent(
+    args: &Value,
+    workspace: &std::path::Path,
+    cfg: &Config,
+    st: &Arc<State>,
+    client: &reqwest::Client,
+    provider: &ResolvedProvider,
+    parent_model: &str,
+    depth: u32,
+    cancel: &CancellationToken,
+) -> Option<Outcome> {
+    let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+    if id.is_empty() {
+        return None;
+    }
+    let path = st.cfg.read().await.session_file.clone()?;
+    let record = crate::session::load_parked_agents(&path, now_ms())
+        .into_iter()
+        .find(|record| record.run_id == id || record.run_id.starts_with(id))?;
+    let agent = find_agent(&discover_agents(workspace, &cfg.subagents), &record.agent)?.clone();
+    let message = args
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Continue the prior task.");
+    crate::session::remove_parked_agent(&path, &record.run_id).ok()?;
+    let outcome = run_single(
+        st,
+        client,
+        provider,
+        parent_model,
+        &agent,
+        message,
+        &record.run_id,
+        record.parent_run_id,
+        None,
+        ContextKind::Fresh,
+        depth,
+        cancel,
+        None,
+    )
+    .await;
+    Some(outcome)
+}
 fn parse_context(args: &Value, agent: &AgentConfig) -> ContextKind {
     match args.get("context").and_then(|v| v.as_str()) {
         Some("fork") => ContextKind::Fork,
@@ -1147,6 +1208,62 @@ async fn persist_subagent_state(
     }
 }
 
+async fn persist_and_deliver_job(
+    st: &State,
+    run_id: &str,
+    parent_run_id: Option<&str>,
+    state: &str,
+    summary: &str,
+) {
+    let Some(session_path) = st.cfg.read().await.session_file.clone() else {
+        return;
+    };
+    let (task_identity, started_at, ended_at) = st
+        .subagent_runs
+        .lock()
+        .await
+        .get(run_id)
+        .map(|run| {
+            (
+                run.agent.clone().unwrap_or_else(|| run.mode.clone()),
+                run.started_at,
+                run.ended_at.unwrap_or_else(now_ms),
+            )
+        })
+        .unwrap_or_else(|| (run_id.to_string(), now_ms(), now_ms()));
+    let error = (state == "failed" || state == "cancelled").then_some(summary);
+    match crate::session::write_job_artifact_record(
+        &session_path,
+        run_id,
+        parent_run_id,
+        &task_identity,
+        state,
+        started_at,
+        ended_at,
+        error,
+        summary,
+    ) {
+        Ok(path) => {
+            if let Some(parent) = parent_run_id {
+                if let Err(error) =
+                    crate::session::append_parent_delivery(&session_path, parent, run_id, &path)
+                {
+                    emit(&Event::new("error").with("message", json!(error)));
+                    return;
+                }
+            }
+            emit(
+                &Event::new("subagent_delivery")
+                    .with("run_id", json!(run_id))
+                    .with("parent_run_id", json!(parent_run_id))
+                    .with("state", json!(state))
+                    .with("artifact_path", json!(path.display().to_string())),
+            );
+        }
+        Err(error) => emit(&Event::new("error").with("message", json!(error))),
+    }
+}
+
 async fn fail_registered_subagent_setup(
     st: &State,
     run_id: &str,
@@ -1171,6 +1288,7 @@ async fn fail_registered_subagent_setup(
         Some(&message),
     )
     .await;
+    persist_and_deliver_job(st, run_id, parent_run_id, "failed", &message).await;
     emit_subagent_done(
         run_id,
         "failed",
@@ -1346,6 +1464,28 @@ async fn run_single(
     prune_terminal_runs(&mut runs);
     drop(runs);
     if bridge {
+        if final_state == "completed" {
+            if let Some(path) = st.cfg.read().await.session_file.clone() {
+                let snapshot = st.subagent_runs.lock().await.get(run_id).cloned();
+                if let Some(run) = snapshot {
+                    let record = crate::session::ParkedAgentRecord {
+                        run_id: run.id,
+                        target: my_target.clone(),
+                        agent: agent.name.clone(),
+                        parent_run_id: run.parent_run_id,
+                        depth: run.depth,
+                        parked_at_ms: done_ended,
+                        expires_at_ms: done_ended.saturating_add(PARKED_AGENT_TTL_MS),
+                        messages: run
+                            .messages
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone(),
+                    };
+                    let _ = crate::session::store_parked_agent(&path, &record);
+                }
+            }
+        }
         st.intercom.unregister(&my_target);
     }
     let persisted_state = match final_state {
@@ -1359,6 +1499,14 @@ async fn run_single(
         parent_run_id.as_deref(),
         persisted_state,
         done_summary.as_deref(),
+    )
+    .await;
+    persist_and_deliver_job(
+        st,
+        run_id,
+        parent_run_id.as_deref(),
+        final_state,
+        done_summary.as_deref().unwrap_or(""),
     )
     .await;
     emit_subagent_done(
@@ -1445,6 +1593,7 @@ async fn run_agent_inner(
     }
     let workspace = cfg.workspace.clone();
     let tool_defs = subagent_tool_defs(agent, bridge, depth, max_depth);
+    let mut advisor_turn_diffs: Vec<crate::advisor::TurnDiff> = Vec::new();
 
     // --- system prompt ---
     let mut sys = match agent.system_prompt_mode {
@@ -1786,16 +1935,38 @@ async fn run_agent_inner(
             .map(|calls| calls.is_empty())
             .unwrap_or(true)
         {
-            for note in crate::advisor::review(
+            // Subagent reviews get the evidence pack but no soft-continue
+            // (parent finalize should not re-enter the child loop).
+            let review = crate::advisor::review(
                 st,
                 crate::advisor::Scope::Subagent,
                 last_model.as_deref().unwrap_or(parent_model),
                 &sub,
+                &advisor_turn_diffs,
                 cancel,
             )
-            .await
-            {
+            .await;
+            for note in review.system_messages(crate::advisor::Scope::Subagent) {
                 sub.push(note);
+            }
+            // Bubble actionable watchdog findings to the parent-facing result;
+            // the parent can then decide whether to fix or explain them.
+            if !review.notes.is_empty() {
+                let actionable = review
+                    .notes
+                    .iter()
+                    .filter(|n| n.severity.requires_action())
+                    .map(|n| n.steering_line())
+                    .collect::<Vec<_>>();
+                if !actionable.is_empty() {
+                    let mut text = String::from("\n\nAdvisor follow-ups from subagent review:\n");
+                    for item in actionable.iter().take(4) {
+                        text.push_str("- ");
+                        text.push_str(item);
+                        text.push('\n');
+                    }
+                    sub.push(Message::system(text));
+                }
             }
         }
 
@@ -1909,6 +2080,22 @@ async fn run_agent_inner(
                 )
                 .await
             };
+
+            if outcome.ok {
+                if let Some(diff) = outcome.diff.as_ref().filter(|d| !d.is_empty()) {
+                    if advisor_turn_diffs.len() < 8 {
+                        let path = argsv
+                            .get("path")
+                            .or_else(|| argsv.get("to"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&name);
+                        advisor_turn_diffs.push(crate::advisor::TurnDiff {
+                            path: path.to_string(),
+                            unified_diff: diff.clone(),
+                        });
+                    }
+                }
+            }
 
             emit_subagent_progress(
                 run_id,
@@ -2644,22 +2831,37 @@ fn nonempty_run_summary(output: &str) -> String {
 /// When finish (or final assistant) has empty prose, fall back to the last
 /// non-empty assistant message in the subagent history; never return "".
 fn finalize_subagent_text(current: Option<&str>, history: &[crate::message::Message]) -> String {
-    let cur = current.unwrap_or("").trim();
-    if !cur.is_empty() {
-        return cur.to_string();
-    }
-    for m in history.iter().rev() {
-        if m.role() != "assistant" {
-            continue;
-        }
-        if let Some(t) = m.content_text() {
-            let t = t.trim();
-            if !t.is_empty() {
-                return t.to_string();
+    let mut summary = current.unwrap_or("").trim().to_string();
+    if summary.is_empty() {
+        for m in history.iter().rev() {
+            if m.role() != "assistant" {
+                continue;
+            }
+            if let Some(t) = m.content_text() {
+                let t = t.trim();
+                if !t.is_empty() {
+                    summary = t.to_string();
+                    break;
+                }
             }
         }
     }
-    "(step finished with no written summary)".to_string()
+    if summary.is_empty() {
+        summary = "(step finished with no written summary)".to_string();
+    }
+    // Actionable watchdog findings are intentionally bubbled into the
+    // parent-facing result so delegated work cannot hide an unresolved issue.
+    for m in history {
+        if m.role() == "system" {
+            if let Some(t) = m.content_text() {
+                if t.starts_with("Advisor follow-ups from subagent review:") {
+                    summary.push_str("\n\n");
+                    summary.push_str(t.trim());
+                }
+            }
+        }
+    }
+    summary
 }
 
 fn emit_subagent_done(
@@ -3047,6 +3249,11 @@ async fn run_parallel(
     }
     collected.sort_by_key(|(i, _)| *i);
     let all_ok = collected.iter().all(|(_, o)| o.ok);
+    let delivery_summary = collected
+        .iter()
+        .map(|(index, outcome)| format!("task {}: {}", index + 1, outcome.output))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // Promote successful worktrees into the main workspace, then clean up.
     // Never promote on cancel even if a child reported ok before the abort (H13).
@@ -3092,6 +3299,14 @@ async fn run_parallel(
     }
     prune_terminal_runs(&mut runs);
     drop(runs);
+    persist_and_deliver_job(
+        st,
+        &run_id,
+        parent_run_id.as_deref(),
+        final_state,
+        &delivery_summary,
+    )
+    .await;
     let persisted_state = match final_state {
         "completed" => crate::session::RunState::Completed,
         "cancelled" => crate::session::RunState::Cancelled,
@@ -3320,6 +3535,14 @@ async fn run_chain(
     }
     prune_terminal_runs(&mut runs);
     drop(runs);
+    persist_and_deliver_job(
+        st,
+        &run_id,
+        chain_parent_run_id.as_deref(),
+        final_state,
+        &outcome.output,
+    )
+    .await;
     let persisted_state = match final_state {
         "completed" => crate::session::RunState::Completed,
         "cancelled" => crate::session::RunState::Cancelled,

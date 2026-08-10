@@ -110,11 +110,10 @@ var (
 	userRailStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(c.accent))  // accent left rail on user turns
 	composerBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.railDim)) // tonal composer border
 
-	// --- Redesign primitives (rebuilt per theme) ---
-	// Border-only cards: no solid fill so the terminal background shows
-	// through after the text instead of a grey slab.
+	// Shared structural primitives. Surfaces establish depth; rails establish
+	// grouping. Neither introduces colors beyond the active authored palette.
 	cardStyle     = lipgloss.NewStyle().BorderStyle(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(c.railDim)).Padding(0, 1)
-	recessedStyle = lipgloss.NewStyle().BorderStyle(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color(c.railDim)).Padding(0, 1)
+	recessedStyle = lipgloss.NewStyle().BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color(c.railDim)).Padding(0, 1)
 	hairlineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(c.railDim))
 )
 

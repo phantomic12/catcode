@@ -1,19 +1,25 @@
 {
   "process_spawns": {
     "core/src/browser/headless_display.rs": 1,
+    "core/src/browser/chromium_cdp.rs": 1,
     "core/src/change_coupling.rs": 1,
+    "core/src/dap.rs": 3,
+    "core/src/mcp.rs": 1,
     "core/src/oauth.rs": 1,
     "core/src/plugins.rs": 5,
+    "core/src/runtime/process_supervisor.rs": 1,
     "core/src/test_env.rs": 2,
     "core/src/tooling/builtin/git.rs": 1,
+    "core/src/tooling/ide.rs": 1,
     "core/src/tools.rs": 3,
     "core/src/sandbox/backend.rs": 1
   },
   "task_spawns": {
-    "core/src/fetch_tool.rs": 1,
+    "core/src/dap.rs": 4,
+    "core/src/fetch_tool.rs": 2,
     "core/src/goal.rs": 1,
     "core/src/agent/goal_runtime.rs": 3,
-    "core/src/agent/turn_loop.rs": 2,
+    "core/src/agent/turn_loop.rs": 3,
     "core/src/commands/dispatcher.rs": 8,
     "core/src/main.rs": 6,
     "core/src/provider.rs": 4,

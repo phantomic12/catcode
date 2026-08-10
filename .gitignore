@@ -108,3 +108,7 @@ sdk/node_modules/
 core/.config
 .catalyst-code/plugins/engraphis-memory/
 .catalyst-code/plugins/deep-research/
+
+# Go test binary (go test -c output)
+tui/catalyst-code-tui.test
+tui/*.test

@@ -13,6 +13,123 @@ pub use crate::fetch_tool::execute_fetch;
 pub use crate::search_tool::execute_web_search;
 pub use crate::test_env::execute_test_env;
 
+/// Read a bounded resource through the deferred `runtime` group. Workspace
+/// paths retain the exact paging semantics of `read_file`; every other scheme
+/// is resolved by an owned store rather than passed to a shell.
+pub async fn execute_unified_read(
+    args: &Value,
+    cfg: &Config,
+    session_file: Option<&std::path::Path>,
+) -> Outcome {
+    const ARCHIVE_ENTRY_MAX: u64 = 2 * 1024 * 1024;
+    const ARCHIVE_MAX_ENTRIES: usize = 256;
+
+    let Some(uri) = args
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return Outcome::err("read requires string field 'path'");
+    };
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        return crate::fetch_tool::execute_fetch(&json!({"url": uri}), cfg).await;
+    }
+    if let Some(name) = uri.strip_prefix("skill://") {
+        if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+            return Outcome::err("read: unsafe skill URI");
+        }
+        return crate::subagent::discover_skills_full(&cfg.workspace)
+            .into_iter()
+            .find(|skill| skill.name == name)
+            .map(|skill| Outcome::ok(skill.body))
+            .unwrap_or_else(|| Outcome::err(format!("read: skill '{name}' was not found")));
+    }
+    if let Some(id) = uri.strip_prefix("memory://") {
+        if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+            return Outcome::err("read: unsafe memory URI");
+        }
+        return crate::memory::get_memory(&cfg.workspace, id)
+            .map(|memory| Outcome::ok(memory.content))
+            .unwrap_or_else(|e| Outcome::err(format!("read: memory '{id}' unavailable: {e}")));
+    }
+    if let Some(run_id) = uri.strip_prefix("artifact://") {
+        if run_id.is_empty()
+            || run_id.len() > 128
+            || !run_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Outcome::err("read: unsafe artifact URI");
+        }
+        let Some(session_file) = session_file else {
+            return Outcome::err(
+                "read: artifact resolution is unavailable outside an owned session",
+            );
+        };
+        return crate::session::read_job_artifact(session_file, run_id)
+            .map(|artifact| {
+                Outcome::ok(smart_truncate(
+                    &artifact.to_string(),
+                    cfg.max_read_bytes as usize,
+                ))
+            })
+            .unwrap_or_else(|| {
+                Outcome::err(format!("read: owned artifact '{run_id}' was not found"))
+            });
+    }
+    if let Some((archive, entry)) = uri.split_once("!/") {
+        if entry.is_empty()
+            || entry.starts_with('/')
+            || entry.contains('\\')
+            || entry.split('/').any(|part| part == "..")
+        {
+            return Outcome::err("read: unsafe archive entry path");
+        }
+        let archive_path = match resolve_ws(cfg, archive) {
+            Ok(path) => path,
+            Err(e) => return Outcome::err(e),
+        };
+        let file = match std::fs::File::open(&archive_path) {
+            Ok(file) => file,
+            Err(e) => return Outcome::err(format!("read: archive {archive:?} failed: {e}")),
+        };
+        let mut zip = match zip::ZipArchive::new(file) {
+            Ok(zip) => zip,
+            Err(e) => {
+                return Outcome::err(format!(
+                    "read: {archive:?} is not a supported zip archive: {e}"
+                ))
+            }
+        };
+        if zip.len() > ARCHIVE_MAX_ENTRIES {
+            return Outcome::err(format!(
+                "read: archive has {} entries (max {ARCHIVE_MAX_ENTRIES})",
+                zip.len()
+            ));
+        }
+        let mut member = match zip.by_name(entry) {
+            Ok(member) => member,
+            Err(_) => return Outcome::err(format!("read: archive entry {entry:?} was not found")),
+        };
+        if member.is_dir()
+            || member.size() > ARCHIVE_ENTRY_MAX
+            || member.size() > cfg.max_read_bytes
+        {
+            return Outcome::err(format!(
+                "read: archive entry exceeds {} byte limit",
+                ARCHIVE_ENTRY_MAX.min(cfg.max_read_bytes)
+            ));
+        }
+        use std::io::Read;
+        let mut body = String::with_capacity(member.size() as usize);
+        if let Err(e) = member.read_to_string(&mut body) {
+            return Outcome::err(format!("read: archive entry is not UTF-8 text: {e}"));
+        }
+        return Outcome::ok(body);
+    }
+    read_file(uri, args, cfg)
+}
+
 /// Description shown to the model for the `bash` tool. OS-selected so the
 /// model emits matching syntax: PowerShell on Windows, bash on Unix. The
 /// Model-facing description of the `bash` tool. When sandboxing is enabled the
@@ -110,8 +227,8 @@ pub fn execute(name: &str, args: &Value, cfg: &Config) -> Outcome {
         "goal_write_plan" => Outcome::err(
             "goal_write_plan must be dispatched through handle_goal_write_plan (async, goal mode only)",
         ),
-        "bash" => Outcome::err("bash must be dispatched through execute_bash (async)"),
-        "test_env" => Outcome::err("test_env must be dispatched through execute_test_env (async)"),
+        "snapshot_edit" => crate::tooling::ide::execute_snapshot_edit(args, cfg),
+        "ast_edit" => Outcome::err("ast_edit must be dispatched asynchronously"),
         "bulk" => Outcome::err("bulk must be dispatched through execute_bulk (async)"),
         other => Outcome::err(format!("unknown tool: {other}")),
     }
@@ -207,7 +324,7 @@ fn read_file(input: &str, args: &Value, cfg: &Config) -> Outcome {
             AUTO_WINDOW.min(lines.len())
         } else {
             match limit {
-                Some(n) => (start + n).min(lines.len()),
+                Some(n) => start.saturating_add(n).min(lines.len()),
                 None => lines.len(),
             }
         };
@@ -2991,6 +3108,7 @@ fn collections_tool(args: &Value, cfg: &Config) -> Outcome {
                 return Outcome::err("collections search requires 'query'");
             }
             let limit = args
+
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize)
@@ -4715,5 +4833,28 @@ mod tests {
             "error should mention sudo: {}",
             o.output
         );
+    }
+
+    #[tokio::test]
+    async fn unified_read_handles_workspace_and_rejects_uri_escapes() {
+        let (_root, cfg) = tmp_ws();
+        fs::write(cfg.workspace.join("note.txt"), "safe\n").unwrap();
+        let file = execute_unified_read(&json!({"path":"note.txt"}), &cfg, None).await;
+        assert!(file.ok, "{}", file.output);
+        assert_eq!(file.output, "safe\n");
+        for path in [
+            "../escape",
+            "memory://../secret",
+            "skill://../secret",
+            "artifact://../secret",
+            "archive.zip!/../secret",
+        ] {
+            let outcome = execute_unified_read(&json!({"path": path}), &cfg, None).await;
+            assert!(
+                !outcome.ok,
+                "{path} unexpectedly succeeded: {}",
+                outcome.output
+            );
+        }
     }
 }

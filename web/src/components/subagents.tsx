@@ -16,7 +16,7 @@
 // (intercom.tsx); this panel is for observation, not reply.
 
 import { useEffect, useState } from "react";
-import type { AgentInfo, SubagentChatItem, SubagentRunView } from "@/lib/types";
+import type { AgentInfo, ProcessLogsView, ProcessStatusView, SessionTreeSnapshot, SubagentChatItem, SubagentRunView } from "@/lib/types";
 import {
   formatMs,
   formatTokens,
@@ -70,6 +70,64 @@ function StateBadge({ state }: { state: string }) {
       />
       <span className="text-[11px] font-medium">{s.label}</span>
     </span>
+  );
+}
+
+function sessionTreeSnapshot(tree: unknown): SessionTreeSnapshot | null {
+  if (!tree || typeof tree !== "object") return null;
+  const value = tree as Partial<SessionTreeSnapshot>;
+  return Array.isArray(value.entries) ? value as SessionTreeSnapshot : null;
+}
+
+function SessionTreeView({ tree, onBranch }: { tree: unknown; onBranch?: (entryId: string) => void }) {
+  const snapshot = sessionTreeSnapshot(tree);
+  if (!snapshot) return null;
+  const active = snapshot.leaf ?? null;
+  const ancestry = new Set(snapshot.ancestry ?? []);
+  const siblings = new Set(snapshot.siblings ?? []);
+  return (
+    <section className="mb-3 rounded-sm border border-ink-800 bg-ink-900 px-3 py-2.5" aria-label="Session tree">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-[10px] font-mono uppercase tracking-wider text-ink-500">Session tree</span>
+        {active && <span className="font-mono text-[10px] text-accent-soft">active {active}</span>}
+      </div>
+      <div className="space-y-1">
+        {snapshot.entries.map((entry) => {
+          const isActive = entry.id === active;
+          const role = isActive ? "active leaf" : ancestry.has(entry.id) ? "ancestry" : siblings.has(entry.id) ? "sibling" : "branch";
+          return (
+            <button key={entry.id} onClick={() => onBranch?.(entry.id)} className={`flex w-full items-center gap-2 rounded-sm px-2 py-1 text-left text-[11px] ${isActive ? "bg-accent/15 text-accent-soft" : "text-ink-300 hover:bg-ink-850"}`}>
+              <span className="w-14 shrink-0 font-mono text-[9px] uppercase text-ink-600">{role}</span>
+              <span className="min-w-0 flex-1 truncate">{entry.title || entry.id}</span>
+              {entry.summary && <span className="max-w-[45%] truncate text-ink-600">{entry.summary}</span>}
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+export function ProcessPanel({ processes, logs, onLogs, onStop }: { processes: Record<string, ProcessStatusView>; logs: Record<string, ProcessLogsView>; onLogs?: (name: string) => void; onStop?: (name: string) => void }) {
+  const list = Object.values(processes);
+  if (list.length === 0) return null;
+  return (
+    <section className="mb-3 rounded-sm border border-ink-800 bg-ink-900 px-3 py-2.5" aria-label="Project processes">
+      <div className="mb-2 text-[10px] font-mono uppercase tracking-wider text-ink-500">Project processes</div>
+      <div className="space-y-2">
+        {list.map((process) => (
+          <div key={process.name} className="border-l-2 border-ink-700 pl-2">
+            <div className="flex items-center gap-2 text-[11px]">
+              <span className={`h-1.5 w-1.5 ${process.state === "ready" ? "bg-success" : process.state === "starting" ? "bg-warning" : "bg-ink-600"}`} />
+              <code className="text-ink-200">{process.name}</code>
+              <span className="text-ink-600">pid {process.pid} · {process.state}</span>
+              <button className="ml-auto text-accent-soft" onClick={() => onLogs?.(process.name)}>request logs</button>
+              {process.state !== "exited" && <button className="text-danger" onClick={() => onStop?.(process.name)}>request stop</button>}
+            </div>
+            {logs[process.name] && <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap bg-ink-950 p-2 font-mono text-[10px] text-ink-400">{logs[process.name].truncated && "[earlier output truncated]\n"}{logs[process.name].text}</pre>}
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -280,20 +338,30 @@ export function RunDetail({ run, onBack }: { run: SubagentRunView; onBack: () =>
 
 interface PanelProps {
   runs: Record<string, SubagentRunView>;
-  /** Discoverable agents from core `agents` events (builtin + user + project). */
+  jobs?: Record<string, { runId: string; parentRunId?: string | null; state: string; summary?: string | null }>;
+  processes?: Record<string, ProcessStatusView>;
+  processLogs?: Record<string, ProcessLogsView>;
+  sessionTree?: unknown | null;
   agents?: AgentInfo[];
   onRefreshAgents?: () => void;
+  onRefreshJobs?: () => void;
+  onJobStatus?: (runId: string) => void;
+  onJobWait?: (runId: string) => void;
+  onJobCancel?: (runId: string) => void;
+  onBranch?: (entryId: string) => void;
+  onProcessLogs?: (name: string) => void;
+  onProcessStop?: (name: string) => void;
   onClose: () => void;
 }
 
-export function SubagentsPanel({ runs, agents, onRefreshAgents, onClose }: PanelProps) {
+export function SubagentsPanel({ runs, jobs = {}, processes = {}, processLogs = {}, sessionTree, agents, onRefreshAgents, onRefreshJobs, onJobStatus, onJobWait, onJobCancel, onBranch, onProcessLogs, onProcessStop, onClose }: PanelProps) {
   const closeRef = useOutsideClose(onClose);
   const trapRef = useFocusTrap<HTMLDivElement>();
   useBodyScrollLock();
   const [selectedId, setSelectedId] = useState<string | null>(null);
-
   useEffect(() => {
     onRefreshAgents?.();
+    onRefreshJobs?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -373,6 +441,30 @@ export function SubagentsPanel({ runs, agents, onRefreshAgents, onClose }: Panel
                 <code className="font-mono text-ink-500">subagent</code> tool.
               </p>
             </div>
+            {Object.keys(jobs).length > 0 && (
+              <div className="mb-3 border-b border-ink-800 pb-3">
+                <div className="mb-2 flex items-center justify-between text-[10px] font-mono uppercase tracking-wider text-ink-500">
+                  <span>Durable jobs</span>
+                  <button className="text-accent-soft" onClick={onRefreshJobs}>Refresh</button>
+                </div>
+                {Object.values(jobs).map((job) => (
+                  <div key={job.runId} className="flex items-center gap-2 py-1 text-[12px]" style={{ paddingLeft: job.parentRunId ? 16 : 0 }}>
+                    <code className="text-ink-300">{job.runId}</code>
+                    <span className="text-ink-500">{job.state}</span>
+                    <button className="text-accent-soft" onClick={() => onJobStatus?.(job.runId)}>status</button>
+                    {job.state === "running" && <button className="text-warning" onClick={() => onJobWait?.(job.runId)}>wait</button>}
+                    {job.state === "running" && <button className="text-danger" onClick={() => onJobCancel?.(job.runId)}>cancel</button>}
+                  </div>
+                ))}
+              </div>
+            )}
+            <ProcessPanel
+              processes={processes}
+              logs={processLogs}
+              onLogs={onProcessLogs}
+              onStop={onProcessStop}
+            />
+            <SessionTreeView tree={sessionTree} onBranch={onBranch} />
             {list.length === 0 ? (
               <div className="px-3 py-8 text-center text-[12px] text-ink-600">
                 No runs yet. Delegated work will appear here live.

@@ -546,6 +546,93 @@ pub fn save_memory_scoped_with_importance(
     invalidate_scan_cache();
     Ok(path)
 }
+/// Mutate an existing memory using the latest on-disk entry while holding both
+/// the in-process writer lock and the store's cross-process directory lock.
+/// Callers that rewrite lifecycle/evidence metadata must use this instead of a
+/// previously scanned snapshot, which can silently undo a concurrent append.
+pub(crate) fn update_memory_scoped(
+    workspace: &Path,
+    scope: Scope,
+    id: &str,
+    update: impl FnOnce(&mut MemoryEntry),
+) -> Result<PathBuf, String> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let store = Store::new(Store::default_root());
+    let dir = store.dir_scoped(workspace, scope);
+    let slug = slugify(id);
+    if slug.is_empty() {
+        return Err("memory id/name must contain at least one alphanumeric character".into());
+    }
+    let path = dir.join(format!("{slug}.md"));
+    let _lock = crate::fsutil::FileLock::acquire(&dir.join(".lock"))
+        .map_err(|e| format!("failed to acquire memory lock: {e}"))?;
+    let mut entry = parse_memory_file(&path)
+        .ok_or_else(|| format!("memory '{id}' is missing or unreadable"))?;
+    entry.scope = scope;
+    update(&mut entry);
+    write_memory_file(&path, &entry, &entry.content, &entry.description)
+        .map_err(|e| format!("failed to update memory: {e}"))?;
+    rebuild_index(&dir, scope)?;
+    drop(_lock);
+    drop(_guard);
+    invalidate_scan_cache();
+    Ok(path)
+}
+
+/// Replace content and merge all schema-v2 metadata from an absorbed memory.
+/// Scalar provenance is retained from the survivor (or filled when absent),
+/// while references/evidence and counters are accumulated without duplicates.
+pub(crate) fn merge_memory_scoped(
+    workspace: &Path,
+    scope: Scope,
+    survivor: &str,
+    absorbed: &MemoryEntry,
+    content: String,
+    description: String,
+    mem_type: String,
+) -> Result<PathBuf, String> {
+    update_memory_scoped(workspace, scope, survivor, |entry| {
+        entry.content = content;
+        entry.description = description;
+        entry.mem_type = mem_type;
+        entry.schema_version = entry.schema_version.max(absorbed.schema_version);
+        entry.source_session = entry
+            .source_session
+            .clone()
+            .or_else(|| absorbed.source_session.clone());
+        entry.source_run = entry
+            .source_run
+            .clone()
+            .or_else(|| absorbed.source_run.clone());
+        entry.created_at = match (entry.created_at, absorbed.created_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        entry.confidence = entry.confidence.max(absorbed.confidence);
+        entry.support_count = entry.support_count.saturating_add(absorbed.support_count);
+        entry.contradiction_count = entry
+            .contradiction_count
+            .saturating_add(absorbed.contradiction_count);
+        entry.last_verified_at = match (entry.last_verified_at, absorbed.last_verified_at) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        if entry.last_verified_commit.is_none() {
+            entry.last_verified_commit = absorbed.last_verified_commit.clone();
+        }
+        extend_unique(&mut entry.ref_files, &absorbed.ref_files);
+        extend_unique(&mut entry.ref_symbols, &absorbed.ref_symbols);
+        extend_unique(&mut entry.evidence_episodes, &absorbed.evidence_episodes);
+    })
+}
+
+pub(crate) fn extend_unique(target: &mut Vec<String>, additions: &[String]) {
+    for value in additions {
+        if !value.trim().is_empty() && !target.iter().any(|v| v == value) {
+            target.push(value.clone());
+        }
+    }
+}
 
 /// Append `new_facts` to an existing memory (same name/slug), capped to
 /// `max_bytes` by trimming the oldest facts from the front (on a line boundary).
@@ -672,24 +759,24 @@ fn append_memory_into(
             &combined[start..]
         );
     }
-    // Appending preserves the existing memory's type/description/importance;
-    // the caller's values only apply when creating a NEW memory, so `append`
-    // can never silently wipe a memory's metadata (the tool defaults
-    // description="", type="note").
-    let (final_type, final_desc, final_importance) = match &existing {
-        Some(m) if !m.content.is_empty() => {
-            (m.mem_type.as_str(), m.description.as_str(), m.importance)
-        }
-        _ => (mem_type, description, Importance::Normal),
-    };
+    // Preserve every parsed field when appending to an existing memory. The
+    // generic save builder creates fresh metadata and would resurrect deprecated
+    // entries while dropping provenance, references, and evidence.
+    if let Some(mut entry) = existing {
+        entry.content = combined.clone();
+        write_memory_file(&path, &entry, &combined, &entry.description)
+            .map_err(|e| format!("failed to append memory: {e}"))?;
+        rebuild_index(&dir, scope)?;
+        return Ok(path);
+    }
     store.save_scoped_with_importance(
         workspace,
         scope,
         name,
         &combined,
-        final_type,
-        final_desc,
-        final_importance,
+        mem_type,
+        description,
+        Importance::Normal,
     )
 }
 
@@ -879,6 +966,11 @@ fn write_memory_file(
             v2.push_str(&e.ref_symbols.join(", "));
             v2.push('\n');
         }
+        if !e.evidence_episodes.is_empty() {
+            v2.push_str("episodes: ");
+            v2.push_str(&e.evidence_episodes.join(", "));
+            v2.push('\n');
+        }
     }
     let body = format!(
         "---\nname: {}\ndescription: {}\ntype: {}\n{pin_line}{importance_line}{dep_line}{sup_line}{v2}---\n{}",
@@ -940,7 +1032,6 @@ pub fn mark_memory_deprecated(
     id: &str,
     superseded_by: Option<&str>,
 ) -> Result<(), String> {
-    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let store = Store::new(Store::default_root());
     let dir = store.dir_scoped(workspace, scope);
     let slug = slugify(id);
@@ -954,26 +1045,16 @@ pub fn mark_memory_deprecated(
             scope.as_str()
         ));
     }
-    let entry = parse_memory_file(&path).ok_or_else(|| format!("memory '{id}' is unreadable"))?;
-    let mut new_entry = entry.clone();
-    new_entry.deprecated = true;
-    new_entry.status = MemoryStatus::Deprecated;
-    new_entry.schema_version = new_entry.schema_version.max(2);
-    new_entry.superseded_by = superseded_by
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from);
-    write_memory_file(
-        &path,
-        &new_entry,
-        &new_entry.content,
-        &new_entry.description,
-    )
-    .map_err(|e| format!("failed to write memory: {e}"))?;
-    rebuild_index(&dir, scope)?;
-    drop(_guard);
-    invalidate_scan_cache();
-    Ok(())
+    update_memory_scoped(workspace, scope, id, |entry| {
+        entry.deprecated = true;
+        entry.status = MemoryStatus::Deprecated;
+        entry.schema_version = entry.schema_version.max(2);
+        entry.superseded_by = superseded_by
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+    })
+    .map(|_| ())
 }
 
 /// Mark a memory deprecated, searching both scopes (workspace first). Used by
@@ -1508,6 +1589,13 @@ fn parse_memory_file(path: &Path) -> Option<MemoryEntry> {
             }
             "symbols" | "ref_symbols" => {
                 ref_symbols.extend(
+                    val.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                );
+            }
+            "episodes" | "evidence_episodes" => {
+                evidence_episodes.extend(
                     val.split(',')
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty()),
@@ -2493,6 +2581,38 @@ mod tests {
         assert_eq!(entries[0].mem_type, "convention");
         assert!(entries[0].content.contains("body"));
         assert!(entries[0].content.contains("more facts"));
+    }
+
+    #[test]
+    fn append_preserves_schema_v2_metadata_and_evidence() {
+        let root = tmp_root();
+        let ws = fake_workspace("append_v2");
+        let store = test_store(&root);
+        let dir = store.dir(&ws);
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = "---\nname: learned-rule\ndescription: durable\ntype: convention\nschema_version: 2\nsource_session: session-1\nsource_run: run-2\ncreated_at: 123\nstatus: candidate\nconfidence: 0.73\nsupport_count: 2\ncontradiction_count: 1\nlast_verified_at: 456\nlast_verified_commit: abc123\nfiles: core/src/memory.rs\nsymbols: append_memory\nepisodes: ep-1, ep-2\n---\nfirst fact\n";
+        std::fs::write(dir.join("learned-rule.md"), md).unwrap();
+
+        append_memory_into(
+            &store,
+            &ws,
+            Scope::Workspace,
+            "learned-rule",
+            "second fact",
+            "note",
+            "ignored",
+            16 * 1024,
+        )
+        .unwrap();
+        let e = parse_memory_file(&dir.join("learned-rule.md")).unwrap();
+        assert_eq!(e.status, MemoryStatus::Candidate);
+        assert_eq!(e.source_session.as_deref(), Some("session-1"));
+        assert_eq!(e.source_run.as_deref(), Some("run-2"));
+        assert_eq!(e.created_at, Some(123));
+        assert_eq!(e.evidence_episodes, vec!["ep-1", "ep-2"]);
+        assert_eq!(e.ref_files, vec!["core/src/memory.rs"]);
+        assert!(e.content.contains("first fact"));
+        assert!(e.content.contains("second fact"));
     }
 
     #[test]

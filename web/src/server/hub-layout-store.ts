@@ -1,5 +1,6 @@
 // Server-side hub layout store — account-scoped persistence for project tabs,
-// last-viewed chat sessions, and git sidebar chrome.
+// last-viewed chat sessions, and panel chrome (git left / preview right /
+// terminal bottom sizes + visibility).
 //
 // Chat sessions themselves live as on-disk JSONL + live catcode-core processes
 // in the HarnessBridge. This store only remembers which projects are open and
@@ -13,7 +14,15 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export const HUB_LAYOUT_VERSION = 2 as const;
+export const HUB_LAYOUT_VERSION = 3 as const;
+
+export interface HubTerminalSession {
+  id: string;
+  title: string;
+  cwd: string;
+  alive: boolean;
+  exitCode: number | null;
+}
 
 export interface HubPersistState {
   version: typeof HUB_LAYOUT_VERSION;
@@ -25,9 +34,20 @@ export interface HubPersistState {
   active: string | null;
   /** Last-viewed chat session file (.jsonl) per project path. */
   sessions: Record<string, string>;
-  /** Git sidebar visibility + width. */
+  /** Git sidebar (LEFT) visibility + width. */
   gitOpen: boolean;
   gitWidth: number;
+  /** Terminal panel (BOTTOM) visibility + height. */
+  terminalOpen: boolean;
+  terminalHeight: number;
+  /** Preview panel (RIGHT) visibility + width. */
+  previewOpen: boolean;
+  previewWidth: number;
+  /** Per-project terminal session chrome (ids only; PTYs live in the server). */
+  terminalSessions: Record<string, HubTerminalSession[]>;
+  activeTerminal: Record<string, string | null>;
+  /** Per-project preview URL. */
+  previewUrls: Record<string, string>;
 }
 
 interface HubLayoutFile {
@@ -61,11 +81,18 @@ export function defaultHubState(): HubPersistState {
     active: null,
     sessions: {},
     gitOpen: true,
-    gitWidth: 320,
+    gitWidth: 280,
+    terminalOpen: false,
+    terminalHeight: 260,
+    previewOpen: false,
+    previewWidth: 420,
+    terminalSessions: {},
+    activeTerminal: {},
+    previewUrls: {},
   };
 }
 
-/** Sanitize untrusted JSON into a HubPersistState (v1 terminal → v2 chat). */
+/** Sanitize untrusted JSON into a HubPersistState (v1/v2 → v3 panel chrome). */
 export function sanitizeHubState(raw: unknown): HubPersistState {
   const base = defaultHubState();
   if (!raw || typeof raw !== "object") return base;
@@ -90,6 +117,33 @@ export function sanitizeHubState(raw: unknown): HubPersistState {
     }
   }
 
+  const terminalSessions: Record<string, HubTerminalSession[]> = {};
+  for (const [workspace, value] of Object.entries(parsed.terminalSessions ?? {})) {
+    if (!Array.isArray(value)) continue;
+    terminalSessions[workspace] = value
+      .filter((s): s is HubTerminalSession =>
+        !!s &&
+        typeof s === "object" &&
+        typeof (s as HubTerminalSession).id === "string" &&
+        typeof (s as HubTerminalSession).title === "string" &&
+        typeof (s as HubTerminalSession).cwd === "string" &&
+        typeof (s as HubTerminalSession).alive === "boolean" &&
+        ((s as HubTerminalSession).exitCode === null ||
+          typeof (s as HubTerminalSession).exitCode === "number"),
+      )
+      .slice(0, 16);
+  }
+
+  const activeTerminal: Record<string, string | null> = {};
+  for (const [k, v] of Object.entries(parsed.activeTerminal ?? {})) {
+    if (v === null || typeof v === "string") activeTerminal[k] = v;
+  }
+
+  const previewUrls: Record<string, string> = {};
+  for (const [k, v] of Object.entries(parsed.previewUrls ?? {})) {
+    if (typeof v === "string" && v.length <= 2048) previewUrls[k] = v;
+  }
+
   const active =
     typeof parsed.active === "string" && tabPaths.includes(parsed.active)
       ? parsed.active
@@ -104,8 +158,21 @@ export function sanitizeHubState(raw: unknown): HubPersistState {
     gitOpen: typeof parsed.gitOpen === "boolean" ? parsed.gitOpen : true,
     gitWidth:
       typeof parsed.gitWidth === "number" && Number.isFinite(parsed.gitWidth)
-        ? Math.min(560, Math.max(240, parsed.gitWidth))
-        : 320,
+        ? Math.min(480, Math.max(200, parsed.gitWidth))
+        : 280,
+    terminalOpen: typeof parsed.terminalOpen === "boolean" ? parsed.terminalOpen : false,
+    terminalHeight:
+      typeof parsed.terminalHeight === "number" && Number.isFinite(parsed.terminalHeight)
+        ? Math.min(560, Math.max(140, parsed.terminalHeight))
+        : 260,
+    previewOpen: typeof parsed.previewOpen === "boolean" ? parsed.previewOpen : false,
+    previewWidth:
+      typeof parsed.previewWidth === "number" && Number.isFinite(parsed.previewWidth)
+        ? Math.min(900, Math.max(280, parsed.previewWidth))
+        : 420,
+    terminalSessions,
+    activeTerminal,
+    previewUrls,
   };
 }
 

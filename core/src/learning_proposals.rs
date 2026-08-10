@@ -78,8 +78,22 @@ pub fn validate_and_apply(workspace: &Path, proposal: &LearningProposal) -> Resu
                 }
             }
             let desc: String = proposal.statement.chars().take(100).collect();
-            // Duplicate check: skip if same name already exists with similar body.
+            // Duplicate candidates are left untouched, but verification is an
+            // explicit lifecycle transition and must update the current entry.
             if memory::memory_exists_scoped(workspace, scope, &name) {
+                if action == "verify" {
+                    memory::update_memory_scoped(workspace, scope, &name, |entry| {
+                        entry.schema_version = entry.schema_version.max(2);
+                        entry.status = memory::MemoryStatus::Verified;
+                        entry.confidence = proposal.confidence.clamp(0.0, 1.0);
+                        entry.support_count = entry
+                            .support_count
+                            .saturating_add(proposal.evidence.len() as u32);
+                        memory::extend_unique(&mut entry.ref_files, &proposal.references);
+                        memory::extend_unique(&mut entry.evidence_episodes, &proposal.evidence);
+                        entry.last_verified_at = Some(now_secs());
+                    })?;
+                }
                 return Ok(format!(
                     "duplicate: memory '{name}' already exists — skipped ({status_note})"
                 ));
@@ -98,8 +112,21 @@ pub fn validate_and_apply(workspace: &Path, proposal: &LearningProposal) -> Resu
                 },
             )
             .map_err(|e| e)?;
-            // Best-effort: set schema v2 status via rewrite if helpers exist.
-            let _ = status_note;
+            memory::update_memory_scoped(workspace, scope, &name, |entry| {
+                entry.schema_version = 2;
+                entry.status = if action == "verify" {
+                    memory::MemoryStatus::Verified
+                } else {
+                    memory::MemoryStatus::Candidate
+                };
+                entry.confidence = proposal.confidence.clamp(0.0, 1.0);
+                entry.support_count = proposal.evidence.len() as u32;
+                memory::extend_unique(&mut entry.ref_files, &proposal.references);
+                memory::extend_unique(&mut entry.evidence_episodes, &proposal.evidence);
+                if action == "verify" {
+                    entry.last_verified_at = Some(now_secs());
+                }
+            })?;
             Ok(format!(
                 "created {status_note} {} memory '{name}' (conf={:.2})",
                 scope.as_str(),
@@ -112,15 +139,14 @@ pub fn validate_and_apply(workspace: &Path, proposal: &LearningProposal) -> Resu
                 return Err(format!("append_evidence: memory '{name}' not found"));
             }
             let extra = proposal.evidence.join("\n");
-            // Use save path that appends when exists — call hygiene-safe append via save.
-            memory::save_memory_scoped_with_importance(
+            memory::append_memory_scoped(
                 workspace,
                 scope,
                 &name,
-                &format!("\n{}", extra),
+                &extra,
                 "note",
                 &proposal.statement.chars().take(80).collect::<String>(),
-                Importance::Normal,
+                16 * 1024,
             )
             .map_err(|e| e)?;
             Ok(format!("appended evidence to '{name}'"))

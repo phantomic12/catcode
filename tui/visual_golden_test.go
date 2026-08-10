@@ -48,15 +48,15 @@ func TestVisualGoldens(t *testing.T) {
 	t.Run("40x12 idle", func(t *testing.T) {
 		s := visualSession(40, 12)
 		got := canonicalVisual(s.View().Content)
-		want := `◆ Catalyst Code …project ● ready
-What would you like to build?
-▸ 1. Understand this repository
+		want := `◆ Catalyst / Code ● ready
+START A SESSION
+▸ 1 Understand this repository
 ↑↓ choose · enter use · / commands
-╭─╮
+╭ compose ─╮
 │ ❯ Chat with the agent… (/ commands… │
 ╰─╯
-Enter send ▱▱▱▱▱▱▱▱▱▱ 9% 12.0k/128.0k
-glm-5.2 · 42 tok/s · 180ms ttft`
+Enter send
+▰▱▱▱▱▱▱▱▱▱ 9% · 12.0k`
 		if got != want {
 			t.Fatalf("visual golden changed:\n--- got ---\n%s\n--- want ---\n%s", got, want)
 		}
@@ -68,12 +68,12 @@ glm-5.2 · 42 tok/s · 180ms ttft`
 		s.pendingApproval = &approvalPrompt{requestID: "r1", tool: "bash", args: `{"command":"rm -rf dist"}`}
 		s.layout()
 		got := canonicalVisual(s.View().Content)
-		want := `◆ Catalyst Code ~/project ● ready · glm-5.2
-╭─╮
-│ Delete generated build artifacts │
-╰─╯
+		want := `◆ Catalyst / Code ● ready · glm-5.2
+PROJECT ~/project MODEL glm-5.2
+● YOU ─
+▌ Delete generated build artifacts
 ⚠ approval required ❯ bash rm -rf dist [Y] once · [N] deny · [A] type
-╭─╮
+╭ compose ─╮
 │ ❯ Type a follow-up, or clear input to use the approval keys… │
 ╰─╯
 Y allow once · N deny · A always allow type ▱▱▱▱▱▱▱▱▱▱ 9% 12.0k/128.0k
@@ -94,19 +94,19 @@ glm-5.2 · 42 tok/s · 180ms ttft`
 		s.activityExpanded = true
 		s.layout()
 		got := canonicalVisual(s.View().Content)
-		want := `◆ Catalyst Code ~/project ● ready · glm-5.2
+		want := `◆ Catalyst / Code ● ready · glm-5.2
+PROJECT ~/project MODEL glm-5.2
+● YOU ─
+▌ Refactor the parser and verify it
 ╭─╮
-│ Refactor the parser and verify it │
-╰─╯
-╭─╮
-│ Activity · focused · ↑↓ scroll · Esc close │
+│ Activity · ↑↓ scroll · Esc close │
 │ Subagents │
 │ ◷ reviewer · 0:00 · ▤ read_file │
 │ Tasks │
 │ [•] Refactor parser │
 │ [○] Run tests │
 ╰─╯
-╭─╮
+╭ compose ─╮
 │ ❯ Chat with the agent… (/ commands · ? help) │
 ╰─╯
 Enter send · Shift+Enter newline · Ctrl+P commands ▱▱▱▱▱▱▱▱▱▱ 9% 12.0k/128.0k

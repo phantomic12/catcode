@@ -72,3 +72,21 @@ func TestWorkingWaveReducedMotion(t *testing.T) {
 		t.Fatalf("reduced-motion wave should be a mid-level dim line; got %q", stripANSI(first))
 	}
 }
+
+func TestStreamRefreshIntervalScalesWithTranscriptSize(t *testing.T) {
+	cases := []struct {
+		blocks int
+		want   time.Duration
+	}{
+		{blocks: 0, want: 66 * time.Millisecond},
+		{blocks: 100, want: 66 * time.Millisecond},
+		{blocks: 101, want: 100 * time.Millisecond},
+		{blocks: 300, want: 100 * time.Millisecond},
+		{blocks: 301, want: 150 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		if got := streamRefreshInterval(tc.blocks); got != tc.want {
+			t.Errorf("streamRefreshInterval(%d) = %v, want %v", tc.blocks, got, tc.want)
+		}
+	}
+}

@@ -88,12 +88,12 @@ const (
 
 type streamRefreshMsg struct{}
 
-// busyFrameMsg drives re-renders while a turn is in flight (~10 FPS) so
-// elapsed timers, ◷ badges, and optional border animation advance without a
-// spinner.Model. Idle sessions do not schedule frames (avoids re-render storms).
+// busyFrameMsg repaints time-varying chrome while a turn is in flight. Streaming
+// content has its own 15 FPS clock; chrome does not need 10 FPS, and a slower
+// 4 FPS cadence leaves the single-threaded event loop responsive on slow links.
 type busyFrameMsg struct{}
 
-const busyFrameInterval = time.Second / 10
+const busyFrameInterval = time.Second / 4
 
 // selectionFrameMsg coalesces the much faster stream of terminal drag events
 // into at most one visible selection update per renderer frame.
@@ -155,6 +155,8 @@ type session struct {
 	approvalModeStr string
 	sessionList     []sessionEntry
 	skillsList      []skillInfo // discoverable skills (drives /skill:<name> autocomplete)
+	jobStatusRaw    json.RawMessage
+	sessionTreeRaw  json.RawMessage
 	pluginCommands  []struct {
 		Name        string `json:"name"`
 		Description string `json:"description"`

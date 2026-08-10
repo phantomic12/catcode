@@ -174,46 +174,45 @@ func (s *session) renderCoreFailureBanner() string {
 		Render(" " + msg)
 }
 
-// renderHeader is a minimal chrome strip: product + location on the left,
-// operational state on the right, followed by a single hairline rule. The
-// transcript is the hero, so the header avoids a heavy surface fill.
+// renderHeader keeps fixed two-row geometry on normal terminals so mouse hit
+// targets and transcript coordinates stay stable. The second row is metadata,
+// rendered quieter than the workspace identity above it.
 func (s *session) renderHeader() string {
 	if s.viewChrome != nil && s.viewChrome.headerOK {
 		return s.viewChrome.header
 	}
-	// Brand: the Catalyst wordmark — accent diamond + strong fg. "Code" in muted
-	// keeps the full product name (Catalyst Code) without competing with the mark.
-	brand := accentStyle.Render("◆ ") + boldBaseStyle.Render("Catalyst") + dimStyle.Render(" Code")
-	left := brand
-	if s.width >= 30 && s.cwd != "" {
-		left += mutedStyle.Render("  " + truncatePath(s.cwd, max(8, s.width/2-12)))
-	}
-	state := "starting"
-	stateDot := c.secondary
+	brand := accentStyle.Render("◆") + " " + boldBaseStyle.Render("Catalyst") + dimStyle.Render(" / Code")
+	state, stateColor := "starting", c.secondary
 	switch {
 	case s.coreLifecycle == coreFailed:
-		state, stateDot = "core down", c.err
+		state, stateColor = "core down", c.err
 	case s.busy:
+		state, stateColor = "working", c.accent
 		if s.goalState != nil && goalShowsProgressPanel(s.goalState.Phase, s.goalState.AutoDeploy) {
 			settled, total := s.goalProgressCounts()
-			phaseLabel := goalProgressPhaseLabel(s.goalState.Phase, s.goalState.AutoDeploy)
-			state = fmt.Sprintf("goal · %s · %d/%d", phaseLabel, settled, total)
-		} else {
-			state = "working"
+			state = fmt.Sprintf("goal · %s · %d/%d", goalProgressPhaseLabel(s.goalState.Phase, s.goalState.AutoDeploy), settled, total)
 		}
-		stateDot = c.accent
 	case s.authed:
-		state, stateDot = "ready", c.success
+		state, stateColor = "ready", c.success
 	case len(s.models) > 0:
-		state, stateDot = "no key", c.warn
+		state, stateColor = "no key", c.warn
 	}
-	// The Catalyst status dot (●) carries the operational state.
-	right := statusDot(stateDot) + " " + boldBaseStyle.Render(state)
+	right := statusDot(stateColor) + " " + lipgloss.NewStyle().Foreground(lipgloss.Color(stateColor)).Bold(true).Render(state)
 	if len(s.models) > 0 && s.modelIdx >= 0 && s.modelIdx < len(s.models) && s.width >= 42 {
 		right += mutedStyle.Render(" · " + truncate(s.models[s.modelIdx].ID, max(8, s.width/3)))
 	}
-	row := fitRow(s.width, " "+left, " "+right+" ")
-	out := row
+	out := fitRow(s.width, " "+brand, right+" ")
+	if s.width >= 48 && s.height >= 12 {
+		project := "PROJECT  —"
+		if s.cwd != "" {
+			project = "PROJECT  " + truncatePath(s.cwd, max(12, s.width/2-12))
+		}
+		model := "MODEL  —"
+		if len(s.models) > 0 && s.modelIdx >= 0 && s.modelIdx < len(s.models) {
+			model = "MODEL  " + truncate(s.models[s.modelIdx].ID, max(10, s.width/3))
+		}
+		out += "\n" + fitRow(s.width, " "+mutedStyle.Render(project), mutedStyle.Render(model)+" ")
+	}
 	if s.viewChrome != nil {
 		s.viewChrome.header = out
 		s.viewChrome.headerOK = true
@@ -346,10 +345,8 @@ func (s *session) renderApprovalDiff(a *approvalPrompt) string {
 	return view
 }
 
-// renderFooter is a one-line, contextual control rail. Operational identity
-// lives in the header; detailed performance and policy data live in /status,
-// /stats, and /context. A toast temporarily replaces the left-hand controls so
-// feedback never inserts another layout row.
+// renderFooter is a quiet command deck. The composer remains the primary
+// surface; controls and telemetry use typography instead of another filled bar.
 func (s *session) renderFooter() string {
 	if s.viewChrome != nil && s.viewChrome.footerOK {
 		return s.viewChrome.footer
@@ -358,21 +355,41 @@ func (s *session) renderFooter() string {
 	if toast := s.renderToast(); toast != "" {
 		left = toast
 	} else {
-		left = dimStyle.Render(left)
+		left = keyHintStyle.Render(left)
 	}
 	right := s.renderContext()
-	if s.width < 50 {
-		if lipgloss.Width(left)+lipgloss.Width(right)+1 > s.width {
-			left = dimStyle.Render(s.primaryFooterHint())
+	var lines []string
+	if s.width < 48 {
+		// Compact mode preserves the one action that can be taken now and the
+		// current token total. It intentionally drops only the context maximum.
+		lines = append(lines, " "+keyHintStyle.Render(s.primaryFooterHint()))
+		var maxToks uint64
+		if len(s.models) > 0 && s.modelIdx >= 0 && s.modelIdx < len(s.models) {
+			maxToks = uint64(s.models[s.modelIdx].ContextWindow)
 		}
-	}
-	controlLine := lipgloss.NewStyle().MaxWidth(max(1, s.width)).Render(fitRow(s.width, left, right))
-	var out string
-	if !s.settings.FooterMetrics {
-		out = controlLine
+		pct := 0
+		if maxToks > 0 {
+			pct = min(100, int(float64(s.contextTokens)/float64(maxToks)*100))
+			if pct == 0 && s.contextTokens > 0 {
+				pct = 1
+			}
+		}
+		bar := renderContextBar(float64(pct)/100, 10)
+		lines = append(lines, " "+bar+mutedStyle.Render(fmt.Sprintf(" %d%% · %s", pct, compactTokens(s.contextTokens))))
 	} else {
-		out = controlLine + "\n" + s.renderFooterPerformance()
+		lines = append(lines, fitRow(max(1, s.width), " "+left, right+" "))
 	}
+	if s.settings.FooterMetrics && s.height >= 16 {
+		model := "no model"
+		if len(s.models) > 0 && s.modelIdx >= 0 && s.modelIdx < len(s.models) {
+			model = s.models[s.modelIdx].ID
+		}
+		if metrics := s.renderMetrics(); metrics != "" {
+			model += "  ·  " + metrics
+		}
+		lines = append(lines, mutedStyle.Render(" "+truncate(model, max(1, s.width-1))))
+	}
+	out := strings.Join(lines, "\n")
 	if s.viewChrome != nil {
 		s.viewChrome.footer = out
 		s.viewChrome.footerOK = true
@@ -466,32 +483,27 @@ func (s *session) composerHintLine(innerW int) string {
 }
 
 func (s *session) renderFooterPerformance() string {
+	return mutedStyle.Render(s.renderFooterPerformancePlain())
+}
+
+func (s *session) renderFooterPerformancePlain() string {
 	model := "no model"
 	if len(s.models) > 0 && s.modelIdx >= 0 && s.modelIdx < len(s.models) {
 		model = s.models[s.modelIdx].ID
 	}
 	parts := []string{model}
-	var metrics map[string]json.RawMessage
-	if len(s.lastMetrics) > 0 && json.Unmarshal(s.lastMetrics, &metrics) == nil {
-		tps := get(metrics, "tps")
-		approx := false
-		if tps == "" || tps == "null" {
-			tps = get(metrics, "tps_est")
-			approx = tps != "" && tps != "null"
-		}
-		if value, err := strconv.ParseFloat(tps, 64); err == nil {
-			prefix := ""
-			if approx {
-				prefix = "~"
+	if len(s.lastMetrics) > 0 {
+		var m map[string]json.RawMessage
+		if json.Unmarshal(s.lastMetrics, &m) == nil {
+			if tps := strings.TrimSpace(get(m, "tps")); tps != "" {
+				parts = append(parts, tps+" tok/s")
 			}
-			parts = append(parts, fmt.Sprintf("%s%d tok/s", prefix, int(math.Round(value))))
-		}
-		if ttft := get(metrics, "ttft_ms"); ttft != "" && ttft != "null" {
-			parts = append(parts, ttft+"ms ttft")
+			if ttft := strings.TrimSpace(get(m, "ttft_ms")); ttft != "" {
+				parts = append(parts, ttft+"ms ttft")
+			}
 		}
 	}
-	line := strings.Join(parts, " · ")
-	return mutedStyle.Render(truncate(line, max(1, s.width)))
+	return truncate(strings.Join(parts, "  ·  "), max(1, s.width))
 }
 
 // renderMetrics builds the throughput string for the footer's second line:
@@ -759,12 +771,9 @@ func (s *session) keyLabel(action string) string {
 	return s.keybinds[action]
 }
 
-// renderInputBox wraps the chat input in a rounded border so it reads as a
-// distinct chat composer. Unlike a plain textinput (which scrolls the line
-// horizontally when it overflows), the value is soft-wrapped to the box width
-// and the box grows downward so the whole message stays visible. The cursor
-// is placed on the correct wrapped line via the textinput's own cursor.Model
-// (blink / focus-blur behavior stays identical to the stock textinput).
+// renderInputBox presents the composer as a labelled command surface. It grows
+// downward with wrapped input while its MESSAGE label and SEND affordance stay
+// in fixed positions, making the primary action obvious at a glance.
 func (s *session) renderInputBox() string {
 	if s.viewChrome != nil && s.viewChrome.inputOK {
 		return s.viewChrome.inputBox
@@ -821,32 +830,38 @@ func (s *session) renderInputBoxUncached() string {
 	if hint := s.composerHintLine(cardInnerW); hint != "" && s.input.Value() != "" {
 		lines = append(lines, hint)
 	}
-	// The moving perimeter is an opt-in flourish; a static border keeps
-	// streaming text calm and behaves better over SSH. Reduced-motion always
-	// wins even when animation was explicitly requested.
-	if s.busy && envEnabled("CATCODE_ANIMATED_BORDER") && !s.motionReduced() {
-		return s.renderInputBoxAnimated(w, cardInnerW, textW, lines)
-	}
+	// A static perimeter is intentional: it keeps focus calm while streamed
+	// content changes and gives every terminal the same composer geometry.
 	return s.renderComposerStatic(w, cardInnerW, textW, lines)
 }
 
-// renderComposerStatic draws the composer as a rounded surface card: the
-// prompt glyph lives inside the card, content lines are inset consistently, and
-// the border uses the theme's railDim so the composer is present but quiet.
+// renderComposerStatic draws a compact focus frame. The label identifies the
+// mode; actionable key guidance remains in the footer instead of decorating
+// both ends of the border.
 func (s *session) renderComposerStatic(w, cardInnerW, textW int, lines []string) string {
 	prompt := accentStyle.Render("❯")
-	var content strings.Builder
+	label := accentStyle.Render(" compose ")
+	middle := max(0, w-lipgloss.Width(label)-2)
+	var out strings.Builder
+	out.WriteString(railStyle.Render("╭"))
+	out.WriteString(label)
+	out.WriteString(railStyle.Render(strings.Repeat("─", middle) + "╮"))
 	for i, ln := range lines {
+		out.WriteByte('\n')
+		row := "  " + ln
 		if i == 0 {
-			content.WriteString(prompt + " " + ln)
-		} else {
-			content.WriteString("  " + ln)
+			row = prompt + " " + ln
 		}
-		if i < len(lines)-1 {
-			content.WriteByte('\n')
+		if gap := cardInnerW - lipgloss.Width(row); gap > 0 {
+			row += strings.Repeat(" ", gap)
 		}
+		out.WriteString(railStyle.Render("│ "))
+		out.WriteString(row)
+		out.WriteString(railStyle.Render(" │"))
 	}
-	return cardStyle.Width(w).Render(content.String())
+	out.WriteByte('\n')
+	out.WriteString(railStyle.Render("╰" + strings.Repeat("─", max(0, w-2)) + "╯"))
+	return out.String()
 }
 
 // renderInputBoxAnimated draws the composer as a rounded surface card with a
@@ -1492,10 +1507,9 @@ func (s *session) renderActivityShelfUncached() string {
 	}
 	if !s.activityExpanded {
 		label := accentStyle.Render("◷ ") + baseStyle.Render(strings.Join(parts, " · ")) +
-			dimStyle.Render(" · "+toggle+" expand")
-		return surfaceStyle.Padding(0, 1).Render(label)
+			dimStyle.Render("   "+toggle+" expand")
+		return " " + label
 	}
-
 	var details []string
 	if len(s.subProgress) > 0 {
 		details = append(details, accentStyle.Render("Subagents"))
@@ -1522,10 +1536,9 @@ func (s *session) renderActivityShelfUncached() string {
 	if len(details) > limit {
 		position = fmt.Sprintf(" · %d–%d/%d", s.activityScroll+1, end, len(details))
 	}
-	lines := []string{accentStyle.Render("Activity") + dimStyle.Render(" · focused · ↑↓ scroll · Esc close"+position)}
+	lines := []string{accentStyle.Render("Activity") + dimStyle.Render(" · ↑↓ scroll · Esc close"+position)}
 	lines = append(lines, details[s.activityScroll:end]...)
-	return cardStyle.Width(max(1, s.width-2)).MaxWidth(max(1, s.width)).
-		Render(strings.Join(lines, "\n"))
+	return recessedStyle.Width(max(1, s.width-2)).MaxWidth(max(1, s.width)).Render(strings.Join(lines, "\n"))
 }
 
 func (s *session) activityShelfHeight() int {

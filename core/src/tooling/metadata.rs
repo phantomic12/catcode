@@ -205,6 +205,15 @@ pub fn metadata(name: &str) -> Option<ToolMetadata> {
             Cooperative,
             NETWORK,
         ),
+        "mcp" => entry(
+            "mcp",
+            Destructive,
+            External,
+            Sequential,
+            Inherit,
+            Cooperative,
+            NETWORK,
+        ),
         "finish" | "load_tools" | "goal_write_plan" => entry(
             match name {
                 "finish" => "finish",
@@ -253,6 +262,16 @@ pub fn metadata(name: &str) -> Option<ToolMetadata> {
             Cooperative,
             INTERACTIVE,
         ),
+        "eval" => entry(
+            "eval",
+            ReadOnly,
+            External,
+            Sequential,
+            Never,
+            KillSubprocess,
+            PROCESS,
+        ),
+        "read" => entry("read", ReadOnly, External, Safe, Never, Cooperative, READ),
         "subagent" | "spawn" => entry(
             if name == "subagent" {
                 "subagent"
@@ -274,6 +293,40 @@ pub fn metadata(name: &str) -> Option<ToolMetadata> {
             Inherit,
             KillSubprocess,
             PROCESS,
+        ),
+        "process" => entry(
+            "process",
+            // The approval loop refines this by action: status/logs bypass the
+            // gate while start/stop/restart retain this fail-closed default.
+            Destructive,
+            External,
+            Sequential,
+            Inherit,
+            KillSubprocess,
+            PROCESS,
+        ),
+        "snapshot_edit" | "ast_edit" | "lsp" | "debug" => entry(
+            static_name_ide(name)?,
+            if name == "lsp" {
+                ToolKind::ReadOnly
+            } else if name == "debug" {
+                ToolKind::Destructive
+            } else {
+                ToolKind::Destructive
+            },
+            if name == "lsp" || name == "debug" {
+                External
+            } else {
+                Write
+            },
+            Sequential,
+            if name == "lsp" { Never } else { Inherit },
+            KillSubprocess,
+            if name == "lsp" || name == "debug" {
+                PROCESS
+            } else {
+                WRITE
+            },
         ),
         "write_file" | "edit" | "patch" | "delete" | "rename" | "mkdir" | "bulk_write"
         | "bulk_edit" | "todo_write" | "git_add" | "git_commit" | "bulk" => entry(
@@ -321,6 +374,15 @@ fn static_name(name: &str) -> Option<&'static str> {
         "git_add" => "git_add",
         "git_commit" => "git_commit",
         "bulk" => "bulk",
+        _ => return None,
+    })
+}
+fn static_name_ide(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "snapshot_edit" => "snapshot_edit",
+        "ast_edit" => "ast_edit",
+        "lsp" => "lsp",
+        "debug" => "debug",
         _ => return None,
     })
 }

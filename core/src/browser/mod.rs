@@ -3,10 +3,13 @@
 //! MVP surface the agent actually calls. Full ~50-tool design lives in memory
 //! as roadmap — do not expand schemas here until a tool is implemented.
 //!
-//! Backend: WRY/tao when built with `--features native-browser`. Without the
-//! feature, tools return structured `BROWSER_UNAVAILABLE`.
+//! Backend: shared Chromium/CDP when built with `--features chromium-cdp`.
+//! WRY/tao is an explicit fallback with `--features native-browser`. Without
+//! either feature, tools return structured `BROWSER_UNAVAILABLE`.
 
 mod backend;
+#[cfg(feature = "chromium-cdp")]
+mod chromium_cdp;
 #[cfg(feature = "native-browser")]
 mod headless_display;
 #[cfg(feature = "native-browser")]

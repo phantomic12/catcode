@@ -3663,6 +3663,24 @@ GAPS:
     }
 
     #[test]
+    fn verify_failure_evidence_becomes_remaining_gap() {
+        let mut m = base_mode();
+        m.ceo_mode = true;
+        m.max_iterations = 2;
+        m.phase = GoalPhase::Verifying;
+        assert_eq!(
+            finish_verifying(
+                &mut m,
+                false,
+                "VERDICT: FAIL\nGAPS:\n- evidence validation failed: required summary unavailable"
+            ),
+            VerifyOutcome::Replan
+        );
+        assert!(!m.certified);
+        assert!(m.remaining_gaps[0].contains("evidence validation failed"));
+    }
+
+    #[test]
     fn finish_verifying_fail_without_gaps_synthesizes_remaining_gaps() {
         let mut m = base_mode();
         m.ceo_mode = true;

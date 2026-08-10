@@ -18,6 +18,47 @@ use async_trait::async_trait;
 
 use super::error::ExecutionError;
 
+async fn collect_output_tail<R>(mut reader: R, max: usize) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    const CHUNK: usize = 8 * 1024;
+    let mut tail = Vec::with_capacity(max.min(CHUNK));
+    let mut buf = [0u8; CHUNK];
+    let mut truncated = false;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        if max == 0 {
+            truncated = true;
+            continue;
+        }
+        if n >= max {
+            tail.clear();
+            tail.extend_from_slice(&buf[n - max..n]);
+            truncated = true;
+            continue;
+        }
+        let overflow = tail.len().saturating_add(n).saturating_sub(max);
+        if overflow > 0 {
+            tail.drain(..overflow);
+            truncated = true;
+        }
+        tail.extend_from_slice(&buf[..n]);
+    }
+    if truncated {
+        let mut result = b"...[truncated]...\n".to_vec();
+        result.extend_from_slice(&tail);
+        Ok(result)
+    } else {
+        Ok(tail)
+    }
+}
+
 /// A request to run a program. The backend decides *where* (host or microVM).
 #[derive(Clone, Debug)]
 pub struct ExecRequest {
@@ -142,30 +183,37 @@ impl ExecutionBackend for HostExecutionBackend {
             .spawn()
             .map_err(|e| ExecutionError::spawn_failed(&request.program, e))?;
 
-        // Feed stdin (small, e.g. a sudo password) then close → EOF.
-        if let Some(input) = request.stdin.clone() {
-            if let Some(mut stdin) = child.stdin.take() {
-                use tokio::io::AsyncWriteExt;
-                let _ = stdin.write_all(&input).await;
-                // drop stdin → pipe closes → child sees EOF.
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let stdout_fut = collect_output_tail(stdout, request.max_stdout_bytes);
+        let stderr_fut = collect_output_tail(stderr, request.max_stderr_bytes);
+        let input = request.stdin.clone();
+        let collected = tokio::time::timeout(request.timeout, async {
+            if let Some(input) = input {
+                if let Some(mut stdin) = child.stdin.take() {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stdin.write_all(&input).await;
+                    let _ = stdin.shutdown().await;
+                }
             }
-        }
-
-        let result = tokio::time::timeout(request.timeout, child.wait_with_output()).await;
-        match result {
-            Ok(Ok(o)) => Ok(ExecResult {
-                exit_code: o.status.code(),
-                stdout: truncate_tail(&o.stdout, request.max_stdout_bytes),
-                stderr: truncate_tail(&o.stderr, request.max_stderr_bytes),
-                timed_out: false,
-            }),
-            Ok(Err(e)) => Err(ExecutionError::Other(format!("wait failed: {e}"))),
+            tokio::try_join!(child.wait(), stdout_fut, stderr_fut)
+        })
+        .await;
+        let (status, stdout, stderr) = match collected {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => return Err(ExecutionError::Other(format!("process failed: {e}"))),
             Err(_) => {
-                // Timeout: kill_on_drop(true) terminates the child when the
-                // dropped future reaps it. Return a deterministic timeout error.
-                Err(ExecutionError::Timeout(request.timeout))
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(ExecutionError::Timeout(request.timeout));
             }
-        }
+        };
+        Ok(ExecResult {
+            exit_code: status.code(),
+            stdout,
+            stderr,
+            timed_out: false,
+        })
     }
 }
 
@@ -178,5 +226,25 @@ pub(crate) fn truncate_tail(data: &[u8], max: usize) -> Vec<u8> {
         let mut out = b"...[truncated]...\n".to_vec();
         out.extend_from_slice(&data[start..]);
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn host_output_capture_keeps_bounded_tail() {
+        let request = ExecRequest {
+            program: "sh".into(),
+            args: vec!["-c".into(), "printf '0123456789abcdef'".into()],
+            max_stdout_bytes: 6,
+            max_stderr_bytes: 6,
+            ..ExecRequest::default()
+        };
+        let result = HostExecutionBackend.execute(request).await.unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout, b"...[truncated]...\nabcdef");
+        assert!(result.stdout.len() <= b"...[truncated]...\n".len() + 6);
     }
 }

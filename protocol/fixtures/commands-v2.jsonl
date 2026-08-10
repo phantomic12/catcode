@@ -71,3 +71,9 @@
 {"type":"install_marketplace_skill","source":"anthropics/skills","name":"frontend-design","scope":"project"}
 {"type":"update_marketplace_skill","name":"frontend-design","scope":"project"}
 {"type":"remove_marketplace_skill","name":"frontend-design","scope":"project"}
+{"type":"job_list"}
+{"type":"job_status","run_id":"job-1"}
+{"type":"job_wait","run_id":"job-1","timeout_ms":1000}
+{"type":"job_cancel","run_id":"job-1"}
+{"type":"session_tree"}
+{"type":"session_branch","entry_id":"entry-1"}

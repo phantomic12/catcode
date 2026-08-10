@@ -30,6 +30,10 @@ pub struct ModelsDevEntry {
     pub output: u32,
     pub reasoning: bool,
     pub vision: bool,
+    pub input: Vec<String>,
+    pub output_modalities: Vec<String>,
+    pub tool_call: bool,
+    pub structured_output: bool,
 }
 
 /// Parse the models.dev JSON into a flat lookup keyed by `provider/model-id`.
@@ -53,13 +57,20 @@ fn parse_registry(data: &Value) -> HashMap<String, ModelsDevEntry> {
             .get("reasoning")
             .and_then(|r| r.as_bool())
             .unwrap_or(false);
-        // Vision = "image" in modalities.input[] (the reliable signal).
-        let vision = val
-            .get("modalities")
-            .and_then(|m| m.get("input"))
-            .and_then(|i| i.as_array())
-            .map(|arr| arr.iter().any(|x| x.as_str() == Some("image")))
-            .unwrap_or(false);
+        let modalities = |kind: &str| {
+            val.get("modalities")
+                .and_then(|m| m.get(kind))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let input = modalities("input");
+        let output_modalities = modalities("output");
+        let vision = input.iter().any(|v| v == "image");
         let name = val
             .get("name")
             .and_then(|n| n.as_str())
@@ -73,6 +84,16 @@ fn parse_registry(data: &Value) -> HashMap<String, ModelsDevEntry> {
                 output,
                 reasoning,
                 vision,
+                input,
+                output_modalities,
+                tool_call: val
+                    .get("tool_call")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                structured_output: val
+                    .get("structured_output")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             },
         );
     }
@@ -274,9 +295,10 @@ pub fn enrich_models(
         }
         m.reasoning = entry.reasoning;
         m.vision = entry.vision;
-        // If the model supports reasoning, add default thinking levels so the
-        // UI offers an effort selector. models.dev doesn't provide specific
-        // levels, so we use the standard set.
+        m.input = entry.input.clone();
+        m.output = entry.output_modalities.clone();
+        m.tool_call = entry.tool_call;
+        m.structured_output = entry.structured_output;
         if entry.reasoning && m.thinking_levels.is_empty() {
             m.thinking_levels = crate::provider::DEFAULT_THINKING_LEVELS
                 .iter()
@@ -366,9 +388,16 @@ mod tests {
             output,
             reasoning,
             vision,
+            input: if vision {
+                vec!["text".into(), "image".into()]
+            } else {
+                vec!["text".into()]
+            },
+            output_modalities: vec!["text".into()],
+            tool_call: true,
+            structured_output: false,
         }
     }
-
     #[test]
     fn parse_registry_extracts_caps() {
         let json = serde_json::json!({
@@ -462,12 +491,13 @@ mod tests {
         let mut models = vec![crate::protocol::ModelInfo {
             id: "deepseek-chat".into(),
             name: "DeepSeek Chat".into(),
-            reasoning: true,         // generic default
-            context_window: 200_000, // generic default
-            max_tokens: 8_192,       // generic default
+            reasoning: true,
+            context_window: 200_000,
+            max_tokens: 8_192,
             thinking_levels: Vec::new(),
             vision: false,
             provider: String::new(),
+            ..Default::default()
         }];
         enrich_models(&mut models, &map, "https://api.deepseek.com");
         assert_eq!(models[0].context_window, 1000000);
@@ -488,11 +518,12 @@ mod tests {
             id: "gpt-4o".into(),
             name: "GPT-4o".into(),
             reasoning: false,
-            context_window: 128000, // curated, not generic default
-            max_tokens: 16384,      // curated
-            thinking_levels: vec!["low".into()], // non-empty = curated match
-            vision: false,          // curated table didn't set vision
+            context_window: 128000,
+            max_tokens: 16384,
+            thinking_levels: vec!["low".into()],
+            vision: false,
             provider: String::new(),
+            ..Default::default()
         }];
         enrich_models(&mut models, &map, "https://api.openai.com/v1");
         // Context and max preserved (not generic default).
@@ -518,6 +549,7 @@ mod tests {
             thinking_levels: Vec::new(),
             vision: false,
             provider: String::new(),
+            ..Default::default()
         }];
         enrich_models(&mut models, &map, "https://api.deepseek.com");
         assert!(models[0].reasoning);
@@ -545,6 +577,7 @@ mod tests {
                 thinking_levels: Vec::new(),
                 vision: false,
                 provider: String::new(),
+                ..Default::default()
             },
             crate::protocol::ModelInfo {
                 id: "over-caps".into(),
@@ -555,6 +588,7 @@ mod tests {
                 thinking_levels: Vec::new(),
                 vision: false,
                 provider: String::new(),
+                ..Default::default()
             },
         ];
         enrich_models(&mut models, &map, "https://api.example.com/v1");
@@ -577,10 +611,10 @@ mod tests {
             thinking_levels: Vec::new(),
             vision: false,
             provider: String::new(),
+            ..Default::default()
         }];
         enrich_models(&mut models, &map, "https://api.example.com/v1");
         assert_eq!(models[0].context_window, 128000);
-        // Zero output must not stick; keep a positive budget under context.
         assert!(models[0].max_tokens > 0);
         assert!(models[0].max_tokens < models[0].context_window);
     }

@@ -13,6 +13,7 @@ static RESOURCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub enum ResourceKind {
     Task,
     Subprocess,
+    Process,
     Approval,
     Ask,
     Sudo,

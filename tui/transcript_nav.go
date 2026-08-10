@@ -13,7 +13,7 @@ func navigableBlock(b *block) bool {
 		return false
 	}
 	switch b.kind {
-	case blkUser, blkAssistant, blkThinking, blkTool, blkToolResult, blkError, blkApprove:
+	case blkUser, blkAssistant, blkThinking, blkTool, blkToolResult, blkAdvisor, blkError, blkApprove:
 		return true
 	default:
 		return false
@@ -66,6 +66,8 @@ func blockRoleName(b *block) string {
 		return "reasoning"
 	case blkTool, blkToolResult:
 		return "tool output"
+	case blkAdvisor:
+		return "advisor review"
 	case blkApprove:
 		return "approval"
 	case blkError:

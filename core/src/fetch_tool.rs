@@ -33,8 +33,10 @@ fn parse_http_host(url: &str) -> Option<(String, String)> {
         rest[..end].to_ascii_lowercase()
     } else {
         let end = host_port.find(':').unwrap_or(host_port.len());
-        host_port[..end].to_ascii_lowercase()
+        host_port[..end].trim_end_matches('.').to_ascii_lowercase()
     };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+
     if host.is_empty() || host.contains('@') {
         return None;
     }
@@ -89,31 +91,38 @@ fn ip_is_private(ip: IpAddr) -> bool {
 /// to `metadata.google.internal`) reaches a local/internal service under the
 /// default empty allowlist. An explicit `fetch_allowlist` entry overrides this.
 fn hostname_is_private(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
     const BLOCKED: &[&str] = &[
         "localhost",
         "ip6-localhost",
         "ip6-loopback",
         "metadata",
         "metadata.google.internal",
-        "metadata.google.internal.",
         "metadata.aws.internal",
         "metadata.azure.com",
         "ip6-allnodes",
         "ip6-allrouters",
         "broadcasthost",
     ];
-    BLOCKED.iter().any(|b| b.eq_ignore_ascii_case(host))
+    const WILDCARD_DNS_SUFFIXES: &[&str] = &["nip.io", "sslip.io", "xip.io", "localtest.me"];
+    BLOCKED.iter().any(|b| *b == host)
+        || host == "local"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || WILDCARD_DNS_SUFFIXES
+            .iter()
+            .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
 }
 
-/// Is `host` a private address? Checks IP literals directly (no DNS — fast and
-/// side-effect-free, so it's safe in the sync redirect policy). A hostname
-/// that resolves to a private IP is a residual risk controlled by the
-/// allowlist; we deliberately don't do DNS here to keep the check hang-proof.
+/// Is `host` a private address? IP literals and known local names are checked
+/// synchronously; request execution additionally resolves and pins DNS before
+/// every redirect hop.
 fn host_is_private(host: &str) -> bool {
-    if hostname_is_private(host) {
+    let normalized = host.trim_end_matches('.');
+    if hostname_is_private(normalized) {
         return true;
     }
-    match host.parse::<IpAddr>() {
+    match normalized.parse::<IpAddr>() {
         Ok(ip) => ip_is_private(ip),
         Err(_) => false,
     }
@@ -149,6 +158,110 @@ pub(crate) fn allowlist_redirect_policy(allowlist: Vec<String>) -> reqwest::redi
             attempt.stop()
         }
     })
+}
+
+fn validate_resolved_addresses(
+    host: &str,
+    allowlist: &[String],
+    addresses: &[std::net::SocketAddr],
+) -> Result<(), String> {
+    if addresses.is_empty() {
+        return Err(format!("DNS resolution returned no addresses for '{host}'"));
+    }
+    if allowlist.is_empty() && addresses.iter().any(|addr| ip_is_private(addr.ip())) {
+        return Err(format!(
+            "host '{host}' resolves to a private/loopback/link-local address"
+        ));
+    }
+    Ok(())
+}
+
+async fn resolved_target(
+    url: &reqwest::Url,
+    allowlist: &[String],
+) -> Result<(String, std::net::SocketAddr), String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if !host_allowed(&host, allowlist) {
+        return Err(format!("host '{host}' is not permitted"));
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "URL has no port".to_string())?;
+    let addresses: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| format!("DNS resolution failed for '{host}': {e}"))?
+        .collect();
+    validate_resolved_addresses(&host, allowlist, &addresses)?;
+    Ok((host, addresses[0]))
+}
+
+pub(crate) async fn send_resolved(
+    mut url: reqwest::Url,
+    cfg: &Config,
+) -> Result<reqwest::Response, String> {
+    for redirects in 0..=5 {
+        let (host, target) = resolved_target(&url, &cfg.fetch_allowlist).await?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(
+                cfg.fetch_timeout_secs.max(1),
+            ))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve(&host, target)
+            .user_agent("catalyst-code-fetch/0.1")
+            .build()
+            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+        let response = client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        if redirects == 5 {
+            return Err("redirect limit exceeded".into());
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "redirect response has no valid Location header".to_string())?;
+        url = url
+            .join(location)
+            .map_err(|e| format!("invalid redirect URL: {e}"))?;
+    }
+    unreachable!()
+}
+
+pub(crate) async fn post_resolved_json(
+    url: &str,
+    cfg: &Config,
+    auth_header: (&str, &str),
+    body: &Value,
+) -> Result<reqwest::Response, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    let (host, target) = resolved_target(&parsed, &cfg.fetch_allowlist).await?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            cfg.fetch_timeout_secs.max(1),
+        ))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(&host, target)
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+    client
+        .post(parsed)
+        .header(auth_header.0, auth_header.1)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))
 }
 
 /// Remove every case-insensitive `<open ...>...</open>` block from `s`
@@ -333,22 +446,13 @@ pub async fn execute_fetch(args: &Value, cfg: &Config) -> Outcome {
         ));
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(
-            cfg.fetch_timeout_secs.max(1),
-        ))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .redirect(allowlist_redirect_policy(cfg.fetch_allowlist.clone()))
-        .user_agent("catalyst-code-fetch/0.1")
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return Outcome::err(format!("fetch: failed to build HTTP client: {e}")),
+    let parsed_url = match reqwest::Url::parse(url) {
+        Ok(value) => value,
+        Err(e) => return Outcome::err(format!("fetch: invalid URL: {e}")),
     };
-
-    let resp = match client.get(url).send().await {
-        Ok(r) => r,
-        Err(e) => return Outcome::err(format!("fetch: request failed: {e}")),
+    let resp = match send_resolved(parsed_url, cfg).await {
+        Ok(response) => response,
+        Err(e) => return Outcome::err(format!("fetch: {e}")),
     };
     let status = resp.status();
     let ctype = resp
@@ -464,6 +568,18 @@ mod tests {
         }
         // a real public host is not private
         assert!(!hostname_is_private("example.com"));
+    }
+
+    #[test]
+    fn trailing_dot_and_wildcard_dns_hosts_are_private() {
+        for host in [
+            "localhost.",
+            "127.0.0.1.",
+            "169.254.169.254.nip.io",
+            "10.0.0.1.sslip.io",
+        ] {
+            assert!(!host_allowed(host, &[]), "{host} should be denied");
+        }
     }
 
     #[test]
@@ -629,11 +745,8 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_no_network_allows_when_allowlist_opts_in() {
-        // --no-network + explicit allowlist: operator opted in, so an allowed
-        // host is fetched (exercises the real HTTP path against the mock).
         let html = String::from("<html><body><p>docs ok</p></body></html>");
         let (url, _h) = mock_http(html, "text/html").await;
-        // the mock is on 127.0.0.1; allow localhost so the opt-in path connects
         let cfg = crate::config::Config {
             no_network: true,
             fetch_allowlist: vec!["127.0.0.1".into(), "localhost".into()],
@@ -644,5 +757,53 @@ mod tests {
         let out = execute_fetch(&serde_json::json!({ "url": url }), &cfg).await;
         assert!(out.ok, "{}", out.output);
         assert!(out.output.contains("docs ok"));
+    }
+
+    #[test]
+    fn dns_validation_rejects_public_name_resolving_to_loopback() {
+        let addresses = [std::net::SocketAddr::from(([127, 0, 0, 1], 80))];
+        let err =
+            validate_resolved_addresses("public-looking.example", &[], &addresses).unwrap_err();
+        assert!(err.contains("private/loopback/link-local"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resolved_transport_rechecks_real_redirect_target() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket.write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: http://localhost:9/private\r\nContent-Length: 0\r\n\r\n",
+            ).await.unwrap();
+        });
+        let cfg = crate::config::Config {
+            fetch_allowlist: vec!["127.0.0.1".into()],
+            ..crate::config::Config::default()
+        };
+        let url = reqwest::Url::parse(&format!("http://{addr}/redirect")).unwrap();
+        let err = send_resolved(url, &cfg).await.unwrap_err();
+        server.await.unwrap();
+        assert!(
+            err.contains("localhost") && err.contains("not permitted"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_transport_rejects_loopback_dns_target_without_allowlist() {
+        let cfg = crate::config::Config {
+            fetch_allowlist: Vec::new(),
+            ..crate::config::Config::default()
+        };
+        let url = reqwest::Url::parse("http://localhost./private").unwrap();
+        let err = send_resolved(url, &cfg).await.unwrap_err();
+        assert!(
+            err.contains("private") || err.contains("not permitted"),
+            "{err}"
+        );
     }
 }
