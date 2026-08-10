@@ -15,13 +15,14 @@ cd catcode
 bash build.sh           # auto-detects; builds TUI-only core if WebKitGTK is missing
 ```
 
-`build.sh` probes `pkg-config --exists gio-2.0` and skips the `native-browser`
-feature when it's absent, so headless servers and CI containers build cleanly
-without any GUI dependencies. To force one mode or the other:
+On macOS and Windows, `build.sh` enables `native-browser` by default (system
+`WKWebView` / `WebView2`). On Linux it probes `pkg-config --exists gio-2.0`
+and skips the feature when it's absent, so headless servers and CI containers
+build cleanly without any GUI dependencies. To force one mode or the other:
 
 | Flag         | Effect                                                                            |
 |--------------|-----------------------------------------------------------------------------------|
-| (no flag)    | Auto-detect: build `native-browser` when `gio-2.0` is on pkg-config search path    |
+| (no flag)    | Auto-detect: macOS/Windows always; Linux when `gio-2.0` is on pkg-config path     |
 | `--with-web` | Force building `native-browser`. Fails if WebKitGTK system headers are missing    |
 | `--no-web`   | Force a TUI-only build (no `native-browser`, no GUI dependencies)                 |
 | `--run`      | After building, exec the freshly-built TUI with the new core                      |
@@ -92,11 +93,13 @@ if it isn't already present.
 
 ### Auto-detect (default)
 
-`bash build.sh` without arguments probes for `gio-2.0` via `pkg-config`. When
-it finds it, the build enables the `native-browser` cargo feature (matching
-the behaviour of prebuilt binaries, which include the browser engine). When
-it doesn't, the build emits a single notice line and produces a TUI-only
-core:
+`bash build.sh` without arguments picks a platform-aware default:
+
+- **macOS / Windows** — enables `native-browser` immediately (system
+  `WKWebView` / `WebView2`; no extra packages).
+- **Linux** — probes for `gio-2.0` via `pkg-config`. When found, enables
+  `native-browser` (matching prebuilt binaries). When missing, emits a
+  single notice line and produces a TUI-only core:
 
 ```
 notice: WebKitGTK system headers not found via pkg-config; skipping

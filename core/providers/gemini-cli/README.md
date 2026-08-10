@@ -89,7 +89,7 @@ After OAuth + project discovery, every chat turn is a POST to
 
 ```json
 {
-  "model": "gemini-3.1-pro-preview",
+  "model": "gemini-2.5-flash",
   "project": "<discovered cloudaicompanionProject>",
   "userAgent": "google-api-nodejs-client/9.15.1",
   "request": {

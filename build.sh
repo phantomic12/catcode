@@ -10,8 +10,8 @@ cd "$ROOT_DIR"
 #                WebKitGTK system headers on Linux).
 #   --no-web     skip `native-browser`; build the TUI-only core. This is the
 #                right mode on headless servers and CI.
-#   (none)       auto-detect: build `native-browser` when pkg-config can find
-#                gio-2.0, otherwise skip it with a one-line notice.
+#   (none)       auto-detect: enable on macOS/Windows (system WKWebView /
+#                WebView2); on Linux probe pkg-config for gio-2.0.
 # Plus --run [args] to launch the freshly-built TUI when the build succeeds.
 WITH_WEB="auto"
 RUN_TUI=false
@@ -26,7 +26,8 @@ installation when one is on PATH.
   --with-web   build the \`native-browser\` feature (Linux: requires
                libgtk-3-dev, libwebkit2gtk-4.1-dev, libgio-2.0-dev)
   --no-web     skip \`native-browser\`; build the TUI-only core
-  (default)    auto-detect via \`pkg-config --exists gio-2.0\`
+  (default)    auto-detect: macOS/Windows always; Linux via
+               \`pkg-config --exists gio-2.0\`
   --run [...]  after building, exec the freshly-built TUI
 EOF
 }
@@ -45,16 +46,25 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-# Resolve "auto" by probing for the WebKitGTK pkg-config metadata. We only
-# need *any* system library the native-browser feature pulls in; gio-2.0 is
-# the cheapest reliable signal on Linux.
+# Resolve "auto" in a platform-aware way:
+#   - Darwin / Windows (MINGW/MSYS/CYGWIN): system WKWebView / WebView2 — no
+#     extra packages, so enable native-browser by default.
+#   - Linux (and anything else): probe for WebKitGTK via gio-2.0 on pkg-config;
+#     headless hosts without GTK skip with a one-line notice.
 if [[ "$WITH_WEB" == "auto" ]]; then
-  if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists gio-2.0; then
-    WITH_WEB="yes"
-  else
-    WITH_WEB="no"
-    echo "notice: WebKitGTK system headers not found via pkg-config; skipping native-browser (pass --with-web once you've installed them)"
-  fi
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    Darwin|MINGW*|MSYS*|CYGWIN*)
+      WITH_WEB="yes"
+      ;;
+    *)
+      if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists gio-2.0; then
+        WITH_WEB="yes"
+      else
+        WITH_WEB="no"
+        echo "notice: WebKitGTK system headers not found via pkg-config; skipping native-browser (pass --with-web once you've installed them)"
+      fi
+      ;;
+  esac
 fi
 
 if [[ "$WITH_WEB" == "yes" ]]; then
